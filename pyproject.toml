@@ -1,0 +1,98 @@
+[project]
+name = "pymol_imd"
+version = "0.1.0"
+description = "Multiscale Interactive Molecular Dynamics in PyMOL (CG / AA / ML-MM)"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { file = "LICENSE" }
+authors = [{ name = "th2ch-g" }]
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pymol_imd*"]
+
+# ---------------------------------------------------------------------------
+# pixi workspace
+# ---------------------------------------------------------------------------
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+# Windows native is excluded: ambertools has no conda-forge Windows build.
+# Windows users should run via WSL2 (linux-64).
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+
+# ---------------------------------------------------------------------------
+# Default feature: AA + CG (works on Linux & macOS)
+# ---------------------------------------------------------------------------
+[tool.pixi.dependencies]
+python = ">=3.11,<3.13"
+# Core MD + viewer
+openmm = ">=8.1"
+pymol-open-source = ">=3.0"
+# Forcefield / ligand parameterization
+ambertools = "*"
+openmmforcefields = "*"
+openff-toolkit = "*"
+rdkit = "*"
+# Coarse-grained (Martini) topology generation
+vermouth = "*"
+# Misc utilities
+numpy = "*"
+requests = "*"
+
+[tool.pixi.pypi-dependencies]
+pymol_imd = { path = ".", editable = true }
+# Martini reader for OpenMM (no conda-forge build available). Pinned to upstream main.
+martini-openmm = { git = "https://github.com/maccallumlab/martini_openmm.git" }
+ruff = "*"
+
+# ---------------------------------------------------------------------------
+# Optional ML/MM feature: Linux-only, pulls torch + mlmm_toolkit
+# ---------------------------------------------------------------------------
+[tool.pixi.feature.mlmm]
+platforms = ["linux-64"]
+
+[tool.pixi.feature.mlmm.dependencies]
+pytorch = ">=2.6"
+pytorch_scatter = "*"
+pytorch_geometric = "*"
+biopython = "*"
+ase = "*"
+parmed = "*"
+
+# mlmm_toolkit itself is installed via the `install-mlmm` task below, NOT via
+# pypi-dependencies. Reason: pixi tries to resolve all PyPI git+URL deps for
+# every (env, platform) pair at lock time, and the osx-arm64 build dispatch
+# cannot prebuild Linux-only torch C++ extensions. Keeping it as an explicit
+# task lets the lockfile stay generatable from macOS dev machines.
+
+[tool.pixi.feature.mlmm.tasks]
+install-mlmm = "pip install --no-build-isolation git+https://github.com/t-0hmura/mlmm_toolkit.git"
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+mlmm = { features = ["mlmm"], solve-group = "mlmm" }
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+[tool.pixi.tasks]
+ruff-format = "ruff format --force-exclude"
+ruff-lint = "ruff check --fix --exit-non-zero-on-fix --force-exclude"
+r = { cmd = "echo OK", depends-on = ["ruff-format", "ruff-lint"] }
+smoke = "python -m pymol_imd.tests.smoke"
+
+# ---------------------------------------------------------------------------
+# Ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
