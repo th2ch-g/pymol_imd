@@ -23,11 +23,10 @@ The plugin must accept proteins, DNA, RNA, lipids, and small-molecule ligands; c
   - ML/MM: `mlmm_toolkit` (git+URL) + `pytorch`, `pytorch_scatter`, `pytorch_geometric`, `ase`, `parmed`, `biopython` from conda-forge
   - hydrogen completion: **only** `openmm.app.Modeller.addHydrogens` — do NOT pull in `pdbfixer`, `propka`, etc.
 - Any other dependency requires explicit user approval before being added.
-- **pixi environments / features**: ML/MM is split into the `mlmm` feature, which is `linux-64`-only because `mlmm_toolkit` is officially Linux-only (CUDA-tied deps). The default env covers AA + CG on all three platforms. macOS users will simply get a clear error from `setup_mlmm` saying the feature is unavailable.
-- **ML/MM install flow (two steps, Linux only)**:
-  1. `pixi install -e mlmm` — installs conda deps (`pytorch`, `pytorch_scatter`, `pytorch_geometric`, `ase`, `parmed`, `biopython`, etc.).
-  2. `pixi run -e mlmm install-mlmm` — installs `mlmm_toolkit` itself via `pip install --no-build-isolation git+...`. This is a task, NOT a pypi-dependency, because (a) torch C++ extensions need build isolation off, and (b) Linux git+URL builds cannot be resolved by uv's build dispatch on macOS, which would block lockfile generation from dev machines.
-- Do not move `mlmm_toolkit` back into `pypi-dependencies` — the dev workflow on macOS would break.
+- **pixi environments**: All three backends (AA / CG / ML-MM) live in the single `default` environment. mlmm_toolkit is pulled in as an editable PyPI dependency from a sibling fork (`../mlmm_toolkit`), so a single `pixi install` is enough.
+- The `../mlmm_toolkit` path is relative to the `pymol_imd` repo root. Clone the fork there (or symlink) before running `pixi install`.
+- The fork removes the upstream's Linux-only classifier and adds `_auto_torch_device` (in `mlmm/mlmm_calc.py`) so Apple Silicon MPS is auto-selected (priority: `cuda → mps → cpu`).
+- **Apple Silicon (MPS) fallback**: If a torch op is not yet implemented on MPS, export `PYTORCH_ENABLE_MPS_FALLBACK=1` before launching PyMOL so missing ops silently drop to CPU rather than raise.
 
 ### Common commands
 

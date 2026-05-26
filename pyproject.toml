@@ -40,6 +40,13 @@ openff-toolkit = "*"
 rdkit = "*"
 # Coarse-grained (Martini) topology generation
 vermouth = "*"
+# ML/MM stack (works on linux-64, osx-arm64, osx-64; MPS used on Apple Silicon)
+pytorch = ">=2.6"
+pytorch_scatter = "*"
+pytorch_geometric = "*"
+biopython = "*"
+ase = "*"
+parmed = "*"
 # Misc utilities
 numpy = "*"
 requests = "*"
@@ -48,38 +55,12 @@ requests = "*"
 pymol_imd = { path = ".", editable = true }
 # Martini reader for OpenMM (no conda-forge build available). Pinned to upstream main.
 martini-openmm = { git = "https://github.com/maccallumlab/martini_openmm.git" }
+# Local fork of mlmm_toolkit. The torch C++ extensions are already provided by
+# the conda `pytorch_scatter` / `pytorch_geometric` packages, so mlmm_toolkit's
+# own build stays pure-Python and pixi can install it directly.
+mlmm-toolkit = { path = "../mlmm_toolkit", editable = true }
 ruff = "*"
 
-# ---------------------------------------------------------------------------
-# Optional ML/MM feature: Linux-only, pulls torch + mlmm_toolkit
-# ---------------------------------------------------------------------------
-[tool.pixi.feature.mlmm]
-platforms = ["linux-64"]
-
-[tool.pixi.feature.mlmm.dependencies]
-pytorch = ">=2.6"
-pytorch_scatter = "*"
-pytorch_geometric = "*"
-biopython = "*"
-ase = "*"
-parmed = "*"
-
-# mlmm_toolkit itself is installed via the `install-mlmm` task below, NOT via
-# pypi-dependencies. Reason: pixi tries to resolve all PyPI git+URL deps for
-# every (env, platform) pair at lock time, and the osx-arm64 build dispatch
-# cannot prebuild Linux-only torch C++ extensions. Keeping it as an explicit
-# task lets the lockfile stay generatable from macOS dev machines.
-
-[tool.pixi.feature.mlmm.tasks]
-install-mlmm = "pip install --no-build-isolation git+https://github.com/t-0hmura/mlmm_toolkit.git"
-
-[tool.pixi.environments]
-default = { solve-group = "default" }
-mlmm = { features = ["mlmm"], solve-group = "mlmm" }
-
-# ---------------------------------------------------------------------------
-# Tasks
-# ---------------------------------------------------------------------------
 [tool.pixi.tasks]
 ruff-format = "ruff format --force-exclude"
 ruff-lint = "ruff check --fix --exit-non-zero-on-fix --force-exclude"

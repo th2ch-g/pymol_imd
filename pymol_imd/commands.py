@@ -213,7 +213,19 @@ def imd_run() -> None:
         print("imd: already running")
         return
     _imd_system.running = True
-    _timer.timeout.connect(_imd_system.step)
+
+    def _tick() -> None:
+        try:
+            _imd_system.step()
+        except Exception as exc:
+            logger.exception("imd_run: step failed")
+            _imd_system.running = False
+            print(f"imd_run: stopped due to error — {exc}")
+        if not _imd_system.running:
+            _timer.stop()
+            print("imd_run: stopped (divergence or error). Adjust const_k / max_pull_nm.")
+
+    _timer.timeout.connect(_tick)
     _timer.start(1)
     print("imd_run: started")
 
@@ -235,6 +247,8 @@ def imd_change(
     mouse_force: object | None = None,
     nsteps_per_frame: object | None = None,
     temperature: object | None = None,
+    max_pull_nm: object | None = None,
+    energy_cutoff_kj: object | None = None,
 ) -> None:
     """Hot-patch IMD parameters without rebuilding the system."""
     if _imd_system is None:
@@ -251,6 +265,10 @@ def imd_change(
         cfg.temperature = _as_float(temperature)
         # Langevin integrator temperature can be updated live.
         _imd_system.simulation.integrator.setTemperature(cfg.temperature)
+    if max_pull_nm is not None:
+        cfg.max_pull_nm = _as_float(max_pull_nm)
+    if energy_cutoff_kj is not None:
+        cfg.energy_cutoff_kj = _as_float(energy_cutoff_kj)
     print(f"imd_change: {cfg}")
 
 

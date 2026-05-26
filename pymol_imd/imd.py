@@ -34,6 +34,14 @@ class IMDConfig:
     nsteps_per_frame: int = 1
     const_k: float = 5000.0  # kJ/mol/nm scale for the pulling force
     mouse_force: bool = True
+    # Cap on |delta| (nm) per atom before multiplying by const_k. Prevents
+    # runaway forces when the user drags an atom a huge distance: without
+    # this, |F| = |delta| * const_k can dwarf bond stretching constants and
+    # the structure explodes off-screen.
+    max_pull_nm: float = 0.5
+    # If |potential energy| exceeds this (kJ/mol), the simulation is treated
+    # as diverged and the IMD loop halts. NaN energies trip the same guard.
+    energy_cutoff_kj: float = 1e9
 
 
 class IMDSystem:
@@ -96,7 +104,30 @@ class IMDSystem:
         if self.config.mouse_force:
             self._apply_pull_force_from_pymol()
         self.simulation.step(self.config.nsteps_per_frame)
+        if self._diverged():
+            return
         self._sync_positions_to_pymol()
+
+    def _diverged(self) -> bool:
+        """Return True (and mark the system stopped) if energy went insane.
+
+        Reads the potential energy after a step; NaN/inf or |U| > cutoff
+        indicates the integrator blew up (typically from over-large pull
+        forces or a too-large timestep). Stopping here keeps PyMOL from
+        receiving garbage coordinates that would push atoms off-screen.
+        """
+        energy = self.simulation.context.getState(getEnergy=True).getPotentialEnergy()
+        u_kj = energy.value_in_unit(unit.kilojoule_per_mole)
+        if np.isfinite(u_kj) and abs(u_kj) <= self.config.energy_cutoff_kj:
+            return False
+        logger.error(
+            "Diverged: U = %s kJ/mol (cutoff %.2e). Halting IMD loop. "
+            "Lower const_k / max_pull_nm or shorten timestep_ps.",
+            u_kj,
+            self.config.energy_cutoff_kj,
+        )
+        self.running = False
+        return True
 
     def minimize_step(self, max_iterations: int = 50) -> bool:
         """Run a chunk of minimization; returns True when converged."""
@@ -132,12 +163,22 @@ class IMDSystem:
         # noisy +y on an otherwise-still atom doesn't leak a sideways force.
         atom_max = np.max(np.abs(delta), axis=1)
         delta[atom_max < self._DELTA_NOISE_NM] = 0.0
+
+        # Cap per-atom |delta| at max_pull_nm so the force stays bounded even
+        # if the user yanks an atom across the screen. Direction is kept;
+        # only the magnitude is clipped.
+        mag = np.linalg.norm(delta, axis=1, keepdims=True)
+        safe_mag = np.where(mag > 0, mag, 1.0)
+        scale = np.minimum(mag, self.config.max_pull_nm) / safe_mag
+        delta = delta * scale
+
         n_dragged = int(np.count_nonzero(atom_max >= self._DELTA_NOISE_NM))
         if n_dragged:
             logger.debug(
-                "pull: %d atoms dragged, max |delta| = %.4f nm",
+                "pull: %d atoms dragged, max |delta| = %.4f nm (capped at %.3f)",
                 n_dragged,
-                float(np.max(atom_max)),
+                float(np.max(mag)),
+                self.config.max_pull_nm,
             )
         forces = delta * self.config.const_k
         for idx in range(self.n_atoms):
