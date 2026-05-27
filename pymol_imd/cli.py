@@ -1,0 +1,212 @@
+"""Command-line entry point for pymol_imd.
+
+Wraps ``pymol`` so a single shell command sets up a simulation::
+
+    pymol_imd input.pdb --level cg
+    pymol_imd input.pdb --level aa --ligand-sdf lig.sdf --minimize --run
+    pymol_imd input.pdb --level mlmm --ml-selection "resi 30-50" --ml-backend uma
+
+The CLI itself does not import ``pymol``; it builds a Python statement and
+hands it to PyMOL via the ``-d`` flag, so PyMOL evaluates exactly the same
+``setup_*`` / ``imd_*`` commands an interactive user would type.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ML_BACKENDS = ("uma", "orb", "mace", "aimnet2")
+LEVELS = ("aa", "cg", "mlmm")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="pymol_imd",
+        description=(
+            "Launch PyMOL with a pymol_imd backend already configured. "
+            "Equivalent to typing `from pymol_imd import *; setup_<level>(<pdb>, ...)` "
+            "inside PyMOL."
+        ),
+    )
+    p.add_argument("pdb", help="Input PDB file (path is resolved to absolute).")
+    p.add_argument(
+        "--level",
+        choices=LEVELS,
+        default="aa",
+        help="Simulation backend / resolution. Default: aa.",
+    )
+
+    # ---- common IMD options
+    common = p.add_argument_group("common IMD options")
+    common.add_argument(
+        "--pbc",
+        action="store_true",
+        help="Enable periodic box. Default: vacuum (AA/MLMM) / auto-box (CG).",
+    )
+    common.add_argument(
+        "--temperature", type=float, metavar="K", help="Langevin thermostat temperature (K)."
+    )
+    common.add_argument(
+        "--nsteps-per-frame", type=int, metavar="N", help="MD steps executed per GUI frame."
+    )
+    common.add_argument("--const-k", type=float, metavar="K", help="Pull-force scale (kJ/mol/nm).")
+    common.add_argument(
+        "--no-mouse-force", action="store_true", help="Disable the user-pull mechanism."
+    )
+    common.add_argument(
+        "--minimize", action="store_true", help="Call imd_minimize() right after setup."
+    )
+    common.add_argument(
+        "--run", action="store_true", help="Call imd_run() after setup (and minimize, if set)."
+    )
+
+    # ---- AA-specific
+    aa = p.add_argument_group("--level aa options")
+    aa.add_argument(
+        "--ligand-sdf", metavar="PATH", help="Ligand SDF for GAFF + AM1-BCC parameterization."
+    )
+
+    # ---- CG-specific
+    cg = p.add_argument_group("--level cg options")
+    cg.add_argument("--ff", metavar="NAME", help="Martini forcefield label (default: martini3001).")
+    cg.add_argument(
+        "--no-elastic-network",
+        action="store_true",
+        help="Disable martinize2 elastic network (-elastic).",
+    )
+
+    # ---- MLMM-specific
+    mlmm = p.add_argument_group("--level mlmm options")
+    mlmm.add_argument(
+        "--ml-selection",
+        metavar="SEL",
+        help="ML region selector: 'all', 'resi 30-50', 'chain A', 'resn LIG', or comma-separated indices.",
+    )
+    mlmm.add_argument(
+        "--ml-backend",
+        choices=ML_BACKENDS,
+        metavar="NAME",
+        help=f"MLIP backend. One of: {', '.join(ML_BACKENDS)}.",
+    )
+    mlmm.add_argument("--ml-device", metavar="DEV", help="Torch device: auto / cuda / mps / cpu.")
+    mlmm.add_argument("--ml-charge", type=int, metavar="Z", help="ML region net charge.")
+    mlmm.add_argument("--ml-mult", type=int, metavar="M", help="ML region spin multiplicity.")
+
+    # ---- launcher controls
+    launcher = p.add_argument_group("launcher")
+    launcher.add_argument(
+        "--pymol",
+        metavar="PATH",
+        default=None,
+        help="Path to the pymol executable (auto-detected on PATH if omitted).",
+    )
+    launcher.add_argument(
+        "--print-only",
+        action="store_true",
+        help="Print the resolved PyMOL command and exit without launching.",
+    )
+    return p
+
+
+def _resolve_path(p: str | None) -> str | None:
+    if p is None:
+        return None
+    return str(Path(p).expanduser().resolve())
+
+
+def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
+    """Pull non-default values from argparse into a setup_*-compatible dict."""
+    kwargs: dict = {}
+
+    # Common: only include when user explicitly set them.
+    if args.pbc:
+        kwargs["pbc"] = True
+    if args.temperature is not None:
+        kwargs["temperature"] = args.temperature
+    if args.nsteps_per_frame is not None:
+        kwargs["nsteps_per_frame"] = args.nsteps_per_frame
+    if args.const_k is not None:
+        kwargs["const_k"] = args.const_k
+    if args.no_mouse_force:
+        kwargs["mouse_force"] = False
+
+    if args.level == "aa":
+        if args.ligand_sdf:
+            kwargs["ligand_sdf"] = _resolve_path(args.ligand_sdf)
+    elif args.level == "cg":
+        if args.ff is not None:
+            kwargs["ff"] = args.ff
+        if args.no_elastic_network:
+            kwargs["elastic_network"] = False
+    elif args.level == "mlmm":
+        for src, dst in [
+            ("ml_selection", "ml_selection"),
+            ("ml_backend", "ml_backend"),
+            ("ml_device", "ml_device"),
+            ("ml_charge", "ml_charge"),
+            ("ml_mult", "ml_mult"),
+        ]:
+            val = getattr(args, src)
+            if val is not None:
+                kwargs[dst] = val
+    return kwargs
+
+
+def _build_pymol_statement(
+    level: str, pdb_path: str, kwargs: dict, *, minimize: bool, run: bool
+) -> str:
+    """Assemble the ``-d`` payload PyMOL will eval at startup."""
+    kw_parts = [f"{k}={v!r}" for k, v in kwargs.items()]
+    call_args = ", ".join([repr(pdb_path), *kw_parts])
+    stmts = [
+        "from pymol_imd import *",
+        f"setup_{level}({call_args})",
+    ]
+    if minimize:
+        stmts.append("imd_minimize()")
+    if run:
+        stmts.append("imd_run()")
+    return "; ".join(stmts)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+
+    pdb_path = Path(args.pdb).expanduser().resolve()
+    if not pdb_path.exists():
+        print(f"pymol_imd: PDB file not found: {pdb_path}", file=sys.stderr)
+        return 2
+
+    pymol_bin = args.pymol or shutil.which("pymol")
+    if not pymol_bin:
+        print(
+            "pymol_imd: pymol executable not found in PATH. "
+            "Activate the pixi env first (`pixi shell`) or pass --pymol /path/to/pymol.",
+            file=sys.stderr,
+        )
+        return 127
+
+    kwargs = _collect_setup_kwargs(args)
+    statement = _build_pymol_statement(
+        args.level,
+        str(pdb_path),
+        kwargs,
+        minimize=args.minimize,
+        run=args.run,
+    )
+
+    cmd = [pymol_bin, "-d", statement]
+    if args.print_only:
+        print(shlex.join(cmd))
+        return 0
+
+    return subprocess.run(cmd).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

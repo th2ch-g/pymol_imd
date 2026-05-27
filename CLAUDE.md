@@ -39,12 +39,24 @@ The plugin must accept proteins, DNA, RNA, lipids, and small-molecule ligands; c
 ### Common commands
 
 ```bash
-pixi install                      # create / sync env
-pixi run pymol <pdb> -d "from pymol_imd import *; setup_aa <pdb>; imd_run"
+pixi install                      # create / sync env (+ editable installs the pymol_imd CLI)
+pixi run pymol_imd input.pdb --level aa                  # launch PyMOL with setup_aa
+pixi run pymol_imd input.pdb --level cg --minimize       # CG + auto-minimize
+pixi run pymol_imd input.pdb --level mlmm \
+    --ml-selection "resi 30-50" --ml-backend uma --run   # ONIOM ML/MM + auto-run
+pixi run pymol_imd <pdb> --level <aa|cg|mlmm> --print-only   # show the underlying pymol -d command
+pixi run pymol <pdb> -d "from pymol_imd import *; setup_aa <pdb>; imd_run"  # legacy interactive route
 pixi run ruff-format
 pixi run ruff-lint
 pixi run r                        # format + lint
 ```
+
+The `pymol_imd` CLI (`pymol_imd/cli.py`) is a thin wrapper: it builds a
+`pymol -d "from pymol_imd import *; setup_<level>(...)"` invocation and
+execs PyMOL. All backend-specific flags (`--ligand-sdf`, `--ml-backend`, etc.)
+become kwargs on the matching `setup_*` call. The PyMOL-side commands
+(`setup_aa`, `setup_cg`, `setup_mlmm`, `imd_run`, …) keep working unchanged
+for users who prefer the interactive route.
 
 There is currently no test target; if adding one, register it as a `[tool.pixi.tasks]` entry.
 

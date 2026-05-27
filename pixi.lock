@@ -8923,7 +8923,7 @@ packages:
 - pypi: ./
   name: pymol-imd
   version: 0.1.0
-  sha256: 627a7cdffc455ba3d01b3c18ad72cad68b66061d8658c58b454a7062bb2f8be2
+  sha256: b47c32ab4f55b308ff1c405628d19463ca76adf9f5ef81dd18b1a19f4b911874
   requires_python: '>=3.11,<3.13'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/pymol-open-source-3.1.0-py312h40ef045_0.conda
   sha256: 51cbba2f47365c2334de40466a8c318fef87a535a9144cbdad41ec2c1ec007b5

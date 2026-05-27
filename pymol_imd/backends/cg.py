@@ -23,7 +23,6 @@ from pathlib import Path
 from openmm import unit
 from openmm.app import PDBFile
 
-from ..prep import write_prepared_pdb
 from .base import SystemBundle
 
 logger = logging.getLogger(__name__)
@@ -179,20 +178,13 @@ class CGBackend:
         )
         system = top.create_system(nonbonded_cutoff=1.1 * unit.nanometer)
 
-        # PDBFile.writeFile chokes on Quantity-wrapped box vectors when writing
-        # CRYST1 (openmm 8.x: Quantity[0].__float__ returns Quantity, not float).
-        # Strip the box for the PDB output only; MD still uses the System's
-        # box vectors which are set independently.
-        saved_box = top.topology.getPeriodicBoxVectors()
-        top.topology.setPeriodicBoxVectors(None)
-        try:
-            prepared_pdb = write_prepared_pdb(
-                top.topology,
-                coords.positions,
-                work_dir / "cg_prepared.pdb",
-            )
-        finally:
-            top.topology.setPeriodicBoxVectors(saved_box)
+        # Use martinize2's cg.pdb directly as the prepared PDB. Its CONECT
+        # records list only chemical bonds + constraints (no elastic-network
+        # springs), which is exactly the connectivity we want PyMOL to draw.
+        # Atom order in cg.pdb matches MartiniTopFile.topology because both
+        # come from the same cg.top.
+        prepared_pdb = work_dir / "cg_prepared.pdb"
+        shutil.copy(cg_pdb, prepared_pdb)
 
         return SystemBundle(
             system=system,

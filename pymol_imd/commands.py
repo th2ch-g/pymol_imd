@@ -52,14 +52,19 @@ def _make_imd(bundle, pymol_object: str, **kwargs) -> IMDSystem:
     return IMDSystem(bundle, cfg, pymol_object=pymol_object)
 
 
-def _load_prepared_into_pymol(prepared_pdb_path: Path, base_name: str) -> str:
+def _load_prepared_into_pymol(
+    prepared_pdb_path: Path, base_name: str, *, backend_name: str = "aa"
+) -> str:
     """Load the prepared PDB into PyMOL as a NEW object and return its name.
 
     The original object (e.g. ``1ubq``) is left untouched so the user can
     diff-view the pre/post-prep structures. The new object is named
     ``<base>_imd`` plus a numeric suffix if a previous IMD object exists.
 
-    Returns the actual PyMOL object name assigned.
+    Representation is chosen per backend because CG beads don't carry CONECT
+    bonds (``PDBFile.writeFile`` doesn't emit them) and their atom names
+    (``BB``/``SC1``) don't match PyMOL's cartoon detection, so the default
+    ``lines`` representation leaves the viewport empty.
     """
     from pymol import cmd
 
@@ -71,6 +76,25 @@ def _load_prepared_into_pymol(prepared_pdb_path: Path, base_name: str) -> str:
         suffix += 1
         candidate = f"{base_name}_imd_{suffix}"
     cmd.load(str(prepared_pdb_path), candidate)
+
+    # Backend-aware default representation. Users can always override later.
+    if backend_name == "cg":
+        # Spheres for the beads + sticks for the bonds (CONECT comes from
+        # martinize2's cg.pdb directly so only chemical bonds are drawn).
+        cmd.show_as("spheres", candidate)
+        cmd.show("sticks", candidate)
+        cmd.set("sphere_scale", 0.4, candidate)
+        cmd.set("stick_radius", 0.25, candidate)
+        # Martini bead types aren't standard elements, so PyMOL paints them
+        # with arbitrary fallback colors. Override: backbone in skyblue, the
+        # rest (side-chain beads) in yelloworange for a clean CG look.
+        cmd.color("skyblue", f"{candidate} and name BB")
+        cmd.color("yelloworange", f"{candidate} and not name BB")
+    else:  # aa, mlmm
+        cmd.show_as("cartoon", candidate)
+        # Render any non-polymer atoms (ligands, ions left in) as sticks too.
+        cmd.show("sticks", f"{candidate} and not polymer")
+    cmd.zoom(candidate, buffer=2.0)
     return candidate
 
 
@@ -87,7 +111,7 @@ def setup_aa(
     pbc: object = False,
     temperature: object = 300.0,
     nsteps_per_frame: object = 1,
-    const_k: object = 5000.0,
+    const_k: object = 50000.0,
     mouse_force: object = True,
 ) -> None:
     """Set up an all-atom IMD simulation in vacuo (NVT) by default."""
@@ -100,7 +124,9 @@ def setup_aa(
         ligand_sdf=ligand_path,
         pbc=_as_bool(pbc),
     )
-    obj_name = _load_prepared_into_pymol(bundle.prepared_pdb_path, pdb_path.stem)
+    obj_name = _load_prepared_into_pymol(
+        bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
+    )
     _imd_system = _make_imd(
         bundle,
         obj_name,
@@ -117,24 +143,38 @@ def setup_aa(
 def setup_cg(
     pdb_file: str,
     pbc: object = False,
-    ff: str = "martini30",
+    ff: str | None = None,
     elastic_network: object = True,
     temperature: object = 300.0,
     nsteps_per_frame: object = 1,
-    const_k: object = 5000.0,
+    const_k: object = 50000.0,
     mouse_force: object = True,
+    timestep_ps: object = 0.020,
 ) -> None:
-    """Set up a Martini CG IMD simulation via vermouth + martini_openmm."""
+    """Set up a Martini CG IMD simulation via vermouth + martini_openmm.
+
+    ``ff=None`` falls back to ``CGBackend``'s default (currently martini3001).
+    Keeping the default sourced from the backend avoids drift between the
+    PyMOL command layer and the underlying constant.
+
+    ``timestep_ps`` defaults to 20 fs — the Martini 3 standard. CG beads
+    have no fast X-H modes, so the long timestep is safe and makes CG
+    actually feel ~10x faster than AA per wall-clock second. Override with
+    a smaller value if you observe instability.
+    """
     global _imd_system, _timer, _timer_minimize
     pdb_path = Path(pdb_file)
 
-    bundle = CGBackend().build_system(
-        pdb_path,
-        pbc=_as_bool(pbc),
-        ff=ff,
-        elastic_network=_as_bool(elastic_network),
+    cg_kwargs: dict = {
+        "pbc": _as_bool(pbc),
+        "elastic_network": _as_bool(elastic_network),
+    }
+    if ff is not None:
+        cg_kwargs["ff"] = ff
+    bundle = CGBackend().build_system(pdb_path, **cg_kwargs)
+    obj_name = _load_prepared_into_pymol(
+        bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
     )
-    obj_name = _load_prepared_into_pymol(bundle.prepared_pdb_path, pdb_path.stem)
     _imd_system = _make_imd(
         bundle,
         obj_name,
@@ -142,10 +182,14 @@ def setup_cg(
         nsteps_per_frame=_as_int(nsteps_per_frame),
         const_k=_as_float(const_k),
         mouse_force=_as_bool(mouse_force),
+        timestep_ps=_as_float(timestep_ps),
     )
     _timer = _make_qtimer()
     _timer_minimize = _make_qtimer()
-    print(f"setup_cg: ready (object={obj_name}, atoms={_imd_system.n_atoms}, pbc={bundle.pbc})")
+    print(
+        f"setup_cg: ready (object={obj_name}, atoms={_imd_system.n_atoms}, "
+        f"dt={_as_float(timestep_ps) * 1000:.1f}fs, pbc={bundle.pbc})"
+    )
 
 
 def setup_mlmm(
@@ -158,7 +202,7 @@ def setup_mlmm(
     pbc: object = False,
     temperature: object = 300.0,
     nsteps_per_frame: object = 1,
-    const_k: object = 5000.0,
+    const_k: object = 50000.0,
     mouse_force: object = True,
 ) -> None:
     """Set up an ONIOM-style ML/MM IMD simulation.
@@ -185,7 +229,9 @@ def setup_mlmm(
         ml_charge=_as_int(ml_charge),
         ml_mult=_as_int(ml_mult),
     )
-    obj_name = _load_prepared_into_pymol(bundle.prepared_pdb_path, pdb_path.stem)
+    obj_name = _load_prepared_into_pymol(
+        bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
+    )
     _imd_system = _make_imd(
         bundle,
         obj_name,
@@ -204,8 +250,26 @@ def setup_mlmm(
 
 
 # ----------------------------------------------------------------- imd_* family
-def imd_minimize(max_iter_per_chunk: object = 50) -> None:
-    """Run energy minimization on the Qt event loop until convergence."""
+def imd_minimize(
+    max_iter_per_chunk: object = 50,
+    max_chunks: object = 200,
+) -> None:
+    """Run energy minimization on the Qt event loop.
+
+    Stops when either:
+      * two consecutive chunks differ in potential energy by less than
+        ``1e-3 kJ/mol`` (the convergence path), or
+      * ``max_chunks`` chunks have run without converging (the cap path).
+
+    Parameters
+    ----------
+    max_iter_per_chunk:
+        OpenMM minimizer iterations per Qt tick. Larger values make each
+        tick heavier but reduce Python overhead.
+    max_chunks:
+        Hard upper bound on the number of chunks. Default 200 → up to
+        ``200 * 50 = 10000`` minimization iterations before forced stop.
+    """
     if _imd_system is None:
         print("imd: no system loaded — call setup_aa / setup_cg / setup_mlmm first")
         return
@@ -213,18 +277,33 @@ def imd_minimize(max_iter_per_chunk: object = 50) -> None:
         print("imd: already running — call imd_stop first")
         return
     max_iter = _as_int(max_iter_per_chunk)
+    chunk_cap = _as_int(max_chunks)
     _imd_system.running = True
 
+    # Wrap counter in a list so the closure can rebind without `nonlocal`.
+    chunks_done = [0]
+
     def _tick():
+        chunks_done[0] += 1
         converged = _imd_system.minimize_step(max_iterations=max_iter)
         if converged:
             _timer_minimize.stop()
             _imd_system.running = False
-            print("imd_minimize: converged")
+            total_iter = chunks_done[0] * max_iter
+            print(f"imd_minimize: converged at chunk {chunks_done[0]} ({total_iter} iter)")
+            return
+        if chunks_done[0] >= chunk_cap:
+            _timer_minimize.stop()
+            _imd_system.running = False
+            total_iter = chunks_done[0] * max_iter
+            print(
+                f"imd_minimize: hit max_chunks={chunk_cap} ({total_iter} iter) "
+                "without convergence — raise max_chunks or relax tolerance if needed"
+            )
 
     _timer_minimize.timeout.connect(_tick)
     _timer_minimize.start(1)
-    print("imd_minimize: started")
+    print(f"imd_minimize: started (max_chunks={chunk_cap}, iter_per_chunk={max_iter})")
 
 
 def imd_run() -> None:

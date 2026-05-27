@@ -69,10 +69,32 @@ def load_and_complete_hydrogens(
     return modeller
 
 
+def _chemical_bond_only(atom_a, atom_b) -> bool:
+    """Return True only for bonds that look like a true chemical connection.
+
+    For Martini CG: chemical bonds are (a) intra-residue (BB-SC, SC-SC) and
+    (b) sequential BB-BB peptide bonds (residue id differs by 1, same chain).
+    Anything else — typically non-sequential BB-BB — is an elastic-network
+    spring that we don't want in PyMOL's CONECT records.
+    """
+    ra = atom_a.residue
+    rb = atom_b.residue
+    if ra is rb:
+        return True
+    if ra.chain is not rb.chain:
+        return False
+    try:
+        return abs(int(ra.id) - int(rb.id)) == 1
+    except (ValueError, TypeError):
+        return False
+
+
 def write_prepared_pdb(
     topology: Topology,
     positions: Quantity,
     out_path: Path | str,
+    *,
+    bond_filter=None,
 ) -> Path:
     """Write a PDB so PyMOL can be re-loaded against the OpenMM atom order.
 
@@ -80,11 +102,23 @@ def write_prepared_pdb(
     that are absent from the input PDB; without re-loading PyMOL with this
     file, ``index - 1`` lookups in the IMD sync step land on the wrong atoms
     and the visible structure collapses.
+
+    Emits ``CONECT`` records from ``topology.bonds()`` so PyMOL can draw
+    bonds. Pass ``bond_filter=_chemical_bond_only`` (or a custom callable)
+    to suppress Martini elastic-network springs etc.; the OpenMM ``System``
+    still holds the full bond list, so MD physics is unaffected.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
     with open(out_path, "w") as fh:
-        PDBFile.writeFile(topology, positions, fh, keepIds=True)
+        PDBFile.writeHeader(topology, fh)
+        PDBFile.writeModel(topology, positions, fh, modelIndex=1)
+        for atom_a, atom_b in topology.bonds():
+            if bond_filter is not None and not bond_filter(atom_a, atom_b):
+                continue
+            fh.write(f"CONECT{atom_a.index + 1:>5d}{atom_b.index + 1:>5d}\n")
+        PDBFile.writeFooter(topology, fh)
     return out_path
 
 
