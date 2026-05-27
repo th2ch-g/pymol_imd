@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **CG (Martini)** — coarse-grained MD via `setup_cg`
 - **AA (Amber)** — all-atom MD via `setup_aa`
-- **ML/MM** — hybrid ML/MM MD via `setup_mlmm`, wrapping the [`mlmm_toolkit`](https://github.com/t-0hmura/mlmm_toolkit)
+- **ML/MM** — ONIOM-style hybrid MD via `setup_mlmm` (Amber MM full system + MLIP correction on a user-selected region)
 
 The plugin must accept proteins, DNA, RNA, lipids, and small-molecule ligands; complete missing hydrogens when possible; parameterize ligands with AM1-BCC charges via AmberTools/OpenFF; and run in vacuo by default (no solvent, no PBC, no box). After `setup_*`, the standard flow is `minimize` → production-run (no equilibration), and user-driven pulling of atoms in the PyMOL viewer is translated into per-atom forces fed into OpenMM each frame.
 
@@ -20,11 +20,11 @@ The plugin must accept proteins, DNA, RNA, lipids, and small-molecule ligands; c
 - **Approved libraries** (already greenlit by the user):
   - core: `openmm`, `pymol-open-source`, `ambertools`, `openmmforcefields`, `openff-toolkit`, `rdkit`
   - CG: `vermouth` (martinize2) + `martini-openmm` (git+URL, no conda-forge build)
-  - ML/MM: `mlmm_toolkit` (git+URL) + `pytorch`, `pytorch_scatter`, `pytorch_geometric`, `ase`, `parmed`, `biopython` from conda-forge
+  - ML/MM: `mace-torch` (default, MACE-OMOL-0) plus conda-side `pytorch`, `pytorch_scatter`, `pytorch_geometric`, `ase`, `parmed`, `biopython`. UMA / ORB / AIMNet2 backends are pulled in via the `install-uma` / `install-orb` / `install-aimnet2` pixi tasks.
   - hydrogen completion: **only** `openmm.app.Modeller.addHydrogens` — do NOT pull in `pdbfixer`, `propka`, etc.
 - Any other dependency requires explicit user approval before being added.
 - **pixi environments**: All three backends (AA / CG / ML-MM) live in the single `default` environment. `pixi install` covers AA + CG + MACE-based ML/MM out of the box.
-- **mlmm_toolkit-free**: As of the latest revision, `pymol_imd/backends/mlmm.py` builds the MLIP ASE Calculators directly (`mace_omol`, `ORBCalculator`, `AIMNet2Calculator`, `FAIRChemCalculator`). The previous `mlmm_toolkit` dispatcher dependency was removed — no need to clone the fork at `../mlmm_toolkit`.
+- **No mlmm_toolkit**: `pymol_imd/backends/mlmm.py` builds the MLIP ASE Calculators directly (`mace_omol`, `ORBCalculator`, `AIMNet2Calculator`, `FAIRChemCalculator`). No external dispatcher; everything ML-related lives inside this repo.
 - **CG forcefield**: Martini 3 `.itp` is downloaded once into `~/.cache/pymol_imd/martini3/` on first `setup_cg`. Online required for first run; subsequent runs are offline.
 - **CG forces PBC**: Martini uses a 1.1 nm cutoff so it cannot run in vacuo. CG backend auto-creates a bounding-box around the molecule + 1 nm padding when `pbc=False`. AA/MLMM still default to NoCutoff vacuo.
 - **ML/MM = ONIOM**: `E_total = E_MM(full) + E_ML(region) - E_MM(region)`. Each frame the ML region delta force `F_ML - F_MM_subset` is pushed into a dedicated `CustomExternalForce`. Link-atom handling for cross-region bonds is **not implemented yet**; pick selections that are molecularly closed (entire residues / chains).
@@ -81,7 +81,7 @@ The codebase is being rebuilt; the previous monolithic `pymol_imd/__init__.py` (
 
 - **AA**: forcefield stack mirrors the reference impl — `amber14-all.xml`, `protein.ff14SB`, `tip3pfb` (only if water present), `lipid17`, `DNA.OL15`, `RNA.OL3`. Ligands go through `GAFFTemplateGenerator` (gaff-2.2.20). AM1-BCC charges are produced by AmberTools `antechamber` or OpenFF; verify the chosen path runs on all four platforms. Missing hydrogens are added with `Modeller.addHydrogens` only.
 - **CG (Martini)**: two-step pipeline — `vermouth` (martinize2) converts the AA input into Martini topology files (`.top`/`.itp`/`.gro`), then `martini-openmm` parses those into an OpenMM `System`/`Topology`/`Positions`. Same `CustomExternalForce` is attached so IMD pulling still works on CG beads.
-- **ML/MM**: wraps `mlmm_toolkit` (declared as `git+URL` in pixi pypi-dependencies). The user selects the ML region via a PyMOL selection string; the rest is handled by Amber-style MM. Cross-platform install must be verified after the first pixi sync.
+- **ML/MM**: ONIOM = full-system Amber MM + per-frame MLIP delta force on the ML region. The ML region is resolved through PyMOL's selection language when running inside a session (`cmd.iterate` on a temp prepared-PDB copy), with a strict mini-DSL fallback for headless runs. MACE-OMOL-0 is the default backend; UMA / ORB / AIMNet2 need their own pip task (`install-uma` etc.).
 
 ## User Interaction Conventions
 
