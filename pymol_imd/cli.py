@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 ML_BACKENDS = ("uma", "orb", "mace", "aimnet2")
+LINK_ATOM_METHODS = ("scaled", "fixed", "none")
 LEVELS = ("aa", "cg", "mlmm")
 
 
@@ -115,6 +116,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "is auto-derived as mult - 1."
         ),
     )
+    mlmm.add_argument(
+        "--link-atom-method",
+        choices=LINK_ATOM_METHODS,
+        metavar="MODE",
+        default=None,
+        help=(
+            f"How to place / redistribute link atoms at the QM/MM boundary. "
+            f"One of: {', '.join(LINK_ATOM_METHODS)}. "
+            "Default: 'scaled' (Morokuma/Dapprich g-factor). "
+            "'fixed' keeps Q-H at a tabulated bond length using the IMOMM "
+            "projector Jacobian. 'none' disables link atoms — only safe for "
+            "molecularly closed ML selections."
+        ),
+    )
 
     # ---- launcher controls
     launcher = p.add_argument_group("launcher")
@@ -169,6 +184,7 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
             ("ml_device", "ml_device"),
             ("ml_charge", "ml_charge"),
             ("ml_mult", "ml_mult"),
+            ("link_atom_method", "link_atom_method"),
         ]:
             val = getattr(args, src)
             if val is not None:

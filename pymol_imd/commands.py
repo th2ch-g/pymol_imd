@@ -121,6 +121,42 @@ def _make_qtimer():
     return QtCore.QTimer()
 
 
+def _highlight_ml_region(obj_name: str, ml_indices: tuple[int, ...]) -> str:
+    """Highlight the ML-region atoms while leaving the MM environment alone.
+
+    Only the ML atoms get recolored: carbons take on the cbam magenta and
+    other elements keep their CPK defaults (N=blue, O=red, S=yellow, H=white)
+    so element identity stays readable. The MM region is left untouched,
+    preserving whatever coloring the user already had on the object.
+
+    OpenMM atom indices are 0-based; PyMOL's per-object atom ``index`` is
+    1-based and stays aligned with OpenMM because ``retain_order=1`` is set
+    on import. We mark the ML atoms via a b-factor flag instead of building
+    a huge ``index 1+2+3+...`` selection string, which would break down on
+    ML regions larger than a few hundred atoms.
+
+    Returns the name of the persistent named selection ("<obj>_ml") so the
+    user can re-target it later (e.g. ``util.cbac <obj>_ml`` to switch to
+    cyan carbons).
+    """
+    from pymol import cmd, util
+
+    ml_set = {int(i) + 1 for i in ml_indices}
+    cmd.alter(obj_name, "b = 1.0 if index in ml_set else 0.0", space={"ml_set": ml_set})
+    sel_name = f"{obj_name}_ml"
+    # enable=0 keeps the named selection available for later commands but
+    # suppresses the pink "selection indicator" dots that would otherwise
+    # clutter the viewport immediately after setup.
+    cmd.select(sel_name, f"{obj_name} and b > 0.5", enable=0)
+    # cbam: color-by-atom with magenta carbons. Heteroatoms keep CPK colors,
+    # so the user can still read off element identity at a glance.
+    util.cbam(sel_name)
+    # Sticks on top of the existing cartoon makes the ML region pop without
+    # hiding the surrounding fold.
+    cmd.show("sticks", sel_name)
+    return sel_name
+
+
 # --------------------------------------------------------------- setup_* family
 def setup_aa(
     pdb_file: str,
@@ -226,6 +262,7 @@ def setup_mlmm(
     nsteps_per_frame: object = 1,
     const_k: object = None,
     mouse_force: object = True,
+    link_atom_method: str = "scaled",
 ) -> None:
     """Set up an ONIOM-style ML/MM IMD simulation.
 
@@ -244,6 +281,13 @@ def setup_mlmm(
         works out of the box. UMA needs HF auth.
     ml_device :
         ``auto`` (cuda → mps → cpu), or explicit ``cuda``/``mps``/``cpu``.
+    link_atom_method :
+        ``"scaled"`` (default, Morokuma/Dapprich g-factor) places the link H
+        at ``r_Q + g*(r_M - r_Q)`` so it stretches with the broken bond;
+        ``"fixed"`` keeps the Q-H distance at a tabulated value (1.09 Å for
+        C, 1.01 Å for N, …) using the IMOMM projector Jacobian; ``"none"``
+        disables link-atom handling (only safe for molecularly closed
+        selections).
     """
     global _imd_system, _timer, _timer_minimize
     if ml_selection is None:
@@ -268,10 +312,13 @@ def setup_mlmm(
         ml_device=ml_device,
         ml_charge=_as_int(ml_charge),
         ml_mult=_as_int(ml_mult),
+        link_atom_method=link_atom_method,
     )
     obj_name = _load_prepared_into_pymol(
         bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
     )
+    ml_indices = bundle.extra["ml_indices"] if bundle.extra else ()
+    ml_sel_name = _highlight_ml_region(obj_name, ml_indices) if ml_indices else None
     _imd_system = _make_imd(
         bundle,
         obj_name,
@@ -282,10 +329,13 @@ def setup_mlmm(
     )
     _timer = _make_qtimer()
     _timer_minimize = _make_qtimer()
-    n_ml = len(bundle.extra["ml_indices"]) if bundle.extra else 0
+    n_ml = len(ml_indices)
+    n_link = len(bundle.extra.get("link_atoms", ())) if bundle.extra else 0
+    sel_msg = f", ml_sel={ml_sel_name}" if ml_sel_name else ""
+    link_msg = f", link_atoms={n_link}({link_atom_method})" if n_link else ""
     print(
         f"setup_mlmm: ready (object={obj_name}, atoms={_imd_system.n_atoms}, "
-        f"ml_atoms={n_ml}, ml_backend={ml_backend}, pbc={bundle.pbc})"
+        f"ml_atoms={n_ml}, ml_backend={ml_backend}, pbc={bundle.pbc}{link_msg}{sel_msg})"
     )
 
 

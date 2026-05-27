@@ -32,10 +32,103 @@ from .base import SystemBundle
 logger = logging.getLogger(__name__)
 
 SUPPORTED_ML_BACKENDS = ("uma", "orb", "mace", "aimnet2")
+SUPPORTED_LINK_ATOM_METHODS = ("scaled", "fixed", "none")
 
 # Unit conversion: ASE returns eV / (eV/Å), OpenMM wants kJ/mol / kJ/(mol·nm).
 EV_PER_KJMOL = 96.48533212331  # 1 eV = 96.485... kJ/mol
 EV_PER_A_TO_KJ_PER_MOL_NM = EV_PER_KJMOL * 10.0
+
+# Covalent radii in Angstrom for the Morokuma/Dapprich g-factor.
+# Source: standard chemistry references (Cordero 2008, condensed). Only the
+# elements seen at QM/MM boundaries in biomolecules are listed; unusual
+# elements fall back to ``_DEFAULT_COVALENT_RADIUS``.
+_COVALENT_RADIUS_ANG: dict[str, float] = {
+    "H": 0.31,
+    "C": 0.76,
+    "N": 0.71,
+    "O": 0.66,
+    "F": 0.57,
+    "P": 1.07,
+    "S": 1.05,
+    "Cl": 1.02,
+    "Br": 1.20,
+    "I": 1.39,
+}
+_DEFAULT_COVALENT_RADIUS = 0.75
+
+# Fixed link-atom bond lengths (Angstrom) for the "fixed" mode. Only the
+# common QM-side anchors are tabulated — anything else raises so a silent
+# wrong-distance never sneaks in.
+_FIXED_LINK_DISTANCE_ANG: dict[str, float] = {
+    "C": 1.09,  # C-H
+    "N": 1.01,  # N-H
+    "O": 0.96,  # O-H
+    "S": 1.34,  # S-H
+}
+
+
+def _covalent_radius(elem: str) -> float:
+    return _COVALENT_RADIUS_ANG.get(elem.capitalize(), _DEFAULT_COVALENT_RADIUS)
+
+
+def _g_factor(qm_elem: str, mm_elem: str, link_elem: str = "H") -> float:
+    """Morokuma/Dapprich g-factor for link-atom placement.
+
+    g = (CR(QM) + CR(link)) / (CR(QM) + CR(MM)), with CR = covalent radius.
+    The link atom sits at r_L = r_QM + g * (r_MM - r_QM). Unit cancels, so
+    radii in Angstrom give the same g as radii in Bohr.
+    """
+    cr_q = _covalent_radius(qm_elem)
+    cr_m = _covalent_radius(mm_elem)
+    cr_l = _covalent_radius(link_elem)
+    return (cr_q + cr_l) / (cr_q + cr_m)
+
+
+def _detect_link_atoms(
+    topology, ml_indices: tuple[int, ...], *, method: str = "scaled"
+) -> tuple[tuple[int, int, float], ...]:
+    """Enumerate ML/MM boundary bonds and emit link-atom records.
+
+    Walks every bond in ``topology``; a bond with exactly one endpoint in
+    ``ml_indices`` is a QM/MM boundary. For each boundary bond we emit a
+    ``(qm_atom_index, mm_atom_index, param)`` triple, where ``param`` is the
+    method-dependent placement parameter:
+
+      * ``method="scaled"``: g-factor (Morokuma/Dapprich), unitless.
+      * ``method="fixed"``:  fixed link bond length (Å) tabulated by QM
+                             element.
+
+    ``method="none"`` returns an empty tuple — useful for molecularly closed
+    selections where link atoms aren't needed.
+    """
+    if method == "none":
+        return ()
+    if method not in SUPPORTED_LINK_ATOM_METHODS:
+        raise ValueError(
+            f"Unknown link_atom_method {method!r}. Choose from {SUPPORTED_LINK_ATOM_METHODS}."
+        )
+    keep = set(ml_indices)
+    records: list[tuple[int, int, float]] = []
+    for a1, a2 in topology.bonds():
+        in1 = a1.index in keep
+        in2 = a2.index in keep
+        if in1 == in2:
+            continue  # both QM or both MM — not a boundary
+        q_atom, m_atom = (a1, a2) if in1 else (a2, a1)
+        q_elem = q_atom.element.symbol
+        m_elem = m_atom.element.symbol
+        if method == "scaled":
+            param = _g_factor(q_elem, m_elem)
+        else:  # "fixed"
+            if q_elem not in _FIXED_LINK_DISTANCE_ANG:
+                raise ValueError(
+                    f"Fixed link-atom mode does not support QM-side element "
+                    f"{q_elem!r} (atom {q_atom.index}). Use link_atom_method="
+                    f"'scaled' or extend _FIXED_LINK_DISTANCE_ANG."
+                )
+            param = _FIXED_LINK_DISTANCE_ANG[q_elem]
+        records.append((q_atom.index, m_atom.index, float(param)))
+    return tuple(records)
 
 
 # ----------------------------------------------------------------------------
@@ -401,11 +494,17 @@ class MLMMBackend:
         ml_mult: int = 1,
         mace_model: str = "MACE-OMOL-0",
         constraints: str | None = None,
+        link_atom_method: str = "scaled",
         **_: object,
     ) -> SystemBundle:
         if ml_backend not in SUPPORTED_ML_BACKENDS:
             raise ValueError(
                 f"Unknown ml_backend {ml_backend!r}. Choose from {SUPPORTED_ML_BACKENDS}."
+            )
+        if link_atom_method not in SUPPORTED_LINK_ATOM_METHODS:
+            raise ValueError(
+                f"Unknown link_atom_method {link_atom_method!r}. "
+                f"Choose from {SUPPORTED_LINK_ATOM_METHODS}."
             )
 
         from openmm.app import PME, ForceField
@@ -482,6 +581,18 @@ class MLMMBackend:
 
         ml_symbols = _atoms_from_topology(modeller.topology, ml_indices)
 
+        # Resolve QM/MM boundary bonds into link-atom records. Empty when the
+        # ML region is molecularly closed (or method="none"). Each record is
+        # (qm_atom_index, mm_atom_index, placement_param) — see
+        # ``_detect_link_atoms`` for the meaning of placement_param.
+        link_atoms = _detect_link_atoms(modeller.topology, ml_indices, method=link_atom_method)
+        if link_atoms:
+            logger.info(
+                "MLMM: %d link atoms (method=%s) inserted at QM/MM boundary bonds",
+                len(link_atoms),
+                link_atom_method,
+            )
+
         return SystemBundle(
             system=system,
             topology=modeller.topology,
@@ -497,5 +608,7 @@ class MLMMBackend:
                 "ml_backend_name": ml_backend,
                 "ml_subset_context": sub_context,
                 "ml_subset_n_atoms": sub_system.getNumParticles(),
+                "link_atoms": link_atoms,
+                "link_atom_method": link_atom_method,
             },
         )

@@ -133,9 +133,13 @@ class IMDSystem:
     ) -> openmm.CustomExternalForce | None:
         """Attach a CustomExternalForce that carries the ONIOM ML-vs-MM delta.
 
-        Only ML region atoms get a particle; non-ML atoms are not registered,
-        so the per-step update is O(|ML region|) instead of O(N). Idempotent
-        across IMDSystem rebuilds on the same bundle.
+        ML region atoms get a particle in the canonical ``ml_indices`` order
+        (local indices ``[0, n_ml)``). When link atoms are present, each
+        unique MM-side boundary atom is appended as an additional particle
+        (local indices ``[n_ml, n_ml + n_bdy)``) so the per-frame routine can
+        push the redistributed link-atom force to those atoms in O(|ML|+|bdy|)
+        without scanning the full system. Idempotent across IMDSystem
+        rebuilds on the same bundle.
         """
         if not bundle.extra or "ml_indices" not in bundle.extra:
             return None
@@ -147,6 +151,20 @@ class IMDSystem:
             force.addPerParticleParameter(name)
         for atom_idx in bundle.extra["ml_indices"]:
             force.addParticle(int(atom_idx), (0.0, 0.0, 0.0))
+
+        # Boundary MM atoms (from link atoms) live outside ml_indices but
+        # still need force slots so the redistributed F_M can land somewhere.
+        ml_set = set(bundle.extra["ml_indices"])
+        boundary_mm: list[int] = []
+        seen: set[int] = set()
+        for _q_idx, m_idx, _param in bundle.extra.get("link_atoms", ()):
+            if m_idx in ml_set or m_idx in seen:
+                continue
+            seen.add(m_idx)
+            boundary_mm.append(int(m_idx))
+        for atom_idx in boundary_mm:
+            force.addParticle(atom_idx, (0.0, 0.0, 0.0))
+        bundle.extra["_mlmm_boundary_mm_indices"] = tuple(boundary_mm)
         bundle.system.addForce(force)
         return force
 
@@ -175,6 +193,13 @@ class IMDSystem:
         energy gradient and subtracts the Amber MM contribution computed on
         the same atoms, yielding the ONIOM total force on the ML region.
 
+        When ``link_atoms`` are present, link H atoms are appended to the
+        ML-region ASE ``Atoms`` and their forces are redistributed to the
+        QM-side (``ml_indices``) and MM-side (boundary) atoms using the
+        Jacobian of the link-atom placement. The MM subset is **not** rebuilt
+        with link atoms, matching the convention that the boundary bond's MM
+        contribution is supplied solely by the full-system MM force.
+
         Every supported MLIP backend (UMA / ORB / MACE / AIMNet2) is wrapped
         as an ASE ``Calculator``, so a single ``atoms.get_forces()`` call
         works for all of them.
@@ -186,6 +211,9 @@ class IMDSystem:
             return
         ml_indices = extra["ml_indices"]
         ml_symbols = extra["ml_symbols"]
+        link_atoms: tuple[tuple[int, int, float], ...] = extra.get("link_atoms", ())
+        boundary_mm: tuple[int, ...] = extra.get("_mlmm_boundary_mm_indices", ())
+        method: str = extra.get("link_atom_method", "scaled")
         sub_context: openmm.Context = extra["ml_subset_context"]
         ml_calc = extra["ml_calculator"]
         ml_info = extra.get("ml_calc_info", {})
@@ -194,31 +222,137 @@ class IMDSystem:
         ml_positions_nm = full_positions[list(ml_indices)]
         ml_positions_ang = ml_positions_nm * 10.0
 
-        # 1) MLIP force on ML region via ASE (eV / Å). Backend-agnostic.
-        atoms = Atoms(symbols=ml_symbols, positions=ml_positions_ang)
+        # 1) Build the ASE Atoms for MLIP inference. ML region first, link
+        #    atoms appended after (order matters for force partitioning).
+        if link_atoms:
+            link_positions_ang = self._link_atom_positions_ang(full_positions, link_atoms, method)
+            mlip_positions_ang = np.vstack([ml_positions_ang, link_positions_ang])
+            mlip_symbols = list(ml_symbols) + ["H"] * len(link_atoms)
+        else:
+            mlip_positions_ang = ml_positions_ang
+            mlip_symbols = list(ml_symbols)
+
+        atoms = Atoms(symbols=mlip_symbols, positions=mlip_positions_ang)
         atoms.calc = ml_calc
         # AIMNet2 reads charge / multiplicity from atoms.info; harmless for
         # the other backends.
         atoms.info.update(ml_info)
-        F_ml_eV_per_A = np.asarray(atoms.get_forces(), dtype=np.float64)
+        F_all_eV_per_A = np.asarray(atoms.get_forces(), dtype=np.float64)
 
-        # 2) MM force on the ML-region subset (kJ/mol/nm).
+        # 2) Partition MLIP forces. ML region atoms keep their forces; link
+        #    atom forces are redistributed via the placement Jacobian to the
+        #    QM-side (in ml_indices) and MM-side (in boundary_mm) atoms.
+        n_ml = len(ml_indices)
+        F_ml_eV_per_A = F_all_eV_per_A[:n_ml].copy()
+        F_mm_boundary_eV_per_A = np.zeros((len(boundary_mm), 3), dtype=np.float64)
+
+        if link_atoms:
+            ml_local = {int(idx): i for i, idx in enumerate(ml_indices)}
+            bdy_local = {int(idx): i for i, idx in enumerate(boundary_mm)}
+            F_link_all = F_all_eV_per_A[n_ml:]
+            for k, (q_idx, m_idx, param) in enumerate(link_atoms):
+                F_link = F_link_all[k]
+                f_q, f_m = self._redistribute_link_force(
+                    F_link, full_positions[q_idx], full_positions[m_idx], param, method
+                )
+                F_ml_eV_per_A[ml_local[int(q_idx)]] += f_q
+                # If m_idx happened to also be in the ML region (degenerate
+                # but legal), the redistributed force lands on the ML slot
+                # instead of a boundary slot.
+                if int(m_idx) in bdy_local:
+                    F_mm_boundary_eV_per_A[bdy_local[int(m_idx)]] += f_m
+                else:
+                    F_ml_eV_per_A[ml_local[int(m_idx)]] += f_m
+
+        # 3) MM force on the ML-region subset (kJ/mol/nm).
         sub_context.setPositions(ml_positions_nm * unit.nanometer)
         sub_state = sub_context.getState(getForces=True)
         F_mm_kj_per_nm = sub_state.getForces(asNumpy=True).value_in_unit(
             unit.kilojoule_per_mole / unit.nanometer
         )
 
-        # 3) Delta in OpenMM units: F_ML[kJ/mol/nm] - F_MM[kJ/mol/nm].
+        # 4) Delta in OpenMM units: F_ML[kJ/mol/nm] - F_MM[kJ/mol/nm] on the
+        #    ML region, and pure redistributed F_M on the boundary MM atoms
+        #    (subtractive term is absent there by construction).
         F_ml_kj_per_nm = F_ml_eV_per_A * _EV_PER_A_TO_KJ_PER_MOL_NM
-        delta = F_ml_kj_per_nm - np.asarray(F_mm_kj_per_nm)
+        delta_ml = F_ml_kj_per_nm - np.asarray(F_mm_kj_per_nm)
+        delta_bdy = F_mm_boundary_eV_per_A * _EV_PER_A_TO_KJ_PER_MOL_NM
 
         for local_idx, atom_idx in enumerate(ml_indices):
-            gx, gy, gz = delta[local_idx]
+            gx, gy, gz = delta_ml[local_idx]
             self._mlmm_force.setParticleParameters(
                 local_idx, int(atom_idx), (float(gx), float(gy), float(gz))
             )
+        for k, atom_idx in enumerate(boundary_mm):
+            gx, gy, gz = delta_bdy[k]
+            self._mlmm_force.setParticleParameters(
+                n_ml + k, int(atom_idx), (float(gx), float(gy), float(gz))
+            )
         self._mlmm_force.updateParametersInContext(self.simulation.context)
+
+    @staticmethod
+    def _link_atom_positions_ang(
+        full_positions_nm: np.ndarray,
+        link_atoms: tuple[tuple[int, int, float], ...],
+        method: str,
+    ) -> np.ndarray:
+        """Place each link H along the boundary bond, in Angstrom.
+
+        scaled: r_L = r_Q + g * (r_M - r_Q),  param = g
+        fixed : r_L = r_Q + d * u_QM,         param = d (Å), u_QM normalized
+        """
+        out = np.empty((len(link_atoms), 3), dtype=np.float64)
+        for k, (q_idx, m_idx, param) in enumerate(link_atoms):
+            r_q = full_positions_nm[q_idx] * 10.0
+            r_m = full_positions_nm[m_idx] * 10.0
+            vec = r_m - r_q
+            if method == "scaled":
+                out[k] = r_q + param * vec
+            else:  # "fixed"
+                norm = float(np.linalg.norm(vec))
+                if norm < 1e-9:
+                    # Degenerate Q≡M (numerical) — fall back to scaled
+                    # placement so we never divide by zero.
+                    out[k] = r_q
+                else:
+                    out[k] = r_q + (param / norm) * vec
+        return out
+
+    @staticmethod
+    def _redistribute_link_force(
+        f_link: np.ndarray,
+        r_q_nm: np.ndarray,
+        r_m_nm: np.ndarray,
+        param: float,
+        method: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Redistribute one link-atom force to (F_Q, F_M).
+
+        scaled: J = [[(1-g)I], [gI]] — trivial linear partition.
+        fixed : J carries an (I - u u^T) projector with a 1/R prefactor, so
+                bond-stretching motion of (Q,M) does not feed forces into
+                the link-atom position, only orientation changes do.
+        """
+        if method == "scaled":
+            g = param
+            return (1.0 - g) * f_link, g * f_link
+        # fixed mode. param is the link-atom distance in Å; convert to nm so
+        # the d/R ratio is unitless against r_q_nm / r_m_nm.
+        vec_nm = r_m_nm - r_q_nm
+        R_nm = float(np.linalg.norm(vec_nm))
+        if R_nm < 1e-9:
+            # Geometric degeneracy — return half-half as a safe fallback.
+            return 0.5 * f_link, 0.5 * f_link
+        u = vec_nm / R_nm
+        d_over_R = (param * 0.1) / R_nm
+        proj = np.eye(3) - np.outer(u, u)
+        # Jacobian blocks (mlmm_toolkit / Morokuma):
+        #   dR_dQ = I - d * (I - u u^T)/R    →  F_Q = (I - d_over_R * proj) f_L
+        #   dR_dM =      d * (I - u u^T)/R   →  F_M =       d_over_R * proj  f_L
+        proj_f = proj @ f_link
+        f_q = f_link - d_over_R * proj_f
+        f_m = d_over_R * proj_f
+        return f_q, f_m
 
     def _diverged(self) -> bool:
         """Return True (and mark the system stopped) if energy went insane.
