@@ -23,10 +23,18 @@ The plugin must accept proteins, DNA, RNA, lipids, and small-molecule ligands; c
   - ML/MM: `mlmm_toolkit` (git+URL) + `pytorch`, `pytorch_scatter`, `pytorch_geometric`, `ase`, `parmed`, `biopython` from conda-forge
   - hydrogen completion: **only** `openmm.app.Modeller.addHydrogens` — do NOT pull in `pdbfixer`, `propka`, etc.
 - Any other dependency requires explicit user approval before being added.
-- **pixi environments**: All three backends (AA / CG / ML-MM) live in the single `default` environment. mlmm_toolkit is pulled in as an editable PyPI dependency from a sibling fork (`../mlmm_toolkit`), so a single `pixi install` is enough.
-- The `../mlmm_toolkit` path is relative to the `pymol_imd` repo root. Clone the fork there (or symlink) before running `pixi install`.
-- The fork removes the upstream's Linux-only classifier and adds `_auto_torch_device` (in `mlmm/mlmm_calc.py`) so Apple Silicon MPS is auto-selected (priority: `cuda → mps → cpu`).
-- **Apple Silicon (MPS) fallback**: If a torch op is not yet implemented on MPS, export `PYTORCH_ENABLE_MPS_FALLBACK=1` before launching PyMOL so missing ops silently drop to CPU rather than raise.
+- **pixi environments**: All three backends (AA / CG / ML-MM) live in the single `default` environment. `pixi install` covers AA + CG out of the box. For ML/MM run `pixi run install-mlmm` once after that.
+- **Two-step ML/MM install**:
+  1. `pixi install` — conda deps including `pytorch`, `pytorch_scatter`, `pytorch_geometric`, `mdtraj`, `vermouth`, etc.
+  2. `pixi run install-mlmm` — `pip install --no-build-isolation -e ../mlmm_toolkit`. **Kept out of pypi-dependencies** because pixi's strict resolver clashes with `fairchem-core 2.x → ray[serve] → pydantic` transitive constraints; pip's looser resolver handles them.
+- **CG forcefield**: Martini 3 `.itp` is downloaded once into `~/.cache/pymol_imd/martini3/` on first `setup_cg`. Online required for first run; subsequent runs are offline.
+- **CG forces PBC**: Martini uses a 1.1 nm cutoff so it cannot run in vacuo. CG backend auto-creates a bounding-box around the molecule + 1 nm padding when `pbc=False`. AA/MLMM still default to NoCutoff vacuo.
+- **ML/MM = ONIOM**: `E_total = E_MM(full) + E_ML(region) - E_MM(region)`. Each frame the ML region delta force `F_ML - F_MM_subset` is pushed into a dedicated `CustomExternalForce`. Link-atom handling for cross-region bonds is **not implemented yet**; pick selections that are molecularly closed (entire residues / chains).
+- **MLIP model access**:
+  - **UMA**: Meta's gated repo. Needs HuggingFace auth: `huggingface-cli login` + access request approval at `huggingface.co/facebook/UMA`.
+  - **ORB / MACE / AIMNet2**: each needs its own optional dep (`orb-models`, `mace-torch`, `aimnet`). Not in the default env; users install them on demand.
+- **Apple Silicon (MPS) support**: The `mlmm_toolkit` fork's `_auto_torch_device` selects `cuda → mps → cpu`. Apple Silicon GPUs work for the MLIP backends out of the box.
+- **MPS fallback**: If a torch op is unimplemented on MPS, export `PYTORCH_ENABLE_MPS_FALLBACK=1` before launching PyMOL so the missing ops silently drop to CPU.
 
 ### Common commands
 

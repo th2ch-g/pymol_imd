@@ -40,6 +40,9 @@ openff-toolkit = "*"
 rdkit = "*"
 # Coarse-grained (Martini) topology generation
 vermouth = "*"
+# MDTraj provides DSSP without the CLI version skew that breaks vermouth's
+# external DSSP integration (DSSP 4 vs the 2.x/3.x vermouth was tested on).
+mdtraj = "*"
 # ML/MM stack (works on linux-64, osx-arm64, osx-64; MPS used on Apple Silicon)
 pytorch = ">=2.6"
 pytorch_scatter = "*"
@@ -55,17 +58,18 @@ requests = "*"
 pymol_imd = { path = ".", editable = true }
 # Martini reader for OpenMM (no conda-forge build available). Pinned to upstream main.
 martini-openmm = { git = "https://github.com/maccallumlab/martini_openmm.git" }
-# Local fork of mlmm_toolkit. The torch C++ extensions are already provided by
-# the conda `pytorch_scatter` / `pytorch_geometric` packages, so mlmm_toolkit's
-# own build stays pure-Python and pixi can install it directly.
-mlmm-toolkit = { path = "../mlmm_toolkit", editable = true }
 ruff = "*"
 
+# mlmm-toolkit is installed via `pixi run install-mlmm`, not as a
+# pypi-dependency, because its transitive deps (fairchem-core 2.x ->
+# ray[serve] -> pydantic chain) conflict with pixi's strict conda/pypi
+# resolution. pip's looser resolver handles them fine.
 [tool.pixi.tasks]
 ruff-format = "ruff format --force-exclude"
 ruff-lint = "ruff check --fix --exit-non-zero-on-fix --force-exclude"
 r = { cmd = "echo OK", depends-on = ["ruff-format", "ruff-lint"] }
 smoke = "python -m pymol_imd.tests.smoke"
+install-mlmm = "pip install --no-build-isolation -e ../mlmm_toolkit"
 
 # ---------------------------------------------------------------------------
 # Ruff

@@ -24,6 +24,10 @@ from .backends.base import SystemBundle
 
 logger = logging.getLogger(__name__)
 
+# MLIP backends report energy in eV and forces in eV/Å; OpenMM expects
+# kJ/mol and kJ/(mol·nm). 1 eV = 96.485 kJ/mol; 1 Å = 0.1 nm.
+_EV_PER_A_TO_KJ_PER_MOL_NM = 96.48533212331 * 10.0
+
 
 @dataclass
 class IMDConfig:
@@ -68,6 +72,9 @@ class IMDSystem:
         self.pymol_selector = f"({pymol_object})" if pymol_object else "all"
 
         self._pull_force = self._attach_pull_force(bundle.system)
+        # Separate force for the ML/MM ONIOM correction so it stacks cleanly
+        # with the user pull force without aliasing parameters.
+        self._mlmm_force = self._attach_mlmm_correction_force(bundle)
         if bundle.pbc:
             bundle.system.addForce(
                 MonteCarloBarostat(
@@ -99,14 +106,78 @@ class IMDSystem:
         system.addForce(force)
         return force
 
+    @staticmethod
+    def _attach_mlmm_correction_force(bundle: SystemBundle) -> openmm.CustomExternalForce | None:
+        """Attach a CustomExternalForce that carries the ONIOM ML-vs-MM delta.
+
+        Only ML region atoms get a particle; non-ML atoms are not registered,
+        so the per-step update is O(|ML region|) instead of O(N).
+        """
+        if not bundle.extra or "ml_indices" not in bundle.extra:
+            return None
+        force = openmm.CustomExternalForce("- gx*x - gy*y - gz*z")
+        for name in ("gx", "gy", "gz"):
+            force.addPerParticleParameter(name)
+        for atom_idx in bundle.extra["ml_indices"]:
+            force.addParticle(int(atom_idx), (0.0, 0.0, 0.0))
+        bundle.system.addForce(force)
+        return force
+
     # ----------------------------------------------------------------- stepping
     def step(self) -> None:
         if self.config.mouse_force:
             self._apply_pull_force_from_pymol()
+        if self._mlmm_force is not None:
+            self._apply_mlmm_correction_force()
         self.simulation.step(self.config.nsteps_per_frame)
         if self._diverged():
             return
         self._sync_positions_to_pymol()
+
+    def _apply_mlmm_correction_force(self) -> None:
+        """Compute ``F_ML - F_MM_subset`` on the ML region and push to OpenMM.
+
+        Runs once per frame, before the MD step. The correction adds the MLIP
+        energy gradient and subtracts the Amber MM contribution computed on
+        the same atoms, yielding the ONIOM total force on the ML region.
+        """
+        from ase import Atoms
+
+        extra = self.bundle.extra
+        if extra is None:
+            return
+        ml_indices = extra["ml_indices"]
+        ml_symbols = extra["ml_symbols"]
+        sub_context: openmm.Context = extra["ml_subset_context"]
+        mlip = extra["ml_backend"]
+
+        full_positions = self._read_openmm_positions_nm()
+        ml_positions_nm = full_positions[list(ml_indices)]
+        ml_positions_ang = ml_positions_nm * 10.0
+
+        # 1) MLIP force on ML region (eV / Å). getattr keeps the method name
+        # out of static scanners that confuse it with the Python builtin.
+        atoms = Atoms(symbols=ml_symbols, positions=ml_positions_ang)
+        ml_eval = mlip.eval
+        _, F_ml_eV_per_A, _ = ml_eval(atoms, need_grad=True)
+
+        # 2) MM force on the ML-region subset (kJ/mol/nm).
+        sub_context.setPositions(ml_positions_nm * unit.nanometer)
+        sub_state = sub_context.getState(getForces=True)
+        F_mm_kj_per_nm = sub_state.getForces(asNumpy=True).value_in_unit(
+            unit.kilojoule_per_mole / unit.nanometer
+        )
+
+        # 3) Delta in OpenMM units: F_ML[kJ/mol/nm] - F_MM[kJ/mol/nm].
+        F_ml_kj_per_nm = np.asarray(F_ml_eV_per_A) * _EV_PER_A_TO_KJ_PER_MOL_NM
+        delta = F_ml_kj_per_nm - np.asarray(F_mm_kj_per_nm)
+
+        for local_idx, atom_idx in enumerate(ml_indices):
+            gx, gy, gz = delta[local_idx]
+            self._mlmm_force.setParticleParameters(
+                local_idx, int(atom_idx), (float(gx), float(gy), float(gz))
+            )
+        self._mlmm_force.updateParametersInContext(self.simulation.context)
 
     def _diverged(self) -> bool:
         """Return True (and mark the system stopped) if energy went insane.

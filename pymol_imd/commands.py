@@ -151,13 +151,28 @@ def setup_cg(
 def setup_mlmm(
     pdb_file: str,
     ml_selection: str = "all",
+    ml_backend: str = "uma",
+    ml_device: str = "auto",
+    ml_charge: object = 0,
+    ml_mult: object = 1,
     pbc: object = False,
     temperature: object = 300.0,
     nsteps_per_frame: object = 1,
     const_k: object = 5000.0,
     mouse_force: object = True,
 ) -> None:
-    """Set up an ML/MM IMD simulation via mlmm_toolkit (Linux-only)."""
+    """Set up an ONIOM-style ML/MM IMD simulation.
+
+    Parameters
+    ----------
+    ml_selection :
+        Selection of atoms to treat with the MLIP. Examples: ``"all"``,
+        ``"resi 30-50"``, ``"chain A"``, ``"resn LIG"``, ``"0,1,2,3"``.
+    ml_backend :
+        One of ``uma`` / ``orb`` / ``mace`` / ``aimnet2``. Defaults to UMA.
+    ml_device :
+        ``auto`` (cuda → mps → cpu), or explicit ``cuda``/``mps``/``cpu``.
+    """
     global _imd_system, _timer, _timer_minimize
     pdb_path = Path(pdb_file)
 
@@ -165,6 +180,10 @@ def setup_mlmm(
         pdb_path,
         pbc=_as_bool(pbc),
         ml_selection=ml_selection,
+        ml_backend=ml_backend,
+        ml_device=ml_device,
+        ml_charge=_as_int(ml_charge),
+        ml_mult=_as_int(ml_mult),
     )
     obj_name = _load_prepared_into_pymol(bundle.prepared_pdb_path, pdb_path.stem)
     _imd_system = _make_imd(
@@ -177,7 +196,11 @@ def setup_mlmm(
     )
     _timer = _make_qtimer()
     _timer_minimize = _make_qtimer()
-    print(f"setup_mlmm: ready (object={obj_name}, atoms={_imd_system.n_atoms}, pbc={bundle.pbc})")
+    n_ml = len(bundle.extra["ml_indices"]) if bundle.extra else 0
+    print(
+        f"setup_mlmm: ready (object={obj_name}, atoms={_imd_system.n_atoms}, "
+        f"ml_atoms={n_ml}, ml_backend={ml_backend}, pbc={bundle.pbc})"
+    )
 
 
 # ----------------------------------------------------------------- imd_* family

@@ -35,6 +35,9 @@ class SystemBundle:
             PyMOL has the original PDB while OpenMM has hydrogens added, the
             ``index - 1`` lookup in the sync step writes coordinates to the
             wrong atoms and the structure visually collapses.
+        extra: Optional backend-specific dict for data the IMD driver may need
+            (e.g., ML region atom indices + MLIP backend for ML/MM). The base
+            driver ignores it; downstream backends opt in.
     """
 
     system: openmm.System
@@ -43,6 +46,7 @@ class SystemBundle:
     backend_name: str
     prepared_pdb_path: Path
     pbc: bool = False
+    extra: dict | None = None
 
 
 class Backend(Protocol):
