@@ -30,6 +30,9 @@ FORCEFIELD_FILES = (
 
 class AABackend:
     name = "aa"
+    # |F|_max = max_pull_nm × const_k = 0.5 × 50000 = 25000 kJ/mol/nm, about
+    # 10% of a typical bond stretching constant — strong drag, still safe.
+    recommended_const_k = 50000.0
 
     def build_system(
         self,

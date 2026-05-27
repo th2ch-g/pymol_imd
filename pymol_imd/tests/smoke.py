@@ -1,4 +1,4 @@
-"""Headless smoke test: download a tiny PDB, build AA system, minimize, step.
+"""Headless smoke test: download a tiny PDB, build AA and CG systems, minimize, step.
 
 Runs without PyMOL: imports the backend + IMDSystem directly. The PyMOL ↔
 OpenMM coordinate sync is bypassed because there is no PyMOL window to read

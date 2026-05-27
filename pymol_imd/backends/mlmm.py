@@ -66,6 +66,26 @@ def _auto_torch_device(prefer: str = "auto", cuda_idx: int = 0):
 # ----------------------------------------------------------------------------
 # Per-backend ASE Calculator construction
 # ----------------------------------------------------------------------------
+def _mps_to_cpu_fallback(device_str: str, backend_label: str) -> str:
+    """Return ``"cpu"`` instead of ``"mps"`` for backends that can't load.
+
+    MACE / AIMNet2 / many ORB checkpoints store weights as float64, but
+    MPS (Apple Silicon GPU) cannot allocate float64 storage at all, so
+    ``torch.load(map_location='mps')`` blows up at the rebuild_tensor step.
+    Silent fallback to CPU is the only working option until upstream casts
+    weights to float32 at load time.
+    """
+    if device_str != "mps":
+        return device_str
+    msg = (
+        f"{backend_label} weights are float64 but MPS cannot allocate "
+        "float64 storage; running on CPU instead."
+    )
+    logger.warning(msg)
+    print(f"[pymol_imd] {msg}")
+    return "cpu"
+
+
 def _build_mace_calculator(model: str, device_str: str, dtype: str):
     """Resolve a MACE model name and return an ASE Calculator.
 
@@ -85,12 +105,8 @@ def _build_mace_calculator(model: str, device_str: str, dtype: str):
     from mace.calculators import mace_anicc, mace_mp, mace_off, mace_omol
 
     if device_str == "mps":
-        logger.warning(
-            "MACE on MPS would require float64 storage that MPS cannot "
-            "allocate; running MACE on CPU instead."
-        )
-        device_str = "cpu"
-        dtype = "float64"
+        device_str = _mps_to_cpu_fallback(device_str, "MACE")
+        dtype = "float64"  # reset dtype that was forced to float32 for MPS
 
     lower = model.lower()
     if lower.startswith("mp:") or lower.startswith("mace-mp"):
@@ -99,8 +115,11 @@ def _build_mace_calculator(model: str, device_str: str, dtype: str):
     if lower.startswith("anicc") or lower.startswith("mace-anicc"):
         return mace_anicc(device=device_str, default_dtype=dtype)
     if lower.startswith("omol") or lower.startswith("mace-omol"):
-        # mace_omol only accepts None / "extra_large" — fold our common
-        # public-facing labels onto the default.
+        # mace_omol's documented argument is `None` or `"extra_large"`; we
+        # fold every common user-facing label (`MACE-OMOL-0`, `omol`, etc.)
+        # AND `"extra_large"` itself onto `None`, which is the value that
+        # actually triggers the download path. Any other string is treated
+        # as a local file path or direct URL.
         omol_aliases = {"mace-omol-0", "mace-omol", "omol", "extra_large"}
         omol_arg = None if lower in omol_aliases else model
         return mace_omol(model=omol_arg, device=device_str, default_dtype=dtype)
@@ -112,27 +131,50 @@ def _build_mace_calculator(model: str, device_str: str, dtype: str):
 
 
 def _build_orb_calculator(model: str, device_str: str):
+    """Build an ORBCalculator for an orb-models pretrained model.
+
+    orb-models 0.7.x: ``pretrained.<model>()`` returns a ``(model, adapter)``
+    tuple and ``ORBCalculator`` lives under ``inference.calculator``. Older
+    paths (``orb_models.forcefield.calculator``, single-return pretrained)
+    are gone — this code targets 0.7.x onwards.
+    """
     try:
         from orb_models.forcefield import pretrained
-        from orb_models.forcefield.calculator import ORBCalculator
+        from orb_models.forcefield.inference.calculator import ORBCalculator
     except ImportError as exc:
         raise RuntimeError(
-            "orb-models is required for --ml-backend orb. "
-            "Install with `pixi run pip install orb-models`."
+            "orb-models is required for --ml-backend orb. Install with `pixi run install-orb`."
         ) from exc
-    orbff = getattr(pretrained, model)(device=device_str)
-    return ORBCalculator(orbff, device=device_str)
+
+    if not hasattr(pretrained, model):
+        available = sorted(
+            n for n in dir(pretrained) if n.startswith("orb") and callable(getattr(pretrained, n))
+        )
+        raise ValueError(f"Unknown ORB model {model!r}. Available: {available}")
+    device_str = _mps_to_cpu_fallback(device_str, "ORB")
+    orb_model, adapter = getattr(pretrained, model)(device=device_str)
+    return ORBCalculator(orb_model, adapter, device=device_str)
 
 
-def _build_aimnet2_calculator(model: str, device_str: str):
+def _build_aimnet2_calculator(model: str, device_str: str, charge: int, mult: int):
+    """Build an ASE-compatible AIMNet2 calculator.
+
+    The plain ``AIMNet2Calculator`` in aimnet is a low-level torch wrapper
+    and does **not** implement ASE's ``Calculator`` interface (no
+    ``get_forces``). The ASE-facing class is ``AIMNet2ASE``, which wraps a
+    ``base_calc`` and takes ``charge`` / ``mult`` in its constructor
+    instead of via ``atoms.info``.
+    """
     try:
-        from aimnet.calculators import AIMNet2Calculator
+        from aimnet.calculators.aimnet2ase import AIMNet2ASE
+        from aimnet.calculators.calculator import AIMNet2Calculator
     except ImportError as exc:
         raise RuntimeError(
-            "aimnet is required for --ml-backend aimnet2. "
-            "Install with `pixi run pip install aimnet`."
+            "aimnet is required for --ml-backend aimnet2. Install with `pixi run install-aimnet2`."
         ) from exc
-    return AIMNet2Calculator(model=model, device=device_str)
+    device_str = _mps_to_cpu_fallback(device_str, "AIMNet2")
+    base = AIMNet2Calculator(model=model, device=device_str)
+    return AIMNet2ASE(base_calc=base, charge=int(charge), mult=int(mult))
 
 
 def _build_uma_calculator(model: str, device_str: str, task_name: str):
@@ -152,6 +194,8 @@ def _build_mlip_calculator(
     backend: str,
     *,
     device_str: str,
+    ml_charge: int = 0,
+    ml_mult: int = 1,
     mace_model: str = "MACE-OMOL-0",
     mace_dtype: str = "float64",
     orb_model: str = "orb_v3_conservative_omol",
@@ -159,14 +203,19 @@ def _build_mlip_calculator(
     uma_model: str = "uma-s-1p1",
     uma_task_name: str = "omol",
 ):
-    """Build an ASE Calculator for the requested MLIP backend."""
+    """Build an ASE Calculator for the requested MLIP backend.
+
+    ``ml_charge`` / ``ml_mult`` are only consumed by backends whose ASE
+    wrapper takes them in the constructor (AIMNet2). ORB still reads them
+    from ``atoms.info`` each frame.
+    """
     backend = backend.lower()
     if backend == "mace":
         return _build_mace_calculator(mace_model, device_str, mace_dtype)
     if backend == "orb":
         return _build_orb_calculator(orb_model, device_str)
     if backend == "aimnet2":
-        return _build_aimnet2_calculator(aimnet2_model, device_str)
+        return _build_aimnet2_calculator(aimnet2_model, device_str, ml_charge, ml_mult)
     if backend == "uma":
         return _build_uma_calculator(uma_model, device_str, uma_task_name)
     raise ValueError(f"Unknown ml_backend {backend!r}. Choose from {SUPPORTED_ML_BACKENDS}.")
@@ -337,6 +386,7 @@ def _atoms_from_topology(topology, indices: tuple[int, ...]):
 # ----------------------------------------------------------------------------
 class MLMMBackend:
     name = "mlmm"
+    recommended_const_k = 50000.0  # same as AA (ML region is atomistic)
 
     def build_system(
         self,
@@ -411,12 +461,19 @@ class MLMMBackend:
         ml_calc = _build_mlip_calculator(
             ml_backend,
             device_str=device_str,
+            ml_charge=int(ml_charge),
+            ml_mult=int(ml_mult),
             mace_model=mace_model,
             mace_dtype=mace_dtype,
         )
-        # Charge / multiplicity hints for backends that read them off
-        # atoms.info (notably AIMNet2). MACE / ORB / UMA tolerate the extras.
-        ml_calc_info = {"charge": int(ml_charge), "mult": int(ml_mult)}
+        # `atoms.info` payload that satisfies every supported backend:
+        # AIMNet2 reads `mult`, ORB reads `spin` (= unpaired electrons,
+        # always `mult - 1` by definition), MACE / UMA ignore them.
+        ml_calc_info = {
+            "charge": int(ml_charge),
+            "mult": int(ml_mult),
+            "spin": int(ml_mult) - 1,
+        }
 
         # MM subset for the ONIOM subtraction.
         _, sub_system = _build_subset_mm_system(modeller.topology, forcefield, ml_indices)

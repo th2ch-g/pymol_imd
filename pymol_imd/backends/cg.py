@@ -98,6 +98,10 @@ def _compute_ss_string(pdb_path: Path) -> str:
 
 class CGBackend:
     name = "cg"
+    # CG beads are heavier and bonds are softer; 50000 like AA overshoots
+    # and destabilises Martini's 20 fs timestep. 10000 stays inside Martini's
+    # safe range while still letting users drag beads visibly.
+    recommended_const_k = 10000.0
 
     def build_system(
         self,

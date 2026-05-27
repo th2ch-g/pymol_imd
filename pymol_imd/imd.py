@@ -75,7 +75,8 @@ class IMDSystem:
         # Separate force for the ML/MM ONIOM correction so it stacks cleanly
         # with the user pull force without aliasing parameters.
         self._mlmm_force = self._attach_mlmm_correction_force(bundle)
-        if bundle.pbc:
+        # Barostat attachment is also idempotent across IMDSystem rebuilds.
+        if bundle.pbc and not self._has_barostat(bundle.system):
             bundle.system.addForce(
                 MonteCarloBarostat(
                     self.config.pressure * unit.bar,
@@ -93,11 +94,31 @@ class IMDSystem:
         self.n_atoms = bundle.topology.getNumAtoms()
         self.running = False
         self._last_min_energy: float | None = None
+        # Tracks atoms whose pull force was non-zero on the previous frame
+        # so we can zero them on release without scanning all n_atoms.
+        self._active_pull_idx_prev: set[int] = set()
 
     # ------------------------------------------------------------------ setup
+    _PULL_FORCE_EXPR = "- fx*x - fy*y - fz*z"
+    _MLMM_FORCE_EXPR = "- gx*x - gy*y - gz*z"
+
     @staticmethod
-    def _attach_pull_force(system: openmm.System) -> openmm.CustomExternalForce:
-        force = openmm.CustomExternalForce("- fx*x - fy*y - fz*z")
+    def _find_force(system: openmm.System, energy_expr: str) -> openmm.CustomExternalForce | None:
+        for i in range(system.getNumForces()):
+            f = system.getForce(i)
+            if isinstance(f, openmm.CustomExternalForce) and f.getEnergyFunction() == energy_expr:
+                return f
+        return None
+
+    @classmethod
+    def _attach_pull_force(cls, system: openmm.System) -> openmm.CustomExternalForce:
+        # Idempotent: if the same bundle is re-wrapped in a second IMDSystem
+        # (e.g. user re-runs setup_*), reuse the already-attached force
+        # instead of stacking another copy onto the System.
+        existing = cls._find_force(system, cls._PULL_FORCE_EXPR)
+        if existing is not None:
+            return existing
+        force = openmm.CustomExternalForce(cls._PULL_FORCE_EXPR)
         for name in ("fx", "fy", "fz"):
             force.addPerParticleParameter(name)
         zero = (0.0, 0.0, 0.0)
@@ -106,22 +127,35 @@ class IMDSystem:
         system.addForce(force)
         return force
 
-    @staticmethod
-    def _attach_mlmm_correction_force(bundle: SystemBundle) -> openmm.CustomExternalForce | None:
+    @classmethod
+    def _attach_mlmm_correction_force(
+        cls, bundle: SystemBundle
+    ) -> openmm.CustomExternalForce | None:
         """Attach a CustomExternalForce that carries the ONIOM ML-vs-MM delta.
 
         Only ML region atoms get a particle; non-ML atoms are not registered,
-        so the per-step update is O(|ML region|) instead of O(N).
+        so the per-step update is O(|ML region|) instead of O(N). Idempotent
+        across IMDSystem rebuilds on the same bundle.
         """
         if not bundle.extra or "ml_indices" not in bundle.extra:
             return None
-        force = openmm.CustomExternalForce("- gx*x - gy*y - gz*z")
+        existing = cls._find_force(bundle.system, cls._MLMM_FORCE_EXPR)
+        if existing is not None:
+            return existing
+        force = openmm.CustomExternalForce(cls._MLMM_FORCE_EXPR)
         for name in ("gx", "gy", "gz"):
             force.addPerParticleParameter(name)
         for atom_idx in bundle.extra["ml_indices"]:
             force.addParticle(int(atom_idx), (0.0, 0.0, 0.0))
         bundle.system.addForce(force)
         return force
+
+    @staticmethod
+    def _has_barostat(system: openmm.System) -> bool:
+        for i in range(system.getNumForces()):
+            if isinstance(system.getForce(i), MonteCarloBarostat):
+                return True
+        return False
 
     # ----------------------------------------------------------------- stepping
     def step(self) -> None:
@@ -231,38 +265,47 @@ class IMDSystem:
     def _apply_pull_force_from_pymol(self) -> None:
         try:
             pymol_xyz = self._read_pymol_positions_nm()
-        except Exception as exc:  # pragma: no cover - only happens without PyMOL
-            logger.debug("Skipping pull force: PyMOL not available (%s)", exc)
-            return
+        except ImportError:
+            return  # No PyMOL → no user pull.
+        # RuntimeError from atom-count mismatch etc. is intentionally NOT
+        # caught here; that's a real fault and the user must hear about it.
+
         openmm_xyz = self._read_openmm_positions_nm()
         delta = pymol_xyz - openmm_xyz
-        # Mask per-atom: an atom counts as "dragged" only if its largest
-        # component is above the noise floor. We zero the whole row so a
-        # noisy +y on an otherwise-still atom doesn't leak a sideways force.
         atom_max = np.max(np.abs(delta), axis=1)
-        delta[atom_max < self._DELTA_NOISE_NM] = 0.0
+        active_mask = atom_max >= self._DELTA_NOISE_NM
+        delta[~active_mask] = 0.0
 
-        # Cap per-atom |delta| at max_pull_nm so the force stays bounded even
-        # if the user yanks an atom across the screen. Direction is kept;
-        # only the magnitude is clipped.
         mag = np.linalg.norm(delta, axis=1, keepdims=True)
         safe_mag = np.where(mag > 0, mag, 1.0)
         scale = np.minimum(mag, self.config.max_pull_nm) / safe_mag
         delta = delta * scale
 
-        n_dragged = int(np.count_nonzero(atom_max >= self._DELTA_NOISE_NM))
-        if n_dragged:
+        forces = delta * self.config.const_k
+        active_idx = np.where(active_mask)[0]
+
+        # Update only atoms that are active now OR were active last frame
+        # (so we zero them on release). Skips the O(n_atoms) hot loop —
+        # mouse drag normally touches ≤ a few dozen atoms.
+        to_zero = self._active_pull_idx_prev - set(active_idx.tolist())
+        if active_idx.size or to_zero:
+            for idx in active_idx:
+                fx, fy, fz = forces[idx]
+                self._pull_force.setParticleParameters(
+                    int(idx), int(idx), (float(fx), float(fy), float(fz))
+                )
+            for idx in to_zero:
+                self._pull_force.setParticleParameters(int(idx), int(idx), (0.0, 0.0, 0.0))
+            self._pull_force.updateParametersInContext(self.simulation.context)
+        self._active_pull_idx_prev = set(active_idx.tolist())
+
+        if active_idx.size:
             logger.debug(
                 "pull: %d atoms dragged, max |delta| = %.4f nm (capped at %.3f)",
-                n_dragged,
+                int(active_idx.size),
                 float(np.max(mag)),
                 self.config.max_pull_nm,
             )
-        forces = delta * self.config.const_k
-        for idx in range(self.n_atoms):
-            fx, fy, fz = forces[idx]
-            self._pull_force.setParticleParameters(idx, idx, (float(fx), float(fy), float(fz)))
-        self._pull_force.updateParametersInContext(self.simulation.context)
 
     # ------------------------------------------------------------ coord sync IO
     def _read_openmm_positions_nm(self) -> np.ndarray:

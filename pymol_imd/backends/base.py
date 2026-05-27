@@ -55,15 +55,29 @@ class Backend(Protocol):
     Concrete backends live in this package (``aa.py``, ``cg.py``, ``mlmm.py``).
     They are intentionally duck-typed: any object exposing ``build_system``
     with the right signature is a valid backend.
+
+    Each backend also exposes ``recommended_const_k`` so the command layer
+    can pick a sensible default pulling-force scale per backend (heavier CG
+    beads need a smaller ``const_k`` than fast AA atoms) without spreading
+    those numbers across the codebase.
+
+    ``ligand_sdf`` is **AA-only**; CG and ML/MM backends raise if it is
+    passed. Backend-specific kwargs (``ff`` / ``elastic_network`` for CG,
+    ``ml_selection`` / ``ml_backend`` for ML/MM) flow in via ``**kwargs``.
+
+    ``prepared_pdb_path`` in the returned bundle is *backend-defined*:
+    AA / ML-MM write it via ``prep.write_prepared_pdb``, CG copies
+    martinize2's ``cg.pdb`` verbatim because martinize already emits
+    accurate CONECT records covering chemical bonds + constraints.
     """
 
     name: str
+    recommended_const_k: float
 
     def build_system(
         self,
         pdb_path: Path,
         *,
-        ligand_sdf: Path | None = None,
         pbc: bool = False,
         **kwargs: object,
     ) -> SystemBundle:

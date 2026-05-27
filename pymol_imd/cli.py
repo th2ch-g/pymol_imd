@@ -99,13 +99,22 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             f"MLIP backend. One of: {', '.join(ML_BACKENDS)}. "
-            "If omitted, setup_mlmm picks 'mace' (public MACE-OMOL-0 model, "
-            "no HF login required)."
+            "If omitted, setup_mlmm picks 'aimnet2' — smallest model "
+            "(~10 MB), fastest CPU inference, no login required."
         ),
     )
     mlmm.add_argument("--ml-device", metavar="DEV", help="Torch device: auto / cuda / mps / cpu.")
     mlmm.add_argument("--ml-charge", type=int, metavar="Z", help="ML region net charge.")
-    mlmm.add_argument("--ml-mult", type=int, metavar="M", help="ML region spin multiplicity.")
+    mlmm.add_argument(
+        "--ml-mult",
+        type=int,
+        metavar="M",
+        help=(
+            "ML region spin multiplicity (2S+1). Default: 1 (singlet). "
+            "The unpaired-electron count expected by ORB (atoms.info['spin']) "
+            "is auto-derived as mult - 1."
+        ),
+    )
 
     # ---- launcher controls
     launcher = p.add_argument_group("launcher")
@@ -194,19 +203,27 @@ def main(argv: list[str] | None = None) -> int:
 
     # Level-specific required-flag validation, done up front so we don't
     # launch PyMOL only to error out from inside setup_*.
-    if args.level == "mlmm" and args.ml_selection is None:
-        print(
-            "pymol_imd: --ml-selection is required for --level mlmm.\n"
-            "Uses PyMOL's selection language (and / or / not / within / "
-            "byres / resi / resn / chain / name). Examples:\n"
-            "  --ml-selection 'resi 30-50'\n"
-            "  --ml-selection 'resi 1 and resn MET'\n"
-            "  --ml-selection 'chain A and not resn HOH'\n"
-            "  --ml-selection 'byres (resn LIG) within 5 of chain A'\n"
-            "  --ml-selection 'all'          # whole-system MLIP (slow)",
-            file=sys.stderr,
-        )
-        return 2
+    if args.level == "mlmm":
+        missing = [
+            flag
+            for flag, val in (
+                ("--ml-selection", args.ml_selection),
+                ("--ml-charge", args.ml_charge),
+                ("--ml-mult", args.ml_mult),
+            )
+            if val is None
+        ]
+        if missing:
+            print(
+                f"pymol_imd: --level mlmm requires {', '.join(missing)}.\n"
+                "ml_selection uses PyMOL's selection language. Example:\n"
+                "  pymol_imd input.pdb --level mlmm \\\n"
+                "      --ml-selection 'resi 1 and resn MET' \\\n"
+                "      --ml-charge 0 --ml-mult 1\n"
+                "Multiplicity (2S+1): 1=singlet, 2=doublet/radical, 3=triplet.",
+                file=sys.stderr,
+            )
+            return 2
 
     pymol_bin = args.pymol or shutil.which("pymol")
     if not pymol_bin:

@@ -11,6 +11,7 @@ work with proper Python types.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from pathlib import Path
 
@@ -52,17 +53,29 @@ def _make_imd(bundle, pymol_object: str, **kwargs) -> IMDSystem:
     return IMDSystem(bundle, cfg, pymol_object=pymol_object)
 
 
+def _resolve_const_k(backend, const_k: object) -> float:
+    """Pick the right pulling-force scale.
+
+    Returns the user-supplied value if explicit; otherwise the backend's
+    own ``recommended_const_k`` so the AA/CG/MLMM defaults live next to
+    each backend instead of being copy-pasted across the command layer.
+    """
+    if const_k is None:
+        return float(backend.recommended_const_k)
+    return _as_float(const_k)
+
+
 def _load_prepared_into_pymol(
     prepared_pdb_path: Path, base_name: str, *, backend_name: str = "aa"
 ) -> str:
     """Load the prepared PDB into PyMOL as a NEW object and return its name.
 
-    The original object (e.g. ``1ubq``) is left untouched so the user can
-    diff-view the pre/post-prep structures. The new object is named
-    ``<base>_imd`` plus a numeric suffix if a previous IMD object exists.
+    The new object is named ``<base>_imd`` (or ``<base>_imd_N`` if an IMD
+    object already exists), so any already-loaded original object the user
+    might have isn't clobbered.
 
     Representation is chosen per backend because CG beads don't carry CONECT
-    bonds (``PDBFile.writeFile`` doesn't emit them) and their atom names
+    bonds via the default ``PDBFile.writeFile`` path and their atom names
     (``BB``/``SC1``) don't match PyMOL's cartoon detection, so the default
     ``lines`` representation leaves the viewport empty.
     """
@@ -115,15 +128,20 @@ def setup_aa(
     pbc: object = False,
     temperature: object = 300.0,
     nsteps_per_frame: object = 1,
-    const_k: object = 50000.0,
+    const_k: object = None,
     mouse_force: object = True,
 ) -> None:
-    """Set up an all-atom IMD simulation in vacuo (NVT) by default."""
+    """Set up an all-atom IMD simulation in vacuo (NVT) by default.
+
+    ``const_k`` falls back to ``AABackend.recommended_const_k`` (50000) when
+    omitted; the backend owns its own recommended scale.
+    """
     global _imd_system, _timer, _timer_minimize
     pdb_path = Path(pdb_file)
     ligand_path = Path(ligand_sdf) if ligand_sdf else None
 
-    bundle = AABackend().build_system(
+    backend = AABackend()
+    bundle = backend.build_system(
         pdb_path,
         ligand_sdf=ligand_path,
         pbc=_as_bool(pbc),
@@ -136,7 +154,7 @@ def setup_aa(
         obj_name,
         temperature=_as_float(temperature),
         nsteps_per_frame=_as_int(nsteps_per_frame),
-        const_k=_as_float(const_k),
+        const_k=_resolve_const_k(backend, const_k),
         mouse_force=_as_bool(mouse_force),
     )
     _timer = _make_qtimer()
@@ -151,15 +169,14 @@ def setup_cg(
     elastic_network: object = True,
     temperature: object = 300.0,
     nsteps_per_frame: object = 1,
-    const_k: object = 10000.0,
+    const_k: object = None,
     mouse_force: object = True,
     timestep_ps: object = 0.020,
 ) -> None:
     """Set up a Martini CG IMD simulation via vermouth + martini_openmm.
 
-    ``ff=None`` falls back to ``CGBackend``'s default (currently martini3001).
-    Keeping the default sourced from the backend avoids drift between the
-    PyMOL command layer and the underlying constant.
+    Backend-owned defaults: ``ff=None`` → ``CGBackend.MARTINI_FF`` (martini3001),
+    ``const_k=None`` → ``CGBackend.recommended_const_k`` (10000).
 
     ``timestep_ps`` defaults to 20 fs — the Martini 3 standard. CG beads
     have no fast X-H modes, so the long timestep is safe and makes CG
@@ -175,7 +192,8 @@ def setup_cg(
     }
     if ff is not None:
         cg_kwargs["ff"] = ff
-    bundle = CGBackend().build_system(pdb_path, **cg_kwargs)
+    backend = CGBackend()
+    bundle = backend.build_system(pdb_path, **cg_kwargs)
     obj_name = _load_prepared_into_pymol(
         bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
     )
@@ -184,7 +202,7 @@ def setup_cg(
         obj_name,
         temperature=_as_float(temperature),
         nsteps_per_frame=_as_int(nsteps_per_frame),
-        const_k=_as_float(const_k),
+        const_k=_resolve_const_k(backend, const_k),
         mouse_force=_as_bool(mouse_force),
         timestep_ps=_as_float(timestep_ps),
     )
@@ -199,17 +217,19 @@ def setup_cg(
 def setup_mlmm(
     pdb_file: str,
     ml_selection: str | None = None,
-    ml_backend: str = "mace",
+    ml_backend: str = "aimnet2",
     ml_device: str = "auto",
     ml_charge: object = 0,
     ml_mult: object = 1,
     pbc: object = False,
     temperature: object = 300.0,
     nsteps_per_frame: object = 1,
-    const_k: object = 50000.0,
+    const_k: object = None,
     mouse_force: object = True,
 ) -> None:
     """Set up an ONIOM-style ML/MM IMD simulation.
+
+    ``const_k=None`` falls back to ``MLMMBackend.recommended_const_k``.
 
     Parameters
     ----------
@@ -219,8 +239,9 @@ def setup_mlmm(
         ``"chain A"``, ``"resn LIG"``, ``"0,1,2,3"``. Omitting this raises
         an error to prevent accidental whole-system MLIP simulations.
     ml_backend :
-        One of ``uma`` / ``orb`` / ``mace`` / ``aimnet2``. Defaults to MACE
-        (`MACE-OMOL-0`, login-free public model). UMA needs HF auth.
+        One of ``uma`` / ``orb`` / ``mace`` / ``aimnet2``. Defaults to
+        AIMNet2 — smallest model (~10 MB, bundled), fastest CPU inference,
+        works out of the box. UMA needs HF auth.
     ml_device :
         ``auto`` (cuda → mps → cpu), or explicit ``cuda``/``mps``/``cpu``.
     """
@@ -238,7 +259,8 @@ def setup_mlmm(
         )
     pdb_path = Path(pdb_file)
 
-    bundle = MLMMBackend().build_system(
+    backend = MLMMBackend()
+    bundle = backend.build_system(
         pdb_path,
         pbc=_as_bool(pbc),
         ml_selection=ml_selection,
@@ -255,7 +277,7 @@ def setup_mlmm(
         obj_name,
         temperature=_as_float(temperature),
         nsteps_per_frame=_as_int(nsteps_per_frame),
-        const_k=_as_float(const_k),
+        const_k=_resolve_const_k(backend, const_k),
         mouse_force=_as_bool(mouse_force),
     )
     _timer = _make_qtimer()
@@ -319,6 +341,7 @@ def imd_minimize(
                 "without convergence — raise max_chunks or relax tolerance if needed"
             )
 
+    _reset_timer(_timer_minimize)
     _timer_minimize.timeout.connect(_tick)
     _timer_minimize.start(1)
     print(f"imd_minimize: started (max_chunks={chunk_cap}, iter_per_chunk={max_iter})")
@@ -345,9 +368,25 @@ def imd_run() -> None:
             _timer.stop()
             print("imd_run: stopped (divergence or error). Adjust const_k / max_pull_nm.")
 
+    _reset_timer(_timer)
     _timer.timeout.connect(_tick)
     _timer.start(1)
     print("imd_run: started")
+
+
+def _reset_timer(timer) -> None:
+    """Stop the timer and drop every previous `timeout` connection.
+
+    Without this, `imd_stop → setup_* → imd_run` accumulates `_tick`
+    connections on the same QTimer, so each tick fires `step()` multiple
+    times. Qt raises if there's nothing to disconnect, so we swallow that.
+    """
+    if timer is None:
+        return
+    timer.stop()
+    # Qt raises if there's nothing to disconnect; we don't care.
+    with contextlib.suppress(TypeError, RuntimeError):
+        timer.timeout.disconnect()
 
 
 def imd_stop() -> None:
@@ -370,7 +409,14 @@ def imd_change(
     max_pull_nm: object | None = None,
     energy_cutoff_kj: object | None = None,
 ) -> None:
-    """Hot-patch IMD parameters without rebuilding the system."""
+    """Hot-patch IMD parameters without rebuilding the system.
+
+    Updatable in place: ``const_k``, ``mouse_force``, ``nsteps_per_frame``,
+    ``temperature`` (live Langevin integrator update), ``max_pull_nm``,
+    ``energy_cutoff_kj``. Other ``IMDConfig`` fields (``friction``,
+    ``timestep_ps``, ``pressure``) need a fresh ``setup_*`` because they
+    require rebuilding the integrator or the barostat.
+    """
     if _imd_system is None:
         print("imd: no system loaded")
         return
