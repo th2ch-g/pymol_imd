@@ -20,6 +20,7 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
+import numpy as np
 from openmm import unit
 from openmm.app import PDBFile
 
@@ -160,6 +161,13 @@ class CGBackend:
         subprocess.run(cmd, check=True, cwd=work_dir)
 
         coords = PDBFile(str(cg_pdb))
+        # martinize2 averages constituent AA atoms to place each CG bead. If
+        # every atom that maps to a bead is missing from the input PDB (e.g.
+        # disordered side chains in X-ray structures), the bead position is
+        # written as 'nan' in cg.pdb and OpenMM crashes only later inside
+        # setPositions. Catch it here with an actionable error pointing at the
+        # offending residues so the user can clean the PDB first.
+        _check_for_nan_bead_positions(coords, source_pdb=pdb_path, cg_pdb=cg_pdb)
         # martini_openmm provides a drop-in replacement for GromacsTopFile that
         # understands Martini non-standard directives. The generated .top
         # references `martini.itp`, which must live in `include_dir`.
@@ -198,6 +206,41 @@ class CGBackend:
             prepared_pdb_path=prepared_pdb,
             pbc=pbc,
         )
+
+
+def _check_for_nan_bead_positions(
+    coords: PDBFile, *, source_pdb: Path, cg_pdb: Path, max_listed: int = 12
+) -> None:
+    """Raise if any CG bead in ``coords`` carries a NaN coordinate.
+
+    martinize2 writes ``nan`` into cg.pdb when the AA atoms a bead averages
+    over are entirely absent from the input. Surface this as one clear error
+    instead of an opaque OpenMM crash inside ``setPositions``.
+    """
+    pos_nm = np.asarray(coords.positions.value_in_unit(unit.nanometer))
+    bad_mask = ~np.all(np.isfinite(pos_nm), axis=1)
+    if not bad_mask.any():
+        return
+
+    atoms = list(coords.topology.atoms())
+    offenders: list[str] = []
+    for idx in np.where(bad_mask)[0]:
+        atom = atoms[int(idx)]
+        res = atom.residue
+        chain_id = res.chain.id or "?"
+        offenders.append(f"{chain_id}/{res.name}{res.id}/{atom.name}")
+    head = ", ".join(offenders[:max_listed])
+    suffix = f" (+{len(offenders) - max_listed} more)" if len(offenders) > max_listed else ""
+    raise RuntimeError(
+        "CG mapping produced NaN coordinates for "
+        f"{len(offenders)} bead(s): {head}{suffix}.\n"
+        f"Input PDB: {source_pdb}\n"
+        f"Intermediate CG PDB: {cg_pdb}\n"
+        "Cause: martinize2 averages constituent AA heavy atoms to place each "
+        "bead, and every atom that maps to the listed beads is missing from "
+        "the input. Complete the missing side-chain heavy atoms (e.g. with an "
+        "external tool such as tleap/CHARMM-GUI) and re-run setup_cg."
+    )
 
 
 def _bounding_box_vectors(positions, padding_nm: float = 1.0):
