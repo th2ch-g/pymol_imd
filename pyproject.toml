@@ -25,8 +25,10 @@ include = ["pymol_imd*"]
 [tool.pixi.workspace]
 channels = ["conda-forge"]
 # Windows native is excluded: ambertools has no conda-forge Windows build.
-# Windows users should run via WSL2 (linux-64).
-platforms = ["linux-64", "osx-arm64", "osx-64"]
+# Intel Mac (osx-64) is excluded: the AIMNet2 default backend pulls
+# `warp-lang`, which has no osx-64 wheels. Windows / Intel-Mac users
+# should run via WSL2 / a Linux VM respectively.
+platforms = ["linux-64", "osx-arm64"]
 
 # ---------------------------------------------------------------------------
 # Default feature: AA + CG (works on Linux & macOS)
@@ -64,15 +66,18 @@ martini-openmm = { git = "https://github.com/maccallumlab/martini_openmm.git" }
 # MACE MLIP backend (default for setup_mlmm). MACE-OMOL-0 is a public,
 # login-free model so `pixi install` → `setup_mlmm` works out of the box;
 # UMA stays available via `--ml-backend uma` but needs HF auth.
+# Default MLIP backends: pixi install brings MACE (mace-torch) and the
+# default AIMNet2 (aimnet) in directly. ORB and UMA are excluded from the
+# pypi lock because their dependency chains collide:
+#   - orb-models pulls `cached-path` whose old `rich` / `filelock` requests
+#     conflict with the conda-side pins
+#   - fairchem-core (UMA) pins `e3nn>=0.5`, mace-torch pins `e3nn==0.4.4`
+# These both install fine via pip's looser resolver, so we expose them
+# through `pixi run install-orb` / `install-uma` tasks instead.
 mace-torch = "*"
+aimnet = "*"
 ruff = "*"
 
-# Optional MLIP backends for setup_mlmm (MACE is the default and already
-# installed above). Each of these has transitive deps (fairchem-core 2.x ->
-# ray[serve] -> pydantic; orb-models -> torch C++ extensions; aimnet ->
-# torch) that conflict with pixi's strict conda/pypi resolver, so they
-# live in tasks instead of pypi-dependencies — pip's looser resolver
-# installs them cleanly.
 [tool.pixi.tasks]
 ruff-format = "ruff format --force-exclude"
 ruff-lint = "ruff check --fix --exit-non-zero-on-fix --force-exclude"
@@ -80,7 +85,6 @@ r = { cmd = "echo OK", depends-on = ["ruff-format", "ruff-lint"] }
 smoke = "python -m pymol_imd.tests.smoke"
 install-uma = "pip install --no-build-isolation 'fairchem-core>=2.20.0'"
 install-orb = "pip install --no-build-isolation orb-models"
-install-aimnet2 = "pip install --no-build-isolation aimnet"
 
 # ---------------------------------------------------------------------------
 # Ruff

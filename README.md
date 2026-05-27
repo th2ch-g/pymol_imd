@@ -12,37 +12,47 @@ levels are supported from the same plugin:
 | `cg`   | Martini 3 via `vermouth` + `martini_openmm`  | Large biomolecules, fast 20 fs timestep |
 | `mlmm` | ONIOM-style: full-system Amber MM + MLIP delta on a selected region | Reactive / electronic-effect-sensitive regions |
 
-Supported MLIP backends for `--level mlmm`:
-[MACE-OMOL-0](https://github.com/ACEsuit/mace-foundations) (default,
-login-free), [UMA](https://huggingface.co/facebook/UMA) (HuggingFace gated),
-[ORB](https://github.com/orbital-materials/orb-models),
-[AIMNet2](https://github.com/zubatyuk/aimnet).
+Supported MLIP backends for `--level mlmm` (in order of "ready to use"):
+
+| Backend | Default | Login | Size | Notes |
+|---|---|---|---|---|
+| [AIMNet2](https://github.com/zubatyuk/aimnet) | **yes** | no | ~10 MB (bundled) | Fastest CPU; charge / mult go to the constructor |
+| [MACE-OMOL-0](https://github.com/ACEsuit/mace-foundations) | no | no | ~400 MB | ASL license (academic only) |
+| [ORB](https://github.com/orbital-materials/orb-models) | no | no | ~100 MB | `atoms.info["spin"]` driven |
+| [UMA](https://huggingface.co/facebook/UMA) | no | **yes** | gated | Needs HF auth + `pixi run install-uma` |
 
 ---
 
 ## Install
 
-Requires [pixi](https://pixi.sh). Native support: `linux-64`, `osx-arm64`,
-`osx-64`. Windows users should run via WSL2.
+Requires [pixi](https://pixi.sh). Native support: `linux-64`, `osx-arm64`.
+Intel Mac (`osx-64`) and Windows users should run via a Linux VM / WSL2.
 
 ```bash
 git clone <this-repo>
 cd pymol_imd
-pixi install
+pixi install   # covers AA + CG + ML-MM (AIMNet2 default + MACE) in one step
 ```
 
-`pixi install` covers AA / CG / MLMM-with-MACE out of the box. Optional
-MLIP backends sit behind one-shot pip tasks because their transitive
-dependency graphs conflict with pixi's strict resolver:
+The default `pixi install` brings in:
+
+- AA / CG backends with all their dependencies
+- **AIMNet2** (`aimnet`) — default ML/MM backend, ~10 MB
+- **MACE** (`mace-torch`) — alternative ML/MM backend
+
+For the remaining two MLIP backends, run their pip task once. They are
+kept out of the default lock because:
+
+- **ORB** (`orb-models`): the chain `orb-models → cached-path` requests
+  older `rich` / `filelock` than the conda lock picks
+- **UMA** (`fairchem-core`): pins `e3nn>=0.5`, while `mace-torch` pins
+  `e3nn==0.4.4` — the two cannot coexist in one resolver run; pip's
+  looser resolver installs UMA after the fact
 
 ```bash
-pixi run install-uma        # fairchem-core; UMA needs HF login at runtime
 pixi run install-orb        # orb-models
-pixi run install-aimnet2    # aimnet
+pixi run install-uma        # fairchem-core; UMA also needs `huggingface-cli login`
 ```
-
-`orb-models` and `aimnet` are also installed by the snippet above on
-machines where the pip resolver succeeds (Apple Silicon tested).
 
 ---
 
@@ -111,7 +121,7 @@ CG / ML-MM analogues:
 
 ```
 PyMOL> setup_cg input.pdb timestep_ps=0.020
-PyMOL> setup_mlmm input.pdb ml_selection='resi 30-50' ml_backend=mace
+PyMOL> setup_mlmm input.pdb ml_selection='resi 30-50' ml_charge=0 ml_mult=1
 ```
 
 After `setup_*`:
@@ -176,11 +186,13 @@ indices) without combiners.
 
 ## Troubleshooting
 
-### MACE / Apple Silicon (MPS)
-MPS cannot allocate float64 storage that MACE-OMOL needs. The backend
-prints `MACE on MPS would require float64 storage … running MACE on CPU
-instead` and silently falls back. CPU MACE is usable for small ML regions
-(~tens of atoms).
+### MLIP / Apple Silicon (MPS)
+MPS cannot allocate float64 storage, which **MACE / ORB / AIMNet2 all
+need at model-load time** (their weight files are float64). The plugin
+detects this and silently falls back to CPU with a notice like
+`AIMNet2 weights are float64 but MPS cannot allocate float64 storage;
+running on CPU instead`. CPU MLIPs are usable for small ML regions
+(tens of atoms); pick a larger backend only if you have CUDA.
 
 ### UMA model gated
 The UMA backend pulls weights from `facebook/UMA`, a HuggingFace gated
