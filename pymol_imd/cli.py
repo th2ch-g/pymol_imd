@@ -57,6 +57,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     common.add_argument("--const-k", type=float, metavar="K", help="Pull-force scale (kJ/mol/nm).")
     common.add_argument(
+        "--max-force-kj",
+        type=float,
+        metavar="F",
+        help=(
+            "Per-atom hard cap on the pulling force magnitude (kJ/mol/nm). "
+            "Default 5000. Lower to make divergence-on-strong-drag harder."
+        ),
+    )
+    common.add_argument(
         "--no-mouse-force", action="store_true", help="Disable the user-pull mechanism."
     )
     common.add_argument(
@@ -166,6 +175,8 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
         kwargs["nsteps_per_frame"] = args.nsteps_per_frame
     if args.const_k is not None:
         kwargs["const_k"] = args.const_k
+    if args.max_force_kj is not None:
+        kwargs["max_force_kj"] = args.max_force_kj
     if args.no_mouse_force:
         kwargs["mouse_force"] = False
 

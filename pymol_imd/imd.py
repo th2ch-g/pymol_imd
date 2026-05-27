@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import openmm
-from openmm import LangevinIntegrator, MonteCarloBarostat, unit
+from openmm import LangevinIntegrator, LangevinMiddleIntegrator, MonteCarloBarostat, unit
 from openmm.app import Simulation
 
 from .backends.base import SystemBundle
@@ -38,11 +38,16 @@ class IMDConfig:
     nsteps_per_frame: int = 1
     const_k: float = 10000.0  # kJ/mol/nm scale for the pulling force
     mouse_force: bool = True
-    # Cap on |delta| (nm) per atom before multiplying by const_k. Prevents
-    # runaway forces when the user drags an atom a huge distance: without
-    # this, |F| = |delta| * const_k can dwarf bond stretching constants and
-    # the structure explodes off-screen.
-    max_pull_nm: float = 0.5
+    # Integrator selection: "langevin" (legacy BBK-like) or "langevin_middle"
+    # (Leimkuhler-Matthews BAOAB). The middle scheme has 2nd-order accurate
+    # configurational sampling and a wider stability window under external
+    # forcing, so AA backends default to it; CG/MLMM keep "langevin" for now.
+    integrator: str = "langevin"
+    # Per-atom hard cap on the pulling force magnitude (kJ/mol/nm). Replaces
+    # the old |delta| cap: a |F| cap is unit-meaningful (force) and prevents
+    # runaway accelerations directly, regardless of how far the user drags
+    # an atom or what const_k is set to.
+    max_force_kj: float = 5000.0
     # If |potential energy| exceeds this (kJ/mol), the simulation is treated
     # as diverged and the IMD loop halts. NaN energies trip the same guard.
     energy_cutoff_kj: float = 1e9
@@ -84,7 +89,12 @@ class IMDSystem:
                 )
             )
 
-        integrator = LangevinIntegrator(
+        integrator_cls = (
+            LangevinMiddleIntegrator
+            if self.config.integrator == "langevin_middle"
+            else LangevinIntegrator
+        )
+        integrator = integrator_cls(
             self.config.temperature * unit.kelvin,
             self.config.friction / unit.picosecond,
             self.config.timestep_ps * unit.picoseconds,
@@ -368,7 +378,7 @@ class IMDSystem:
             return False
         logger.error(
             "Diverged: U = %s kJ/mol (cutoff %.2e). Halting IMD loop. "
-            "Lower const_k / max_pull_nm or shorten timestep_ps.",
+            "Lower const_k / max_force_kj or shorten timestep_ps.",
             u_kj,
             self.config.energy_cutoff_kj,
         )
@@ -410,12 +420,15 @@ class IMDSystem:
         active_mask = atom_max >= self._DELTA_NOISE_NM
         delta[~active_mask] = 0.0
 
-        mag = np.linalg.norm(delta, axis=1, keepdims=True)
-        safe_mag = np.where(mag > 0, mag, 1.0)
-        scale = np.minimum(mag, self.config.max_pull_nm) / safe_mag
-        delta = delta * scale
-
+        # Apply the |F| cap directly on the per-atom force vector. Compared
+        # to the previous |delta| cap, this makes the upper bound an explicit
+        # function of force (in kJ/mol/nm) rather than an implicit one via
+        # const_k * |delta|, so users tuning max_force_kj see a predictable
+        # ceiling regardless of how const_k is set.
         forces = delta * self.config.const_k
+        fmag = np.linalg.norm(forces, axis=1, keepdims=True)
+        safe_fmag = np.where(fmag > 0.0, fmag, 1.0)
+        forces = forces * (np.minimum(fmag, self.config.max_force_kj) / safe_fmag)
         active_idx = np.where(active_mask)[0]
 
         # Update only atoms that are active now OR were active last frame
@@ -435,10 +448,10 @@ class IMDSystem:
 
         if active_idx.size:
             logger.debug(
-                "pull: %d atoms dragged, max |delta| = %.4f nm (capped at %.3f)",
+                "pull: %d atoms dragged, |F|max requested=%.1f / cap=%.1f kJ/mol/nm",
                 int(active_idx.size),
-                float(np.max(mag)),
-                self.config.max_pull_nm,
+                float(np.max(fmag)),
+                self.config.max_force_kj,
             )
 
     # ------------------------------------------------------------ coord sync IO

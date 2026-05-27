@@ -13,15 +13,64 @@ Usage::
 from __future__ import annotations
 
 import logging
+import math
 import sys
 import tempfile
 from pathlib import Path
+
+import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger("smoke")
 
 
-def _run_backend(backend, pdb_path: Path, *, label: str, n_steps: int) -> None:
+def _verify_force_cap(imd, *, label: str) -> None:
+    """Inject a fake 1 nm delta on atom 0 and confirm |F| is capped at max_force_kj.
+
+    With const_k=10000 and max_force_kj=5000 (defaults), nominal |F| = 10000
+    kJ/mol/nm and the cap should clamp it to 5000.
+    """
+    nominal_fmag = 1.0 * imd.config.const_k  # delta=1 nm * const_k
+    cap = imd.config.max_force_kj
+    if nominal_fmag <= cap:
+        log.info(
+            "[%s] const_k=%.0f below cap=%.0f; cap check would be vacuous, skipping",
+            label,
+            imd.config.const_k,
+            cap,
+        )
+        return
+
+    def _fake_pymol_positions() -> np.ndarray:
+        pos = imd._read_openmm_positions_nm().copy()
+        pos[0] = pos[0] + np.array([1.0, 0.0, 0.0])  # 1 nm shove on atom 0
+        return pos
+
+    original = imd._read_pymol_positions_nm
+    imd._read_pymol_positions_nm = _fake_pymol_positions
+    try:
+        imd._apply_pull_force_from_pymol()
+    finally:
+        imd._read_pymol_positions_nm = original
+
+    _, params = imd._pull_force.getParticleParameters(0)
+    fmag = math.sqrt(sum(float(p) ** 2 for p in params))
+    if abs(fmag - cap) > 1.0:
+        raise AssertionError(
+            f"[{label}] |F| cap not enforced: got {fmag:.2f} kJ/mol/nm, expected {cap:.2f}"
+        )
+    log.info("[%s] |F| cap OK: nominal=%.0f -> capped=%.1f kJ/mol/nm", label, nominal_fmag, fmag)
+
+
+def _run_backend(
+    backend,
+    pdb_path: Path,
+    *,
+    label: str,
+    n_steps: int,
+    integrator: str = "langevin",
+    check_force_cap: bool = False,
+) -> None:
     from pymol_imd.imd import IMDConfig, IMDSystem
 
     log.info("[%s] Building system from %s", label, pdb_path)
@@ -30,12 +79,20 @@ def _run_backend(backend, pdb_path: Path, *, label: str, n_steps: int) -> None:
         "[%s] System built: %d atoms (pbc=%s)", label, bundle.topology.getNumAtoms(), bundle.pbc
     )
 
-    imd = IMDSystem(bundle, IMDConfig(nsteps_per_frame=1, mouse_force=False))
+    cfg = IMDConfig(nsteps_per_frame=1, mouse_force=False, integrator=integrator)
+    imd = IMDSystem(bundle, cfg)
+    log.info("[%s] Integrator: %s", label, integrator)
     log.info("[%s] Minimizing...", label)
     imd.simulation.minimizeEnergy(maxIterations=200)
+
+    if check_force_cap:
+        _verify_force_cap(imd, label=label)
+
     log.info("[%s] Stepping %d frames...", label, n_steps)
     for _ in range(n_steps):
         imd.simulation.step(1)
+        if imd._diverged():
+            raise AssertionError(f"[{label}] diverged after a single 1-step block")
     log.info("[%s] OK", label)
 
 
@@ -47,8 +104,17 @@ def main(pdb_id: str = "1aki", n_steps: int = 10) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         pdb_path = fetch_pdb(pdb_id, out_dir=tmp_path)
-        _run_backend(AABackend(), pdb_path, label="AA", n_steps=n_steps)
-        _run_backend(CGBackend(), pdb_path, label="CG", n_steps=n_steps)
+        # AA runs with LangevinMiddleIntegrator (matches setup_aa default) and
+        # also exercises the |F| cap path under a synthetic large delta.
+        _run_backend(
+            AABackend(),
+            pdb_path,
+            label="AA",
+            n_steps=n_steps,
+            integrator="langevin_middle",
+            check_force_cap=True,
+        )
+        _run_backend(CGBackend(), pdb_path, label="CG", n_steps=n_steps, integrator="langevin")
         log.info("Smoke test OK")
     return 0
 

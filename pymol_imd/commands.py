@@ -166,11 +166,13 @@ def setup_aa(
     nsteps_per_frame: object = 1,
     const_k: object = None,
     mouse_force: object = True,
+    max_force_kj: object | None = None,
 ) -> None:
     """Set up an all-atom IMD simulation in vacuo (NVT) by default.
 
     ``const_k`` falls back to ``AABackend.recommended_const_k`` (50000) when
-    omitted; the backend owns its own recommended scale.
+    omitted; the backend owns its own recommended scale. ``max_force_kj``
+    falls back to ``IMDConfig.max_force_kj`` (5000) when omitted.
     """
     global _imd_system, _timer, _timer_minimize
     pdb_path = Path(pdb_file)
@@ -185,14 +187,19 @@ def setup_aa(
     obj_name = _load_prepared_into_pymol(
         bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
     )
-    _imd_system = _make_imd(
-        bundle,
-        obj_name,
-        temperature=_as_float(temperature),
-        nsteps_per_frame=_as_int(nsteps_per_frame),
-        const_k=_resolve_const_k(backend, const_k),
-        mouse_force=_as_bool(mouse_force),
-    )
+    imd_kwargs: dict = {
+        "temperature": _as_float(temperature),
+        "nsteps_per_frame": _as_int(nsteps_per_frame),
+        "const_k": _resolve_const_k(backend, const_k),
+        "mouse_force": _as_bool(mouse_force),
+        # AA uses HBonds constraints + a relatively short timestep; the
+        # LangevinMiddleIntegrator (BAOAB) gives a wider stability margin
+        # under user-injected pull forces with no API cost.
+        "integrator": "langevin_middle",
+    }
+    if max_force_kj is not None:
+        imd_kwargs["max_force_kj"] = _as_float(max_force_kj)
+    _imd_system = _make_imd(bundle, obj_name, **imd_kwargs)
     _timer = _make_qtimer()
     _timer_minimize = _make_qtimer()
     print(f"setup_aa: ready (object={obj_name}, atoms={_imd_system.n_atoms}, pbc={bundle.pbc})")
@@ -208,6 +215,7 @@ def setup_cg(
     const_k: object = None,
     mouse_force: object = True,
     timestep_ps: object = 0.020,
+    max_force_kj: object | None = None,
 ) -> None:
     """Set up a Martini CG IMD simulation via vermouth + martini_openmm.
 
@@ -233,15 +241,16 @@ def setup_cg(
     obj_name = _load_prepared_into_pymol(
         bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
     )
-    _imd_system = _make_imd(
-        bundle,
-        obj_name,
-        temperature=_as_float(temperature),
-        nsteps_per_frame=_as_int(nsteps_per_frame),
-        const_k=_resolve_const_k(backend, const_k),
-        mouse_force=_as_bool(mouse_force),
-        timestep_ps=_as_float(timestep_ps),
-    )
+    imd_kwargs: dict = {
+        "temperature": _as_float(temperature),
+        "nsteps_per_frame": _as_int(nsteps_per_frame),
+        "const_k": _resolve_const_k(backend, const_k),
+        "mouse_force": _as_bool(mouse_force),
+        "timestep_ps": _as_float(timestep_ps),
+    }
+    if max_force_kj is not None:
+        imd_kwargs["max_force_kj"] = _as_float(max_force_kj)
+    _imd_system = _make_imd(bundle, obj_name, **imd_kwargs)
     _timer = _make_qtimer()
     _timer_minimize = _make_qtimer()
     print(
@@ -263,10 +272,19 @@ def setup_mlmm(
     const_k: object = None,
     mouse_force: object = True,
     link_atom_method: str = "scaled",
+    max_force_kj: object | None = None,
+    timestep_ps: object = 0.0005,
 ) -> None:
     """Set up an ONIOM-style ML/MM IMD simulation.
 
     ``const_k=None`` falls back to ``MLMMBackend.recommended_const_k``.
+
+    ``timestep_ps`` defaults to 0.5 fs because the ML region carries no
+    constraints (the MLIP and OpenMM constraint framework can't share state),
+    so C-H bond vibrations (~10 fs period) must be resolved directly. AA-like
+    2 fs steps are not safe here and tend to drift / blow up under MLIP
+    numerical noise. Override only if you know the ML region has no fast
+    modes (e.g. all-heavy-atom selection).
 
     Parameters
     ----------
@@ -319,14 +337,16 @@ def setup_mlmm(
     )
     ml_indices = bundle.extra["ml_indices"] if bundle.extra else ()
     ml_sel_name = _highlight_ml_region(obj_name, ml_indices) if ml_indices else None
-    _imd_system = _make_imd(
-        bundle,
-        obj_name,
-        temperature=_as_float(temperature),
-        nsteps_per_frame=_as_int(nsteps_per_frame),
-        const_k=_resolve_const_k(backend, const_k),
-        mouse_force=_as_bool(mouse_force),
-    )
+    imd_kwargs: dict = {
+        "temperature": _as_float(temperature),
+        "nsteps_per_frame": _as_int(nsteps_per_frame),
+        "const_k": _resolve_const_k(backend, const_k),
+        "mouse_force": _as_bool(mouse_force),
+        "timestep_ps": _as_float(timestep_ps),
+    }
+    if max_force_kj is not None:
+        imd_kwargs["max_force_kj"] = _as_float(max_force_kj)
+    _imd_system = _make_imd(bundle, obj_name, **imd_kwargs)
     _timer = _make_qtimer()
     _timer_minimize = _make_qtimer()
     n_ml = len(ml_indices)
@@ -335,7 +355,9 @@ def setup_mlmm(
     link_msg = f", link_atoms={n_link}({link_atom_method})" if n_link else ""
     print(
         f"setup_mlmm: ready (object={obj_name}, atoms={_imd_system.n_atoms}, "
-        f"ml_atoms={n_ml}, ml_backend={ml_backend}, pbc={bundle.pbc}{link_msg}{sel_msg})"
+        f"ml_atoms={n_ml}, ml_backend={ml_backend}, "
+        f"dt={_as_float(timestep_ps) * 1000:.2f}fs, "
+        f"pbc={bundle.pbc}{link_msg}{sel_msg})"
     )
 
 
@@ -416,7 +438,7 @@ def imd_run() -> None:
             print(f"imd_run: stopped due to error — {exc}")
         if not _imd_system.running:
             _timer.stop()
-            print("imd_run: stopped (divergence or error). Adjust const_k / max_pull_nm.")
+            print("imd_run: stopped (divergence or error). Adjust const_k / max_force_kj.")
 
     _reset_timer(_timer)
     _timer.timeout.connect(_tick)
@@ -456,16 +478,16 @@ def imd_change(
     mouse_force: object | None = None,
     nsteps_per_frame: object | None = None,
     temperature: object | None = None,
-    max_pull_nm: object | None = None,
+    max_force_kj: object | None = None,
     energy_cutoff_kj: object | None = None,
 ) -> None:
     """Hot-patch IMD parameters without rebuilding the system.
 
     Updatable in place: ``const_k``, ``mouse_force``, ``nsteps_per_frame``,
-    ``temperature`` (live Langevin integrator update), ``max_pull_nm``,
+    ``temperature`` (live Langevin integrator update), ``max_force_kj``,
     ``energy_cutoff_kj``. Other ``IMDConfig`` fields (``friction``,
-    ``timestep_ps``, ``pressure``) need a fresh ``setup_*`` because they
-    require rebuilding the integrator or the barostat.
+    ``timestep_ps``, ``pressure``, ``integrator``) need a fresh ``setup_*``
+    because they require rebuilding the integrator or the barostat.
     """
     if _imd_system is None:
         print("imd: no system loaded")
@@ -479,10 +501,11 @@ def imd_change(
         cfg.nsteps_per_frame = _as_int(nsteps_per_frame)
     if temperature is not None:
         cfg.temperature = _as_float(temperature)
-        # Langevin integrator temperature can be updated live.
+        # Langevin integrator temperature can be updated live (same API on
+        # both LangevinIntegrator and LangevinMiddleIntegrator).
         _imd_system.simulation.integrator.setTemperature(cfg.temperature)
-    if max_pull_nm is not None:
-        cfg.max_pull_nm = _as_float(max_pull_nm)
+    if max_force_kj is not None:
+        cfg.max_force_kj = _as_float(max_force_kj)
     if energy_cutoff_kj is not None:
         cfg.energy_cutoff_kj = _as_float(energy_cutoff_kj)
     print(f"imd_change: {cfg}")

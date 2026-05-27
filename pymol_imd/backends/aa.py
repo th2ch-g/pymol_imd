@@ -30,8 +30,10 @@ FORCEFIELD_FILES = (
 
 class AABackend:
     name = "aa"
-    # |F|_max = max_pull_nm × const_k = 0.5 × 50000 = 25000 kJ/mol/nm, about
-    # 10% of a typical bond stretching constant — strong drag, still safe.
+    # Pull-force spring constant (kJ/mol/nm). The actual per-atom |F| is
+    # bounded by IMDConfig.max_force_kj (default 5000) regardless of this
+    # value, so const_k mostly controls how aggressively the pull responds
+    # to small drags before it saturates at the cap.
     recommended_const_k = 50000.0
 
     def build_system(
