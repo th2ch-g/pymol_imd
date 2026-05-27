@@ -61,18 +61,26 @@ requests = "*"
 pymol_imd = { path = ".", editable = true }
 # Martini reader for OpenMM (no conda-forge build available). Pinned to upstream main.
 martini-openmm = { git = "https://github.com/maccallumlab/martini_openmm.git" }
+# MACE MLIP backend (default for setup_mlmm). MACE-OMOL-0 is a public,
+# login-free model so `pixi install` → `setup_mlmm` works out of the box;
+# UMA stays available via `--ml-backend uma` but needs HF auth.
+mace-torch = "*"
 ruff = "*"
 
-# mlmm-toolkit is installed via `pixi run install-mlmm`, not as a
-# pypi-dependency, because its transitive deps (fairchem-core 2.x ->
-# ray[serve] -> pydantic chain) conflict with pixi's strict conda/pypi
-# resolution. pip's looser resolver handles them fine.
+# Optional MLIP backends for setup_mlmm (MACE is the default and already
+# installed above). Each of these has transitive deps (fairchem-core 2.x ->
+# ray[serve] -> pydantic; orb-models -> torch C++ extensions; aimnet ->
+# torch) that conflict with pixi's strict conda/pypi resolver, so they
+# live in tasks instead of pypi-dependencies — pip's looser resolver
+# installs them cleanly.
 [tool.pixi.tasks]
 ruff-format = "ruff format --force-exclude"
 ruff-lint = "ruff check --fix --exit-non-zero-on-fix --force-exclude"
 r = { cmd = "echo OK", depends-on = ["ruff-format", "ruff-lint"] }
 smoke = "python -m pymol_imd.tests.smoke"
-install-mlmm = "pip install --no-build-isolation -e ../mlmm_toolkit"
+install-uma = "pip install --no-build-isolation 'fairchem-core>=2.20.0'"
+install-orb = "pip install --no-build-isolation orb-models"
+install-aimnet2 = "pip install --no-build-isolation aimnet"
 
 # ---------------------------------------------------------------------------
 # Ruff

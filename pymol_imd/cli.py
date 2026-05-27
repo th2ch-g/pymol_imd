@@ -85,13 +85,23 @@ def _build_parser() -> argparse.ArgumentParser:
     mlmm.add_argument(
         "--ml-selection",
         metavar="SEL",
-        help="ML region selector: 'all', 'resi 30-50', 'chain A', 'resn LIG', or comma-separated indices.",
+        help=(
+            "ML region selector (REQUIRED for --level mlmm). Uses PyMOL's "
+            "selection language. Examples: 'all', 'resi 30-50', "
+            "'resi 1 and resn MET', 'chain A and not resn HOH', "
+            "'byres (resn LIG) within 5 of chain A'."
+        ),
     )
     mlmm.add_argument(
         "--ml-backend",
         choices=ML_BACKENDS,
         metavar="NAME",
-        help=f"MLIP backend. One of: {', '.join(ML_BACKENDS)}.",
+        default=None,
+        help=(
+            f"MLIP backend. One of: {', '.join(ML_BACKENDS)}. "
+            "If omitted, setup_mlmm picks 'mace' (public MACE-OMOL-0 model, "
+            "no HF login required)."
+        ),
     )
     mlmm.add_argument("--ml-device", metavar="DEV", help="Torch device: auto / cuda / mps / cpu.")
     mlmm.add_argument("--ml-charge", type=int, metavar="Z", help="ML region net charge.")
@@ -180,6 +190,22 @@ def main(argv: list[str] | None = None) -> int:
     pdb_path = Path(args.pdb).expanduser().resolve()
     if not pdb_path.exists():
         print(f"pymol_imd: PDB file not found: {pdb_path}", file=sys.stderr)
+        return 2
+
+    # Level-specific required-flag validation, done up front so we don't
+    # launch PyMOL only to error out from inside setup_*.
+    if args.level == "mlmm" and args.ml_selection is None:
+        print(
+            "pymol_imd: --ml-selection is required for --level mlmm.\n"
+            "Uses PyMOL's selection language (and / or / not / within / "
+            "byres / resi / resn / chain / name). Examples:\n"
+            "  --ml-selection 'resi 30-50'\n"
+            "  --ml-selection 'resi 1 and resn MET'\n"
+            "  --ml-selection 'chain A and not resn HOH'\n"
+            "  --ml-selection 'byres (resn LIG) within 5 of chain A'\n"
+            "  --ml-selection 'all'          # whole-system MLIP (slow)",
+            file=sys.stderr,
+        )
         return 2
 
     pymol_bin = args.pymol or shutil.which("pymol")

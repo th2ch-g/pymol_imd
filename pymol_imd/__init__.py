@@ -13,6 +13,14 @@ Importing this package does two things:
 
 from __future__ import annotations
 
+import os
+
+# Enable PyTorch's MPS->CPU fallback for ops not yet implemented on Apple
+# Silicon. MACE in particular hits float64 rebuild paths during model load /
+# inference; without this fallback the user crashes the moment they invoke
+# setup_mlmm on a Mac. Set BEFORE importing torch (downstream of this).
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 __version__ = "0.1.0"
 
 from .commands import (  # noqa: F401

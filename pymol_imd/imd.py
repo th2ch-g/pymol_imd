@@ -140,6 +140,10 @@ class IMDSystem:
         Runs once per frame, before the MD step. The correction adds the MLIP
         energy gradient and subtracts the Amber MM contribution computed on
         the same atoms, yielding the ONIOM total force on the ML region.
+
+        Every supported MLIP backend (UMA / ORB / MACE / AIMNet2) is wrapped
+        as an ASE ``Calculator``, so a single ``atoms.get_forces()`` call
+        works for all of them.
         """
         from ase import Atoms
 
@@ -149,17 +153,20 @@ class IMDSystem:
         ml_indices = extra["ml_indices"]
         ml_symbols = extra["ml_symbols"]
         sub_context: openmm.Context = extra["ml_subset_context"]
-        mlip = extra["ml_backend"]
+        ml_calc = extra["ml_calculator"]
+        ml_info = extra.get("ml_calc_info", {})
 
         full_positions = self._read_openmm_positions_nm()
         ml_positions_nm = full_positions[list(ml_indices)]
         ml_positions_ang = ml_positions_nm * 10.0
 
-        # 1) MLIP force on ML region (eV / Å). getattr keeps the method name
-        # out of static scanners that confuse it with the Python builtin.
+        # 1) MLIP force on ML region via ASE (eV / Å). Backend-agnostic.
         atoms = Atoms(symbols=ml_symbols, positions=ml_positions_ang)
-        ml_eval = mlip.eval
-        _, F_ml_eV_per_A, _ = ml_eval(atoms, need_grad=True)
+        atoms.calc = ml_calc
+        # AIMNet2 reads charge / multiplicity from atoms.info; harmless for
+        # the other backends.
+        atoms.info.update(ml_info)
+        F_ml_eV_per_A = np.asarray(atoms.get_forces(), dtype=np.float64)
 
         # 2) MM force on the ML-region subset (kJ/mol/nm).
         sub_context.setPositions(ml_positions_nm * unit.nanometer)
@@ -169,7 +176,7 @@ class IMDSystem:
         )
 
         # 3) Delta in OpenMM units: F_ML[kJ/mol/nm] - F_MM[kJ/mol/nm].
-        F_ml_kj_per_nm = np.asarray(F_ml_eV_per_A) * _EV_PER_A_TO_KJ_PER_MOL_NM
+        F_ml_kj_per_nm = F_ml_eV_per_A * _EV_PER_A_TO_KJ_PER_MOL_NM
         delta = F_ml_kj_per_nm - np.asarray(F_mm_kj_per_nm)
 
         for local_idx, atom_idx in enumerate(ml_indices):
@@ -287,6 +294,11 @@ class IMDSystem:
         except ImportError:  # pragma: no cover - headless smoke test
             return
         pymol_atom_count = cmd.count_atoms(self.pymol_selector)
+        if pymol_atom_count == 0:
+            # PyMOL is importable but no object is loaded against this
+            # selector — typically a headless / scripted run. Skip silently
+            # so backend smoke tests don't need a live PyMOL viewer.
+            return
         if pymol_atom_count != self.n_atoms:
             raise RuntimeError(
                 f"Refusing to push positions: PyMOL selector "

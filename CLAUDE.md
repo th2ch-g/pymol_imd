@@ -23,17 +23,17 @@ The plugin must accept proteins, DNA, RNA, lipids, and small-molecule ligands; c
   - ML/MM: `mlmm_toolkit` (git+URL) + `pytorch`, `pytorch_scatter`, `pytorch_geometric`, `ase`, `parmed`, `biopython` from conda-forge
   - hydrogen completion: **only** `openmm.app.Modeller.addHydrogens` — do NOT pull in `pdbfixer`, `propka`, etc.
 - Any other dependency requires explicit user approval before being added.
-- **pixi environments**: All three backends (AA / CG / ML-MM) live in the single `default` environment. `pixi install` covers AA + CG out of the box. For ML/MM run `pixi run install-mlmm` once after that.
-- **Two-step ML/MM install**:
-  1. `pixi install` — conda deps including `pytorch`, `pytorch_scatter`, `pytorch_geometric`, `mdtraj`, `vermouth`, etc.
-  2. `pixi run install-mlmm` — `pip install --no-build-isolation -e ../mlmm_toolkit`. **Kept out of pypi-dependencies** because pixi's strict resolver clashes with `fairchem-core 2.x → ray[serve] → pydantic` transitive constraints; pip's looser resolver handles them.
+- **pixi environments**: All three backends (AA / CG / ML-MM) live in the single `default` environment. `pixi install` covers AA + CG + MACE-based ML/MM out of the box.
+- **mlmm_toolkit-free**: As of the latest revision, `pymol_imd/backends/mlmm.py` builds the MLIP ASE Calculators directly (`mace_omol`, `ORBCalculator`, `AIMNet2Calculator`, `FAIRChemCalculator`). The previous `mlmm_toolkit` dispatcher dependency was removed — no need to clone the fork at `../mlmm_toolkit`.
 - **CG forcefield**: Martini 3 `.itp` is downloaded once into `~/.cache/pymol_imd/martini3/` on first `setup_cg`. Online required for first run; subsequent runs are offline.
 - **CG forces PBC**: Martini uses a 1.1 nm cutoff so it cannot run in vacuo. CG backend auto-creates a bounding-box around the molecule + 1 nm padding when `pbc=False`. AA/MLMM still default to NoCutoff vacuo.
 - **ML/MM = ONIOM**: `E_total = E_MM(full) + E_ML(region) - E_MM(region)`. Each frame the ML region delta force `F_ML - F_MM_subset` is pushed into a dedicated `CustomExternalForce`. Link-atom handling for cross-region bonds is **not implemented yet**; pick selections that are molecularly closed (entire residues / chains).
 - **MLIP model access**:
-  - **UMA**: Meta's gated repo. Needs HuggingFace auth: `huggingface-cli login` + access request approval at `huggingface.co/facebook/UMA`.
-  - **ORB / MACE / AIMNet2**: each needs its own optional dep (`orb-models`, `mace-torch`, `aimnet`). Not in the default env; users install them on demand.
-- **Apple Silicon (MPS) support**: The `mlmm_toolkit` fork's `_auto_torch_device` selects `cuda → mps → cpu`. Apple Silicon GPUs work for the MLIP backends out of the box.
+  - **MACE-OMOL-0 (default)**: public ASL-licensed model on GitHub releases of `mace-foundations`. No login, ~400 MB on first call, cached to `~/.cache/mace/`. Already covered by `pixi install` via `mace-torch`.
+  - **UMA**: HuggingFace gated repo `facebook/UMA`. Requires `huggingface-cli login` + access approval. Install fairchem-core via `pixi run install-uma`.
+  - **ORB**: install via `pixi run install-orb` (`orb-models`). Public model.
+  - **AIMNet2**: install via `pixi run install-aimnet2` (`aimnet`). Model is bundled with the package.
+- **Apple Silicon (MPS) support**: `pymol_imd.backends.mlmm._auto_torch_device` selects `cuda → mps → cpu`. On MPS the MACE dtype is forced to `float32` because MPS does not support float64.
 - **MPS fallback**: If a torch op is unimplemented on MPS, export `PYTORCH_ENABLE_MPS_FALLBACK=1` before launching PyMOL so the missing ops silently drop to CPU.
 
 ### Common commands

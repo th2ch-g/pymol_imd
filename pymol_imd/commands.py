@@ -198,8 +198,8 @@ def setup_cg(
 
 def setup_mlmm(
     pdb_file: str,
-    ml_selection: str = "all",
-    ml_backend: str = "uma",
+    ml_selection: str | None = None,
+    ml_backend: str = "mace",
     ml_device: str = "auto",
     ml_charge: object = 0,
     ml_mult: object = 1,
@@ -214,14 +214,28 @@ def setup_mlmm(
     Parameters
     ----------
     ml_selection :
-        Selection of atoms to treat with the MLIP. Examples: ``"all"``,
-        ``"resi 30-50"``, ``"chain A"``, ``"resn LIG"``, ``"0,1,2,3"``.
+        REQUIRED. Selection of atoms to treat with the MLIP. Examples:
+        ``"all"`` (entire system, slow on large proteins), ``"resi 30-50"``,
+        ``"chain A"``, ``"resn LIG"``, ``"0,1,2,3"``. Omitting this raises
+        an error to prevent accidental whole-system MLIP simulations.
     ml_backend :
-        One of ``uma`` / ``orb`` / ``mace`` / ``aimnet2``. Defaults to UMA.
+        One of ``uma`` / ``orb`` / ``mace`` / ``aimnet2``. Defaults to MACE
+        (`MACE-OMOL-0`, login-free public model). UMA needs HF auth.
     ml_device :
         ``auto`` (cuda → mps → cpu), or explicit ``cuda``/``mps``/``cpu``.
     """
     global _imd_system, _timer, _timer_minimize
+    if ml_selection is None:
+        raise ValueError(
+            "setup_mlmm requires ml_selection. Selection language is PyMOL's "
+            "(full syntax: and / or / not / within / byres / resi / resn / "
+            "chain / name). Examples:\n"
+            "  setup_mlmm input.pdb ml_selection='resi 30-50'\n"
+            "  setup_mlmm input.pdb ml_selection='resi 1 and resn MET'\n"
+            "  setup_mlmm input.pdb ml_selection='chain A and not resn HOH'\n"
+            "  setup_mlmm input.pdb ml_selection='byres (resn LIG) within 5 of chain A'\n"
+            "  setup_mlmm input.pdb ml_selection='all'  # whole system (slow)"
+        )
     pdb_path = Path(pdb_file)
 
     bundle = MLMMBackend().build_system(
