@@ -89,6 +89,29 @@ def _chemical_bond_only(atom_a, atom_b) -> bool:
         return False
 
 
+def _build_atom_to_pdb_serial(topology: Topology) -> dict:
+    """Map each ``Atom`` to the 1-based serial number ``PDBFile.writeModel``
+    will assign it.
+
+    Must mirror ``PDBFile.writeModel``'s iteration exactly: each chain's
+    final residue triggers a TER record that consumes one extra serial,
+    shifting every subsequent atom's serial by +1 per chain. Failing to
+    account for that makes CONECT records point at the wrong atoms — a
+    visible disaster for waters / heteroatoms past the first chain.
+    """
+    mapping: dict = {}
+    serial = 1
+    for chain in topology.chains():
+        residues = list(chain.residues())
+        for res_idx, res in enumerate(residues):
+            for atom in res.atoms():
+                mapping[atom] = serial
+                serial += 1
+            if res_idx == len(residues) - 1:
+                serial += 1  # TER record consumes one serial slot
+    return mapping
+
+
 def write_prepared_pdb(
     topology: Topology,
     positions: Quantity,
@@ -111,13 +134,15 @@ def write_prepared_pdb(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    atom_serial = _build_atom_to_pdb_serial(topology)
+
     with open(out_path, "w") as fh:
         PDBFile.writeHeader(topology, fh)
         PDBFile.writeModel(topology, positions, fh, modelIndex=1)
         for atom_a, atom_b in topology.bonds():
             if bond_filter is not None and not bond_filter(atom_a, atom_b):
                 continue
-            fh.write(f"CONECT{atom_a.index + 1:>5d}{atom_b.index + 1:>5d}\n")
+            fh.write(f"CONECT{atom_serial[atom_a]:>5d}{atom_serial[atom_b]:>5d}\n")
         PDBFile.writeFooter(topology, fh)
     return out_path
 

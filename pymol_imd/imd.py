@@ -36,7 +36,7 @@ class IMDConfig:
     friction: float = 1.0  # 1/ps
     timestep_ps: float = 0.002  # ps
     nsteps_per_frame: int = 1
-    const_k: float = 50000.0  # kJ/mol/nm scale for the pulling force
+    const_k: float = 10000.0  # kJ/mol/nm scale for the pulling force
     mouse_force: bool = True
     # Cap on |delta| (nm) per atom before multiplying by const_k. Prevents
     # runaway forces when the user drags an atom a huge distance: without

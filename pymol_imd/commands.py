@@ -95,6 +95,10 @@ def _load_prepared_into_pymol(
         # Render any non-polymer atoms (ligands, ions left in) as sticks too.
         cmd.show("sticks", f"{candidate} and not polymer")
     cmd.zoom(candidate, buffer=2.0)
+    # Drop into Editing mode so the user can immediately grab atoms with
+    # Ctrl+left-drag and feed the pull-force mechanism without first
+    # toggling Mouse > 3-Button Editing from the menu.
+    cmd.config_mouse("three_button_editing")
     return candidate
 
 
@@ -147,7 +151,7 @@ def setup_cg(
     elastic_network: object = True,
     temperature: object = 300.0,
     nsteps_per_frame: object = 1,
-    const_k: object = 50000.0,
+    const_k: object = 10000.0,
     mouse_force: object = True,
     timestep_ps: object = 0.020,
 ) -> None:
