@@ -83,6 +83,7 @@ ruff-format = "ruff format --force-exclude"
 ruff-lint = "ruff check --fix --exit-non-zero-on-fix --force-exclude"
 r = { cmd = "echo OK", depends-on = ["ruff-format", "ruff-lint"] }
 smoke = "python -m pymol_imd.tests.smoke"
+record-smoke = "python -m pymol_imd.tests.smoke_record"
 install-uma = "pip install --no-build-isolation 'fairchem-core>=2.20.0'"
 install-orb = "pip install --no-build-isolation orb-models"
 

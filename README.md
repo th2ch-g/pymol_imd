@@ -92,6 +92,10 @@ pixi run pymol_imd 1ubq.pdb --level aa --print-only
 | `--no-mouse-force` | all | Disable user-pull |
 | `--minimize` | all | Run `imd_minimize` after setup |
 | `--run` | all | Run `imd_run` after setup |
+| `--traj-out PATH` | all | Record a trajectory during `imd_run` (`.xtc`/`.dcd`/`.pdb` by extension); needs `--run` |
+| `--traj-interval N` | all | Trajectory: write every N GUI frames (default 1) |
+| `--force-csv PATH` | all | Record user pull forces to CSV (`frame,step,time_ps,atom_index,fx,fy,fz,fmag`, atom_index 0-based); needs `--run` |
+| `--force-csv-interval N` | all | Force CSV: write every N GUI frames (default 1) |
 | `--ligand-sdf PATH` | `aa` | Ligand SDF for GAFF + AM1-BCC parameterisation |
 | `--ff NAME` | `cg`  | Martini forcefield label (default: `martini3001`) |
 | `--no-elastic-network` | `cg` | Skip martinize2 `-elastic` |
@@ -112,9 +116,10 @@ pixi run pymol_imd 1ubq.pdb --level aa --print-only
 PyMOL> from pymol_imd import *
 PyMOL> setup_aa /path/to/input.pdb
 PyMOL> imd_minimize             # converges on stable structure
-PyMOL> imd_run                  # production loop
+PyMOL> imd_record traj=traj.xtc, force_csv=forces.csv  # arm recording (optional)
+PyMOL> imd_run                  # production loop (recording starts here)
 PyMOL> imd_change const_k=20000 # hot-patch on the fly
-PyMOL> imd_stop
+PyMOL> imd_stop                 # recording flushed + closed here
 ```
 
 CG / ML-MM analogues:
@@ -129,6 +134,43 @@ After `setup_*`:
 - A new PyMOL object `<basename>_imd` appears with backend-appropriate
   representation (cartoon + sticks for AA / ML-MM, spheres + bonds for CG).
 - Mouse mode switches to **3-Button Editing** automatically.
+
+---
+
+## Recording trajectories and forces
+
+`imd_record` arms output for the **next** `imd_run`. Recording starts when
+`imd_run` is called and stops — files flushed + closed — on `imd_stop` (or on
+an automatic divergence / error halt). Minimization is never recorded.
+
+```
+PyMOL> setup_aa input.pdb
+PyMOL> imd_record traj=run.xtc, force_csv=pull.csv
+PyMOL> imd_run                  # recording begins
+PyMOL> imd_stop                 # files finalized
+PyMOL> imd_record off           # disarm (optional)
+```
+
+- **Trajectory** format is chosen by file extension: `.xtc`, `.dcd`, `.pdb`.
+- **Force CSV** logs only the user pull force, one row per dragged atom per
+  recorded frame, columns `frame,step,time_ps,atom_index,fx,fy,fz,fmag`
+  (forces in kJ/mol/nm, after the `max_force_kj` cap). `atom_index` is
+  **0-based** (OpenMM / trajectory convention) — add 1 to match a PyMOL
+  `index` selection.
+- `traj_interval` / `force_csv_interval` are in **GUI frames** (default 1):
+  `traj_interval=5` writes every 5th frame.
+
+From the CLI the same is available via flags (recording requires `--run`):
+
+```bash
+pixi run pymol_imd input.pdb --level aa --run \
+    --traj-out run.xtc --traj-interval 5 \
+    --force-csv pull.csv
+```
+
+> Changing `nsteps_per_frame` with `imd_change` mid-run does **not** retune an
+> active trajectory reporter's interval (fixed at `imd_run` time). Run
+> `imd_stop` then `imd_run` again to resync.
 
 ---
 
@@ -226,7 +268,8 @@ pymol_imd/
 │   ├── cg.py          Martini 3 backend (vermouth + martini_openmm)
 │   └── mlmm.py        ONIOM ML/MM backend (UMA / ORB / MACE / AIMNet2)
 └── tests/
-    └── smoke.py       Headless AA + CG smoke
+    ├── smoke.py        Headless AA + CG smoke
+    └── smoke_record.py Headless trajectory + force-CSV recording smoke
 ```
 
 ---

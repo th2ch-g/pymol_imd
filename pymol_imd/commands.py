@@ -362,6 +362,64 @@ def setup_mlmm(
 
 
 # ----------------------------------------------------------------- imd_* family
+def imd_record(
+    traj: object | None = None,
+    traj_interval: object = 1,
+    force_csv: object | None = None,
+    force_csv_interval: object = 1,
+) -> None:
+    """Arm trajectory / pull-force recording for the next ``imd_run``.
+
+    Recording does not start immediately: it is configured here and begins
+    when ``imd_run`` is called, stopping (files flushed + closed) on
+    ``imd_stop`` or on divergence / error. This deferral lets ``imd_stop`` ->
+    ``imd_run`` re-record cleanly and lets the trajectory interval pick up the
+    current ``nsteps_per_frame``.
+
+    Parameters
+    ----------
+    traj:
+        Output trajectory path. Format is chosen by extension: ``.xtc`` /
+        ``.dcd`` / ``.pdb``. Pass ``"off"`` (or call with no paths) to disable
+        all recording.
+    traj_interval:
+        Write every N GUI frames to the trajectory (default 1).
+    force_csv:
+        Output CSV path for the user pull forces. Columns:
+        ``frame,step,time_ps,atom_index,fx,fy,fz,fmag``. Only dragged atoms
+        are written (one row each per recorded frame). ``atom_index`` is
+        0-based (OpenMM / trajectory convention); add 1 for a PyMOL selection.
+    force_csv_interval:
+        Write forces every N GUI frames (default 1).
+
+    Examples::
+
+        imd_record traj=traj.xtc, force_csv=forces.csv
+        imd_record traj=run.pdb, traj_interval=10
+        imd_record off                       # disable recording
+    """
+    if _imd_system is None:
+        print("imd: no system loaded — call setup_aa / setup_cg / setup_mlmm first")
+        return
+    # "off" (or no paths at all) clears recording.
+    if traj == "off" or (traj is None and force_csv is None):
+        _imd_system.set_recording()
+        print("imd_record: recording disabled")
+        return
+    _imd_system.set_recording(
+        traj=str(traj) if traj is not None else None,
+        traj_interval=_as_int(traj_interval),
+        force_csv=str(force_csv) if force_csv is not None else None,
+        force_csv_interval=_as_int(force_csv_interval),
+    )
+    parts = []
+    if traj is not None:
+        parts.append(f"traj={traj} (every {_as_int(traj_interval)} frame[s])")
+    if force_csv is not None:
+        parts.append(f"force_csv={force_csv} (every {_as_int(force_csv_interval)} frame[s])")
+    print(f"imd_record: armed — {', '.join(parts)}. Starts on imd_run, stops on imd_stop.")
+
+
 def imd_minimize(
     max_iter_per_chunk: object = 50,
     max_chunks: object = 200,
@@ -420,7 +478,12 @@ def imd_minimize(
 
 
 def imd_run() -> None:
-    """Start the production IMD loop."""
+    """Start the production IMD loop.
+
+    If an ``imd_record`` config is armed, trajectory / force-CSV recording
+    starts here and stops on ``imd_stop`` (or automatically on divergence /
+    error). With no armed config this behaves exactly as before.
+    """
     if _imd_system is None:
         print("imd: no system loaded — call setup_aa / setup_cg / setup_mlmm first")
         return
@@ -428,6 +491,14 @@ def imd_run() -> None:
         print("imd: already running")
         return
     _imd_system.running = True
+    try:
+        _imd_system.start_recording()
+    except Exception as exc:
+        # Bad trajectory extension / unwritable path etc. — don't start the
+        # loop with a half-initialized recorder.
+        _imd_system.running = False
+        print(f"imd_run: recording setup failed — {exc}")
+        return
 
     def _tick() -> None:
         try:
@@ -438,6 +509,7 @@ def imd_run() -> None:
             print(f"imd_run: stopped due to error — {exc}")
         if not _imd_system.running:
             _timer.stop()
+            _imd_system.stop_recording()
             print("imd_run: stopped (divergence or error). Adjust const_k / max_force_kj.")
 
     _reset_timer(_timer)
@@ -462,7 +534,7 @@ def _reset_timer(timer) -> None:
 
 
 def imd_stop() -> None:
-    """Stop minimization and production loops."""
+    """Stop minimization and production loops, and close any recording."""
     if _imd_system is None:
         return
     _imd_system.running = False
@@ -470,6 +542,8 @@ def imd_stop() -> None:
         _timer.stop()
     if _timer_minimize is not None:
         _timer_minimize.stop()
+    # Flush + close trajectory / CSV (idempotent; safe when not recording).
+    _imd_system.stop_recording()
     print("imd_stop: stopped")
 
 
@@ -488,6 +562,11 @@ def imd_change(
     ``energy_cutoff_kj``. Other ``IMDConfig`` fields (``friction``,
     ``timestep_ps``, ``pressure``, ``integrator``) need a fresh ``setup_*``
     because they require rebuilding the integrator or the barostat.
+
+    Note: changing ``nsteps_per_frame`` while a recording is active does NOT
+    retune the trajectory reporter's interval (it is fixed at ``imd_run``
+    time). Run ``imd_stop`` then ``imd_run`` again to resync the trajectory
+    sampling cadence.
     """
     if _imd_system is None:
         print("imd: no system loaded")
@@ -521,6 +600,7 @@ def _register() -> None:
     cmd.extend("setup_aa", setup_aa)
     cmd.extend("setup_cg", setup_cg)
     cmd.extend("setup_mlmm", setup_mlmm)
+    cmd.extend("imd_record", imd_record)
     cmd.extend("imd_minimize", imd_minimize)
     cmd.extend("imd_run", imd_run)
     cmd.extend("imd_stop", imd_stop)

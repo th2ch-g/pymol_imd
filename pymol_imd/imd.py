@@ -12,13 +12,17 @@ AA / CG / ML-MM backend) and turns it into a runnable simulation that:
 
 from __future__ import annotations
 
+import contextlib
+import csv
+import gc
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import openmm
 from openmm import LangevinIntegrator, LangevinMiddleIntegrator, MonteCarloBarostat, unit
-from openmm.app import Simulation
+from openmm.app import DCDReporter, PDBReporter, Simulation, XTCReporter
 
 from .backends.base import SystemBundle
 
@@ -108,6 +112,24 @@ class IMDSystem:
         # so we can zero them on release without scanning all n_atoms.
         self._active_pull_idx_prev: set[int] = set()
 
+        # --- recording state (production run only; never during minimize) ---
+        # set_recording() (imd_record) stores the pending config here;
+        # start_recording() (imd_run) opens files / attaches the reporter;
+        # stop_recording() (imd_stop) flushes + closes them. Kept on the
+        # mutable IMDSystem because the frozen SystemBundle cannot hold it.
+        self._record_settings: dict | None = None
+        self._recording: bool = False
+        self._traj_reporter: object | None = None
+        self._force_csv_path: Path | None = None
+        self._force_csv_file = None
+        self._force_csv_writer = None
+        self._force_csv_interval: int = 1
+        self._frame_index: int = 0  # per-run GUI-frame counter
+        # Pull force cached each frame by _apply_pull_force_from_pymol so the
+        # CSV writer reads it without recomputing.
+        self._last_pull_active_idx: np.ndarray = np.empty(0, dtype=int)
+        self._last_pull_forces: np.ndarray = np.empty((0, 3), dtype=float)
+
     # ------------------------------------------------------------------ setup
     _PULL_FORCE_EXPR = "- fx*x - fy*y - fz*z"
     _MLMM_FORCE_EXPR = "- gx*x - gy*y - gz*z"
@@ -191,9 +213,12 @@ class IMDSystem:
             self._apply_pull_force_from_pymol()
         if self._mlmm_force is not None:
             self._apply_mlmm_correction_force()
-        self.simulation.step(self.config.nsteps_per_frame)
+        self.simulation.step(self.config.nsteps_per_frame)  # trajectory reporter fires here
         if self._diverged():
             return
+        if self._recording:
+            self._record_force_csv()
+        self._frame_index += 1
         self._sync_positions_to_pymol()
 
     def _apply_mlmm_correction_force(self) -> None:
@@ -398,6 +423,173 @@ class IMDSystem:
         self._last_min_energy = energy_kj
         return converged
 
+    # --------------------------------------------------------------- recording
+    def set_recording(
+        self,
+        traj: str | None = None,
+        traj_interval: int = 1,
+        force_csv: str | None = None,
+        force_csv_interval: int = 1,
+    ) -> None:
+        """Store the pending recording config (does NOT open any file).
+
+        Called by the ``imd_record`` command. The actual file open / reporter
+        attach is deferred to :meth:`start_recording` (invoked by ``imd_run``)
+        so that re-running (``imd_stop`` -> ``imd_run``) re-attaches cleanly
+        and the reporter interval picks up the current ``nsteps_per_frame``.
+
+        Passing both ``traj`` and ``force_csv`` as None clears recording.
+        """
+        if traj is None and force_csv is None:
+            self._record_settings = None
+            return
+        self._record_settings = {
+            "traj": traj,
+            "traj_interval": max(1, int(traj_interval)),
+            "force_csv": force_csv,
+            "force_csv_interval": max(1, int(force_csv_interval)),
+        }
+
+    def start_recording(self) -> None:
+        """Open the trajectory reporter / force CSV from the pending config.
+
+        No-op when no recording was requested (so ``imd_run`` with no prior
+        ``imd_record`` keeps its original behavior). If already recording, the
+        previous outputs are closed first for a clean re-attach.
+        """
+        if self._record_settings is None:
+            return
+        if self._recording:
+            self.stop_recording()
+        self._frame_index = 0
+        settings = self._record_settings
+        traj = settings["traj"]
+        force_csv = settings["force_csv"]
+
+        try:
+            if traj is not None:
+                self._traj_reporter = self._make_traj_reporter(traj, settings["traj_interval"])
+                self.simulation.reporters.append(self._traj_reporter)
+            if force_csv is not None:
+                self._force_csv_interval = settings["force_csv_interval"]
+                path = Path(force_csv)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                self._force_csv_path = path
+                self._force_csv_file = open(path, "w", newline="")  # noqa: SIM115
+                self._force_csv_writer = csv.writer(self._force_csv_file)
+                self._force_csv_writer.writerow(
+                    ["frame", "step", "time_ps", "atom_index", "fx", "fy", "fz", "fmag"]
+                )
+                self._force_csv_file.flush()
+        except Exception:
+            # Roll back any partially-opened output (e.g. traj attached but
+            # the CSV open failed) so we never leave a dangling reporter.
+            self.stop_recording()
+            raise
+
+        self._recording = True
+        logger.info(
+            "recording: traj=%s (every %d frame[s]), force_csv=%s (every %d frame[s])",
+            traj,
+            settings["traj_interval"],
+            force_csv,
+            settings["force_csv_interval"],
+        )
+
+    def _make_traj_reporter(self, traj_path: str, traj_interval: int):
+        """Build a format-appropriate OpenMM trajectory reporter.
+
+        The file extension picks the format (.xtc / .dcd / .pdb). OpenMM's
+        ``reportInterval`` is in MD steps; since IMD advances
+        ``nsteps_per_frame`` steps per GUI frame, ``traj_interval`` (in GUI
+        frames) maps to ``reportInterval = traj_interval * nsteps_per_frame``.
+        Reporters fire on ``currentStep % reportInterval == 0``.
+
+        Note: changing ``nsteps_per_frame`` mid-run via ``imd_change`` does NOT
+        retune this interval (it is fixed at attach time); stop and re-run to
+        resync the trajectory cadence.
+        """
+        ext = Path(traj_path).suffix.lower()
+        report_interval = max(1, traj_interval * self.config.nsteps_per_frame)
+        # Overwrite any existing file so a second imd_run to the same path is
+        # consistent across formats (XTCReporter raises on a non-empty file).
+        out = Path(traj_path)
+        if out.exists():
+            logger.warning("recording: overwriting existing trajectory %s", traj_path)
+            out.unlink()
+        if ext == ".xtc":
+            return XTCReporter(traj_path, report_interval)
+        if ext == ".dcd":
+            return DCDReporter(traj_path, report_interval)
+        if ext == ".pdb":
+            return PDBReporter(traj_path, report_interval)
+        raise ValueError(
+            f"Unsupported trajectory extension '{ext}' for {traj_path!r}. Use .xtc, .dcd, or .pdb."
+        )
+
+    def stop_recording(self) -> None:
+        """Flush + close any active trajectory / CSV outputs. Idempotent.
+
+        The trajectory reporter is removed from the simulation, its reference
+        dropped, then ``gc.collect()`` is forced: PDBReporter writes its
+        trailing footer and DCDReporter closes its file only in ``__del__``,
+        so this is the format-uniform way to finalize the file. XTCReporter
+        completes each frame at the C level and needs nothing extra.
+        """
+        if self._traj_reporter is not None:
+            with contextlib.suppress(ValueError):
+                self.simulation.reporters.remove(self._traj_reporter)
+            self._traj_reporter = None
+            gc.collect()
+        if self._force_csv_file is not None:
+            try:
+                self._force_csv_file.flush()
+                self._force_csv_file.close()
+            finally:
+                self._force_csv_file = None
+                self._force_csv_writer = None
+                self._force_csv_path = None
+        self._recording = False
+
+    def _record_force_csv(self) -> None:
+        """Append the current frame's user pull forces to the CSV.
+
+        One row per dragged atom: frame index, absolute MD step, time, the
+        OpenMM 0-based atom index, the post-cap force vector (kJ/mol/nm) and
+        its magnitude. Frames with no dragged atoms emit no rows. atom_index
+        is 0-based (OpenMM / trajectory convention); add 1 for a PyMOL
+        selection.
+        """
+        if self._force_csv_writer is None:
+            return
+        if self._frame_index % self._force_csv_interval != 0:
+            return
+        active = self._last_pull_active_idx
+        if active.size == 0:
+            return
+        step = self.simulation.currentStep
+        time_ps = step * self.config.timestep_ps
+        forces = self._last_pull_forces
+        rows = []
+        for idx in active:
+            i = int(idx)
+            fx, fy, fz = forces[i]
+            fmag = float(np.sqrt(fx * fx + fy * fy + fz * fz))
+            rows.append(
+                (
+                    self._frame_index,
+                    step,
+                    f"{time_ps:.6f}",
+                    i,
+                    f"{float(fx):.6f}",
+                    f"{float(fy):.6f}",
+                    f"{float(fz):.6f}",
+                    f"{fmag:.6f}",
+                )
+            )
+        self._force_csv_writer.writerows(rows)
+        self._force_csv_file.flush()
+
     # ------------------------------------------------------------- pulling logic
     # Noise threshold: prepared.pdb is written with %8.3f (0.001 A = 1e-4 nm
     # precision), and PyMOL stores coordinates as float32. The round-trip
@@ -410,7 +602,10 @@ class IMDSystem:
         try:
             pymol_xyz = self._read_pymol_positions_nm()
         except ImportError:
-            return  # No PyMOL → no user pull.
+            # No PyMOL → no user pull. Keep the cache honest so the CSV writer
+            # doesn't re-emit a stale frame's active set.
+            self._last_pull_active_idx = np.empty(0, dtype=int)
+            return
         # RuntimeError from atom-count mismatch etc. is intentionally NOT
         # caught here; that's a real fault and the user must hear about it.
 
@@ -445,6 +640,9 @@ class IMDSystem:
                 self._pull_force.setParticleParameters(int(idx), int(idx), (0.0, 0.0, 0.0))
             self._pull_force.updateParametersInContext(self.simulation.context)
         self._active_pull_idx_prev = set(active_idx.tolist())
+        # Cache for the force CSV writer (consumed by _record_force_csv).
+        self._last_pull_active_idx = active_idx
+        self._last_pull_forces = forces
 
         if active_idx.size:
             logger.debug(

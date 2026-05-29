@@ -74,6 +74,35 @@ def _build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--run", action="store_true", help="Call imd_run() after setup (and minimize, if set)."
     )
+    common.add_argument(
+        "--traj-out",
+        metavar="PATH",
+        help=(
+            "Record a trajectory during imd_run. Format by extension: "
+            ".xtc / .dcd / .pdb. Requires --run."
+        ),
+    )
+    common.add_argument(
+        "--traj-interval",
+        type=int,
+        metavar="N",
+        help="Write every N GUI frames to the trajectory (default 1).",
+    )
+    common.add_argument(
+        "--force-csv",
+        metavar="PATH",
+        help=(
+            "Record user pull forces to CSV during imd_run (columns: "
+            "frame,step,time_ps,atom_index,fx,fy,fz,fmag). atom_index is "
+            "0-based (add 1 for a PyMOL selection). Requires --run."
+        ),
+    )
+    common.add_argument(
+        "--force-csv-interval",
+        type=int,
+        metavar="N",
+        help="Write forces every N GUI frames (default 1).",
+    )
 
     # ---- AA-specific
     aa = p.add_argument_group("--level aa options")
@@ -203,8 +232,37 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
     return kwargs
 
 
+def _collect_record_kwargs(args: argparse.Namespace) -> dict:
+    """Pull recording flags into an ``imd_record(...)``-compatible dict.
+
+    Returns an empty dict when neither output path is set: an interval alone
+    is meaningless and would otherwise produce ``imd_record(traj_interval=N)``,
+    which (no paths) reads as "disable recording".
+    """
+    traj_out = _resolve_path(args.traj_out)
+    force_csv = _resolve_path(args.force_csv)
+    if traj_out is None and force_csv is None:
+        return {}
+    kwargs: dict = {}
+    if traj_out is not None:
+        kwargs["traj"] = traj_out
+        if args.traj_interval is not None:
+            kwargs["traj_interval"] = args.traj_interval
+    if force_csv is not None:
+        kwargs["force_csv"] = force_csv
+        if args.force_csv_interval is not None:
+            kwargs["force_csv_interval"] = args.force_csv_interval
+    return kwargs
+
+
 def _build_pymol_statement(
-    level: str, pdb_path: str, kwargs: dict, *, minimize: bool, run: bool
+    level: str,
+    pdb_path: str,
+    kwargs: dict,
+    *,
+    minimize: bool,
+    run: bool,
+    record_kwargs: dict | None = None,
 ) -> str:
     """Assemble the ``-d`` payload PyMOL will eval at startup."""
     kw_parts = [f"{k}={v!r}" for k, v in kwargs.items()]
@@ -213,6 +271,10 @@ def _build_pymol_statement(
         "from pymol_imd import *",
         f"setup_{level}({call_args})",
     ]
+    # Arm recording right after setup so it is in place before imd_run.
+    if record_kwargs:
+        rec_parts = ", ".join(f"{k}={v!r}" for k, v in record_kwargs.items())
+        stmts.append(f"imd_record({rec_parts})")
     if minimize:
         stmts.append("imd_minimize()")
     if run:
@@ -262,12 +324,20 @@ def main(argv: list[str] | None = None) -> int:
         return 127
 
     kwargs = _collect_setup_kwargs(args)
+    record_kwargs = _collect_record_kwargs(args)
+    if record_kwargs and not args.run:
+        print(
+            "pymol_imd: --traj-out / --force-csv given without --run; no "
+            "recording will happen (recording starts on imd_run).",
+            file=sys.stderr,
+        )
     statement = _build_pymol_statement(
         args.level,
         str(pdb_path),
         kwargs,
         minimize=args.minimize,
         run=args.run,
+        record_kwargs=record_kwargs,
     )
 
     cmd = [pymol_bin, "-d", statement]
