@@ -177,6 +177,23 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     mlmm.add_argument(
+        "--ml-compile",
+        action="store_true",
+        help=(
+            "Opt-in torch.compile for the MLIP (AIMNet2). Numerically "
+            "~identical, biggest speedup on CUDA, smaller on CPU. Default off."
+        ),
+    )
+    mlmm.add_argument(
+        "--enable-cueq",
+        action="store_true",
+        help=(
+            "Opt-in cuEquivariance acceleration for MACE (CUDA only; needs "
+            "`pixi run install-cueq`). Safe no-op elsewhere. Don't combine "
+            "with --ml-compile."
+        ),
+    )
+    mlmm.add_argument(
         "--link-atom-method",
         choices=LINK_ATOM_METHODS,
         metavar="MODE",
@@ -253,6 +270,10 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
             val = getattr(args, src)
             if val is not None:
                 kwargs[dst] = val
+        if args.ml_compile:
+            kwargs["ml_compile"] = True
+        if args.enable_cueq:
+            kwargs["enable_cueq"] = True
     return kwargs
 
 

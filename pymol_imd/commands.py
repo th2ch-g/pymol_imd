@@ -279,6 +279,8 @@ def imd_setup_mlmm(
     link_atom_method: str = "scaled",
     max_force_kj: object | None = None,
     timestep_ps: object = 0.0005,
+    ml_compile: object = False,
+    enable_cueq: object = False,
     work_dir: str | None = None,
 ) -> None:
     """Set up an ONIOM-style ML/MM IMD simulation.
@@ -312,6 +314,15 @@ def imd_setup_mlmm(
         C, 1.01 Å for N, …) using the IMOMM projector Jacobian; ``"none"``
         disables link-atom handling (only safe for molecularly closed
         selections).
+    ml_compile :
+        Opt-in ``torch.compile`` for the MLIP (AIMNet2 today). Numerically
+        ~identical but not bitwise, so the default is False. Biggest speedup
+        on CUDA; smaller on CPU.
+    enable_cueq :
+        Opt-in cuEquivariance acceleration for MACE (CUDA only; needs the
+        cuequivariance packages via ``pixi run install-cueq``). Safe to leave
+        off elsewhere — MACE logs it as disabled. Do not combine with
+        ``ml_compile``.
     """
     global _imd_system, _timer, _timer_minimize
     if ml_selection is None:
@@ -336,6 +347,8 @@ def imd_setup_mlmm(
         ml_device=ml_device,
         ml_charge=_as_int(ml_charge),
         ml_mult=_as_int(ml_mult),
+        ml_compile=_as_bool(ml_compile),
+        enable_cueq=_as_bool(enable_cueq),
         link_atom_method=link_atom_method,
         work_dir=Path(work_dir) if work_dir else None,
     )

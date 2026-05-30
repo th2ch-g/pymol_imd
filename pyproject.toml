@@ -78,14 +78,39 @@ mace-torch = "*"
 aimnet = "*"
 ruff = "*"
 
+# ---------------------------------------------------------------------------
+# CUDA feature (Linux + NVIDIA only)
+# ---------------------------------------------------------------------------
+# Adds a separate `gpu` environment whose torch resolves to a CUDA build via
+# the cuda system-requirement + pytorch-gpu metapackage. The `default`
+# environment stays CPU-only and unchanged (separate solve-group), so
+# macOS / CPU users are unaffected. CUDA inference is the single biggest ML/MM
+# speedup (10-100x vs CPU). Build + run on linux-64 only:
+#     pixi install -e gpu
+#     pixi run -e gpu pymol_imd input.pdb --level mlmm --ml-selection "resi 30-50" --run
+[tool.pixi.feature.cuda]
+platforms = ["linux-64"]
+system-requirements = { cuda = "12" }
+
+[tool.pixi.feature.cuda.dependencies]
+pytorch-gpu = "*"
+cuda-version = "12.*"
+
+[tool.pixi.environments]
+gpu = ["cuda"]
+
 [tool.pixi.tasks]
 ruff-format = "ruff format --force-exclude"
 ruff-lint = "ruff check --fix --exit-non-zero-on-fix --force-exclude"
 r = { cmd = "echo OK", depends-on = ["ruff-format", "ruff-lint"] }
 smoke = "python -m pymol_imd.tests.smoke"
+smoke-mlmm = "python -m pymol_imd.tests.smoke_mlmm"
 record-smoke = "python -m pymol_imd.tests.smoke_record"
 install-uma = "pip install --no-build-isolation 'fairchem-core>=2.20.0'"
 install-orb = "pip install --no-build-isolation orb-models"
+# cuEquivariance acceleration for MACE. CUDA 12 + linux-64 only — run inside
+# the gpu environment: `pixi run -e gpu install-cueq`. No-op on CPU/MPS.
+install-cueq = "pip install --no-build-isolation cuequivariance cuequivariance-torch cuequivariance-ops-torch-cu12"
 
 # ---------------------------------------------------------------------------
 # Ruff

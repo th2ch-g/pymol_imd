@@ -130,6 +130,18 @@ class IMDSystem:
         self._last_pull_active_idx: np.ndarray = np.empty(0, dtype=int)
         self._last_pull_forces: np.ndarray = np.empty((0, 3), dtype=float)
 
+        # Tier-1 lossless ML/MM caches: per-frame-invariant index arrays / maps
+        # plus a reusable ASE Atoms object so the hot path stops rebuilding them
+        # every frame. All no-ops for non-MLMM backends.
+        self._mlip_atoms = None
+        self._ml_indices_list: list[int] = []
+        self._n_ml = 0
+        self._mlip_symbols: list[str] = []
+        self._ml_local: dict[int, int] = {}
+        self._bdy_local: dict[int, int] = {}
+        self._init_mlmm_cache()
+        self._warmup_mlmm()
+
     # ------------------------------------------------------------------ setup
     _PULL_FORCE_EXPR = "- fx*x - fy*y - fz*z"
     _MLMM_FORCE_EXPR = "- gx*x - gy*y - gz*z"
@@ -221,6 +233,64 @@ class IMDSystem:
         self._frame_index += 1
         self._sync_positions_to_pymol()
 
+    def _init_mlmm_cache(self) -> None:
+        """Precompute per-frame-invariant ML/MM data once (Tier-1 lossless).
+
+        The ML symbols, the atom-index list used to slice positions, and the
+        QM/MM local-index maps never change after setup, so building them every
+        frame in ``_apply_mlmm_correction_force`` was pure Python overhead. The
+        ASE ``Atoms`` object is also built once here and only has its positions
+        overwritten each frame: ASE invalidates its result cache on any
+        position change (``tol=1e-15``), so reuse is numerically identical to
+        rebuilding a fresh ``Atoms`` every frame.
+
+        No-op for non-MLMM bundles (``_mlip_atoms`` stays ``None``).
+        """
+        extra = self.bundle.extra
+        if extra is None or "ml_indices" not in extra:
+            return
+        from ase import Atoms
+
+        ml_indices = extra["ml_indices"]
+        ml_symbols = extra["ml_symbols"]
+        link_atoms = extra.get("link_atoms", ())
+        boundary_mm = extra.get("_mlmm_boundary_mm_indices", ())
+
+        self._ml_indices_list = list(ml_indices)
+        self._n_ml = len(ml_indices)
+        # ML region symbols first, one "H" per link atom appended after — the
+        # exact order _apply_mlmm_correction_force fills positions in.
+        self._mlip_symbols = list(ml_symbols) + ["H"] * len(link_atoms)
+        self._ml_local = {int(idx): i for i, idx in enumerate(ml_indices)}
+        self._bdy_local = {int(idx): i for i, idx in enumerate(boundary_mm)}
+
+        atoms = Atoms(symbols=self._mlip_symbols)
+        atoms.calc = extra["ml_calculator"]
+        # AIMNet2 reads charge / multiplicity from atoms.info; harmless for the
+        # other backends. Set once — the payload never changes after setup.
+        atoms.info.update(extra.get("ml_calc_info", {}))
+        self._mlip_atoms = atoms
+
+    def _warmup_mlmm(self) -> None:
+        """Run one MLIP inference at setup so the first interactive frame is fast.
+
+        The first MLIP call pays for model download, TorchScript/torch.compile
+        tracing, and (AIMNet2) Warp kernel codegen — seconds of work that would
+        otherwise freeze the viewer on the first dragged frame. Doing it here at
+        setup moves that cost to where the user expects setup work, and primes
+        the ML/MM correction force with the t0 delta. Numerically lossless: the
+        throwaway forces are recomputed every frame anyway.
+
+        No-op for non-MLMM backends. Failures are non-fatal (logged) — the real
+        per-frame path surfaces any genuine error with full context.
+        """
+        if self._mlip_atoms is None:
+            return
+        try:
+            self._apply_mlmm_correction_force()
+        except Exception as exc:
+            logger.warning("MLMM warmup inference failed (non-fatal): %s", exc)
+
     def _apply_mlmm_correction_force(self) -> None:
         """Compute ``F_ML - F_MM_subset`` on the ML region and push to OpenMM.
 
@@ -237,53 +307,43 @@ class IMDSystem:
 
         Every supported MLIP backend (UMA / ORB / MACE / AIMNet2) is wrapped
         as an ASE ``Calculator``, so a single ``atoms.get_forces()`` call
-        works for all of them.
+        works for all of them. The ASE ``Atoms`` object and the index maps are
+        built once in :meth:`_init_mlmm_cache` and reused here.
         """
-        from ase import Atoms
-
         extra = self.bundle.extra
         if extra is None:
             return
         ml_indices = extra["ml_indices"]
-        ml_symbols = extra["ml_symbols"]
         link_atoms: tuple[tuple[int, int, float], ...] = extra.get("link_atoms", ())
         boundary_mm: tuple[int, ...] = extra.get("_mlmm_boundary_mm_indices", ())
         method: str = extra.get("link_atom_method", "scaled")
         sub_context: openmm.Context = extra["ml_subset_context"]
-        ml_calc = extra["ml_calculator"]
-        ml_info = extra.get("ml_calc_info", {})
 
         full_positions = self._read_openmm_positions_nm()
-        ml_positions_nm = full_positions[list(ml_indices)]
+        ml_positions_nm = full_positions[self._ml_indices_list]
         ml_positions_ang = ml_positions_nm * 10.0
 
-        # 1) Build the ASE Atoms for MLIP inference. ML region first, link
-        #    atoms appended after (order matters for force partitioning).
+        # 1) MLIP inference on the reused ASE Atoms. ML region first, link
+        #    atoms appended after (order matches self._mlip_symbols).
         if link_atoms:
             link_positions_ang = self._link_atom_positions_ang(full_positions, link_atoms, method)
             mlip_positions_ang = np.vstack([ml_positions_ang, link_positions_ang])
-            mlip_symbols = list(ml_symbols) + ["H"] * len(link_atoms)
         else:
             mlip_positions_ang = ml_positions_ang
-            mlip_symbols = list(ml_symbols)
-
-        atoms = Atoms(symbols=mlip_symbols, positions=mlip_positions_ang)
-        atoms.calc = ml_calc
-        # AIMNet2 reads charge / multiplicity from atoms.info; harmless for
-        # the other backends.
-        atoms.info.update(ml_info)
+        atoms = self._mlip_atoms
+        atoms.set_positions(mlip_positions_ang)
         F_all_eV_per_A = np.asarray(atoms.get_forces(), dtype=np.float64)
 
         # 2) Partition MLIP forces. ML region atoms keep their forces; link
         #    atom forces are redistributed via the placement Jacobian to the
         #    QM-side (in ml_indices) and MM-side (in boundary_mm) atoms.
-        n_ml = len(ml_indices)
+        n_ml = self._n_ml
         F_ml_eV_per_A = F_all_eV_per_A[:n_ml].copy()
         F_mm_boundary_eV_per_A = np.zeros((len(boundary_mm), 3), dtype=np.float64)
 
         if link_atoms:
-            ml_local = {int(idx): i for i, idx in enumerate(ml_indices)}
-            bdy_local = {int(idx): i for i, idx in enumerate(boundary_mm)}
+            ml_local = self._ml_local
+            bdy_local = self._bdy_local
             F_link_all = F_all_eV_per_A[n_ml:]
             for k, (q_idx, m_idx, param) in enumerate(link_atoms):
                 F_link = F_link_all[k]

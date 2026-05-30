@@ -156,30 +156,113 @@ def _auto_torch_device(prefer: str = "auto", cuda_idx: int = 0):
     return "cpu", torch.device("cpu")
 
 
+def _configure_torch_threads(device_str: str, n_ml: int) -> None:
+    """Optionally pin torch's CPU thread count for MLIP inference.
+
+    Only acts on CPU. Controlled by the ``PYMOL_IMD_TORCH_THREADS`` env var:
+    when set to a positive integer, ``torch.set_num_threads`` is called with
+    it. We deliberately do NOT change the thread count automatically because
+    the optimum is workload-dependent — small ML regions are often fastest
+    with 1-2 threads (parallel-reduction overhead dominates the tiny forward
+    pass), while large regions benefit from more — so silently forcing a value
+    could slow some cases. The effective count is logged either way so users
+    can tune it.
+
+    Numerically lossless: at fixed coordinates the MLIP forces are
+    bitwise-identical regardless of thread count (verified for AIMNet2).
+    """
+    if device_str != "cpu":
+        return
+    import os
+
+    import torch
+
+    requested = os.environ.get("PYMOL_IMD_TORCH_THREADS")
+    if requested:
+        try:
+            n = int(requested)
+        except ValueError:
+            logger.warning("PYMOL_IMD_TORCH_THREADS=%r is not an integer; ignoring", requested)
+        else:
+            if n >= 1:
+                torch.set_num_threads(n)
+            else:
+                logger.warning("PYMOL_IMD_TORCH_THREADS=%d must be >= 1; ignoring", n)
+    logger.info(
+        "MLMM: torch using %d CPU thread(s) for %d ML atoms (override with "
+        "PYMOL_IMD_TORCH_THREADS)",
+        torch.get_num_threads(),
+        n_ml,
+    )
+
+
+def _log_torch_build(device_str: str) -> None:
+    """Log the selected device + torch build so GPU use is verifiable.
+
+    Surfaces ``torch.version.cuda`` (``None`` for CPU/MPS builds). If the user
+    asked for CUDA but the active torch is a CPU build (the default env), warn
+    with the concrete fix — otherwise the heavy ML inference silently runs on
+    CPU and the slowdown looks mysterious.
+    """
+    import torch
+
+    cuda_build = torch.version.cuda
+    logger.info(
+        "MLMM: ML backend on %s (torch %s, cuda build=%s)",
+        device_str,
+        torch.__version__,
+        cuda_build,
+    )
+    if device_str == "cuda" and cuda_build is None:
+        msg = (
+            "ml_device=cuda requested but this torch is a CPU/MPS build "
+            "(torch.version.cuda is None) — inference will fail or fall back. "
+            "Use the GPU environment on linux-64: `pixi install -e gpu` then "
+            "`pixi run -e gpu pymol_imd ... --level mlmm`."
+        )
+        logger.warning(msg)
+        print(f"[pymol_imd] WARNING: {msg}")
+
+
 # ----------------------------------------------------------------------------
 # Per-backend ASE Calculator construction
 # ----------------------------------------------------------------------------
-def _mps_to_cpu_fallback(device_str: str, backend_label: str) -> str:
-    """Return ``"cpu"`` instead of ``"mps"`` for backends that can't load.
+# Per-backend reason why MPS (Apple Silicon GPU) isn't used. Each default
+# MLIP hits a different wall, so the CPU-fallback notice names the real cause
+# instead of a one-size-fits-all "float64" message.
+_MPS_CPU_REASON: dict[str, str] = {
+    "AIMNet2": (
+        "AIMNet2's GPU path uses Warp CUDA kernels with no Metal backend, so "
+        "MPS gives no speedup (and its weights can't load on MPS anyway)"
+    ),
+    "MACE": (
+        "MACE foundation weights are float64 and MPS cannot allocate float64 "
+        "storage; an MPS-float32 path is feasible but lowers precision (opt-in, "
+        "not yet enabled)"
+    ),
+    "ORB": ("ORB's graph construction is CUDA-oriented and MPS is unsupported upstream"),
+}
 
-    MACE / AIMNet2 / many ORB checkpoints store weights as float64, but
-    MPS (Apple Silicon GPU) cannot allocate float64 storage at all, so
-    ``torch.load(map_location='mps')`` blows up at the rebuild_tensor step.
-    Silent fallback to CPU is the only working option until upstream casts
-    weights to float32 at load time.
+
+def _mps_to_cpu_fallback(device_str: str, backend_label: str) -> str:
+    """Fall back to CPU for backends that can't (usefully) run on MPS.
+
+    None of the default-bundled MLIPs benefit from MPS today — see
+    ``_MPS_CPU_REASON`` for the backend-specific cause — so we transparently
+    run on CPU and log the real reason. A MACE-only MPS-float32 path is
+    feasible (load float32 on CPU, then ``.to('mps')``) but lowers precision
+    vs MACE's native float64, so it is left as an opt-in future improvement.
     """
     if device_str != "mps":
         return device_str
-    msg = (
-        f"{backend_label} weights are float64 but MPS cannot allocate "
-        "float64 storage; running on CPU instead."
-    )
+    reason = _MPS_CPU_REASON.get(backend_label, f"{backend_label} cannot run on MPS")
+    msg = f"{backend_label} on MPS → CPU: {reason}."
     logger.warning(msg)
     print(f"[pymol_imd] {msg}")
     return "cpu"
 
 
-def _build_mace_calculator(model: str, device_str: str, dtype: str):
+def _build_mace_calculator(model: str, device_str: str, dtype: str, *, enable_cueq: bool = False):
     """Resolve a MACE model name and return an ASE Calculator.
 
     mace-torch ships several factories: ``mace_off`` (MACE-OFF23
@@ -194,6 +277,15 @@ def _build_mace_calculator(model: str, device_str: str, dtype: str):
     CPU automatically here — CPU MACE is still fast enough for IMD on
     small ML regions and is the only working option until upstream
     handles the dtype cast at load time.
+
+    ``enable_cueq`` turns on cuEquivariance acceleration. The foundation
+    factories (mp/omol/off) forward ``**kwargs`` straight into
+    ``MACECalculator``, so we pass ``enable_cueq=True`` through that channel.
+    cuEq needs CUDA + the cuequivariance packages (`pixi run install-cueq` in
+    the gpu env); on CPU/MPS or when those packages are absent MACE logs that
+    cuEq is disabled and runs normally, so passing it is always safe. It is
+    mutually exclusive with torch.compile — a known cuEq bug silently breaks
+    MACE's backward pass when both are enabled.
     """
     from mace.calculators import mace_anicc, mace_mp, mace_off, mace_omol
 
@@ -201,10 +293,13 @@ def _build_mace_calculator(model: str, device_str: str, dtype: str):
         device_str = _mps_to_cpu_fallback(device_str, "MACE")
         dtype = "float64"  # reset dtype that was forced to float32 for MPS
 
+    # Forwarded to MACECalculator via the factory **kwargs passthrough. Only
+    # the foundation factories (mp/omol/off) forward kwargs; anicc is left as-is.
+    cueq_kw = {"enable_cueq": True} if enable_cueq else {}
     lower = model.lower()
     if lower.startswith("mp:") or lower.startswith("mace-mp"):
         name = model.split(":", 1)[-1] if ":" in model else model
-        return mace_mp(model=name, device=device_str, default_dtype=dtype)
+        return mace_mp(model=name, device=device_str, default_dtype=dtype, **cueq_kw)
     if lower.startswith("anicc") or lower.startswith("mace-anicc"):
         return mace_anicc(device=device_str, default_dtype=dtype)
     if lower.startswith("omol") or lower.startswith("mace-omol"):
@@ -215,12 +310,12 @@ def _build_mace_calculator(model: str, device_str: str, dtype: str):
         # as a local file path or direct URL.
         omol_aliases = {"mace-omol-0", "mace-omol", "omol", "extra_large"}
         omol_arg = None if lower in omol_aliases else model
-        return mace_omol(model=omol_arg, device=device_str, default_dtype=dtype)
+        return mace_omol(model=omol_arg, device=device_str, default_dtype=dtype, **cueq_kw)
     if lower.startswith("off:") or lower.startswith("mace-off"):
         name = model.split(":", 1)[-1] if ":" in model else model
-        return mace_off(model=name, device=device_str, default_dtype=dtype)
+        return mace_off(model=name, device=device_str, default_dtype=dtype, **cueq_kw)
     # Treat as a local model file or a literal mace_off argument.
-    return mace_off(model=model, device=device_str, default_dtype=dtype)
+    return mace_off(model=model, device=device_str, default_dtype=dtype, **cueq_kw)
 
 
 def _build_orb_calculator(model: str, device_str: str):
@@ -249,7 +344,9 @@ def _build_orb_calculator(model: str, device_str: str):
     return ORBCalculator(orb_model, adapter, device=device_str)
 
 
-def _build_aimnet2_calculator(model: str, device_str: str, charge: int, mult: int):
+def _build_aimnet2_calculator(
+    model: str, device_str: str, charge: int, mult: int, *, compile_model: bool = False
+):
     """Build an ASE-compatible AIMNet2 calculator.
 
     The plain ``AIMNet2Calculator`` in aimnet is a low-level torch wrapper
@@ -257,6 +354,11 @@ def _build_aimnet2_calculator(model: str, device_str: str, charge: int, mult: in
     ``get_forces``). The ASE-facing class is ``AIMNet2ASE``, which wraps a
     ``base_calc`` and takes ``charge`` / ``mult`` in its constructor
     instead of via ``atoms.info``.
+
+    ``compile_model`` forwards to ``AIMNet2Calculator``'s own ``compile_model``
+    flag (``torch.compile``). The big win is on CUDA (~5x via Warp kernels); on
+    CPU the gain is smaller. torch.compile is numerically ~identical but not
+    bitwise, so it stays opt-in (never the silent default).
     """
     try:
         from aimnet.calculators.aimnet2ase import AIMNet2ASE
@@ -266,7 +368,7 @@ def _build_aimnet2_calculator(model: str, device_str: str, charge: int, mult: in
             "aimnet is required for --ml-backend aimnet2. Install with `pixi run install-aimnet2`."
         ) from exc
     device_str = _mps_to_cpu_fallback(device_str, "AIMNet2")
-    base = AIMNet2Calculator(model=model, device=device_str)
+    base = AIMNet2Calculator(model=model, device=device_str, compile_model=compile_model)
     return AIMNet2ASE(base_calc=base, charge=int(charge), mult=int(mult))
 
 
@@ -289,6 +391,8 @@ def _build_mlip_calculator(
     device_str: str,
     ml_charge: int = 0,
     ml_mult: int = 1,
+    ml_compile: bool = False,
+    enable_cueq: bool = False,
     mace_model: str = "MACE-OMOL-0",
     mace_dtype: str = "float64",
     orb_model: str = "orb_v3_conservative_omol",
@@ -301,14 +405,20 @@ def _build_mlip_calculator(
     ``ml_charge`` / ``ml_mult`` are only consumed by backends whose ASE
     wrapper takes them in the constructor (AIMNet2). ORB still reads them
     from ``atoms.info`` each frame.
+
+    ``ml_compile`` requests ``torch.compile`` where the backend supports it
+    (AIMNet2 today). It is numerically ~identical but not bitwise, hence
+    opt-in; backends without a wired compile path ignore it.
     """
     backend = backend.lower()
     if backend == "mace":
-        return _build_mace_calculator(mace_model, device_str, mace_dtype)
+        return _build_mace_calculator(mace_model, device_str, mace_dtype, enable_cueq=enable_cueq)
     if backend == "orb":
         return _build_orb_calculator(orb_model, device_str)
     if backend == "aimnet2":
-        return _build_aimnet2_calculator(aimnet2_model, device_str, ml_charge, ml_mult)
+        return _build_aimnet2_calculator(
+            aimnet2_model, device_str, ml_charge, ml_mult, compile_model=ml_compile
+        )
     if backend == "uma":
         return _build_uma_calculator(uma_model, device_str, uma_task_name)
     raise ValueError(f"Unknown ml_backend {backend!r}. Choose from {SUPPORTED_ML_BACKENDS}.")
@@ -492,6 +602,8 @@ class MLMMBackend:
         ml_device: str = "auto",
         ml_charge: int = 0,
         ml_mult: int = 1,
+        ml_compile: bool = False,
+        enable_cueq: bool = False,
         mace_model: str = "MACE-OMOL-0",
         constraints: str | None = None,
         link_atom_method: str = "scaled",
@@ -555,15 +667,28 @@ class MLMMBackend:
         )
 
         device_str, _ = _auto_torch_device(ml_device)
-        logger.info("MLMM: ML backend running on %s", device_str)
+        _log_torch_build(device_str)
+        _configure_torch_threads(device_str, len(ml_indices))
         # MPS (Apple Silicon GPU) doesn't support float64; the MACE default
         # is float64 so we have to opt in to float32 when running on mps.
         mace_dtype = "float32" if device_str == "mps" else "float64"
+        if ml_compile and ml_backend != "aimnet2":
+            logger.warning(
+                "ml_compile is currently wired only for aimnet2; ignored for %s", ml_backend
+            )
+        if enable_cueq and ml_compile:
+            logger.warning(
+                "enable_cueq + ml_compile can silently break MACE's backward pass "
+                "(known cuEq bug). cuEq affects MACE, ml_compile affects AIMNet2, so "
+                "they don't collide today, but avoid enabling both."
+            )
         ml_calc = _build_mlip_calculator(
             ml_backend,
             device_str=device_str,
             ml_charge=int(ml_charge),
             ml_mult=int(ml_mult),
+            ml_compile=ml_compile,
+            enable_cueq=enable_cueq,
             mace_model=mace_model,
             mace_dtype=mace_dtype,
         )
