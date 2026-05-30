@@ -262,7 +262,9 @@ def _mps_to_cpu_fallback(device_str: str, backend_label: str) -> str:
     return "cpu"
 
 
-def _build_mace_calculator(model: str, device_str: str, dtype: str, *, enable_cueq: bool = False):
+def _build_mace_calculator(
+    model: str, device_str: str, dtype: str, *, enable_cueq: bool = False, ml_compile: bool = False
+):
     """Resolve a MACE model name and return an ASE Calculator.
 
     mace-torch ships several factories: ``mace_off`` (MACE-OFF23
@@ -286,6 +288,10 @@ def _build_mace_calculator(model: str, device_str: str, dtype: str, *, enable_cu
     cuEq is disabled and runs normally, so passing it is always safe. It is
     mutually exclusive with torch.compile — a known cuEq bug silently breaks
     MACE's backward pass when both are enabled.
+
+    ``ml_compile`` sets MACECalculator's ``compile_mode='default'`` (torch.compile)
+    through the same **kwargs channel. Since cuEq + compile is the broken combo,
+    enable_cueq wins when both are requested (compile is skipped with a warning).
     """
     from mace.calculators import mace_anicc, mace_mp, mace_off, mace_omol
 
@@ -295,11 +301,20 @@ def _build_mace_calculator(model: str, device_str: str, dtype: str, *, enable_cu
 
     # Forwarded to MACECalculator via the factory **kwargs passthrough. Only
     # the foundation factories (mp/omol/off) forward kwargs; anicc is left as-is.
-    cueq_kw = {"enable_cueq": True} if enable_cueq else {}
+    extra_kw: dict = {}
+    if enable_cueq:
+        extra_kw["enable_cueq"] = True
+        if ml_compile:
+            logger.warning(
+                "MACE: enable_cueq and ml_compile both set; using cuEq and skipping "
+                "compile (cuEq + torch.compile is a known broken combo)."
+            )
+    elif ml_compile:
+        extra_kw["compile_mode"] = "default"
     lower = model.lower()
     if lower.startswith("mp:") or lower.startswith("mace-mp"):
         name = model.split(":", 1)[-1] if ":" in model else model
-        return mace_mp(model=name, device=device_str, default_dtype=dtype, **cueq_kw)
+        return mace_mp(model=name, device=device_str, default_dtype=dtype, **extra_kw)
     if lower.startswith("anicc") or lower.startswith("mace-anicc"):
         return mace_anicc(device=device_str, default_dtype=dtype)
     if lower.startswith("omol") or lower.startswith("mace-omol"):
@@ -310,21 +325,25 @@ def _build_mace_calculator(model: str, device_str: str, dtype: str, *, enable_cu
         # as a local file path or direct URL.
         omol_aliases = {"mace-omol-0", "mace-omol", "omol", "extra_large"}
         omol_arg = None if lower in omol_aliases else model
-        return mace_omol(model=omol_arg, device=device_str, default_dtype=dtype, **cueq_kw)
+        return mace_omol(model=omol_arg, device=device_str, default_dtype=dtype, **extra_kw)
     if lower.startswith("off:") or lower.startswith("mace-off"):
         name = model.split(":", 1)[-1] if ":" in model else model
-        return mace_off(model=name, device=device_str, default_dtype=dtype, **cueq_kw)
+        return mace_off(model=name, device=device_str, default_dtype=dtype, **extra_kw)
     # Treat as a local model file or a literal mace_off argument.
-    return mace_off(model=model, device=device_str, default_dtype=dtype, **cueq_kw)
+    return mace_off(model=model, device=device_str, default_dtype=dtype, **extra_kw)
 
 
-def _build_orb_calculator(model: str, device_str: str):
+def _build_orb_calculator(model: str, device_str: str, *, ml_compile: bool = False):
     """Build an ORBCalculator for an orb-models pretrained model.
 
     orb-models 0.7.x: ``pretrained.<model>()`` returns a ``(model, adapter)``
     tuple and ``ORBCalculator`` lives under ``inference.calculator``. Older
     paths (``orb_models.forcefield.calculator``, single-return pretrained)
     are gone — this code targets 0.7.x onwards.
+
+    ``ml_compile`` wraps the underlying model in ``torch.compile`` (ORB has no
+    native compile flag). ORBCalculator keeps it as ``self.model`` and calls it
+    every frame, so replacing that attribute with the compiled module is enough.
     """
     try:
         from orb_models.forcefield import pretrained
@@ -341,7 +360,12 @@ def _build_orb_calculator(model: str, device_str: str):
         raise ValueError(f"Unknown ORB model {model!r}. Available: {available}")
     device_str = _mps_to_cpu_fallback(device_str, "ORB")
     orb_model, adapter = getattr(pretrained, model)(device=device_str)
-    return ORBCalculator(orb_model, adapter, device=device_str)
+    calc = ORBCalculator(orb_model, adapter, device=device_str)
+    if ml_compile:
+        import torch
+
+        calc.model = torch.compile(calc.model)
+    return calc
 
 
 def _build_aimnet2_calculator(
@@ -372,16 +396,30 @@ def _build_aimnet2_calculator(
     return AIMNet2ASE(base_calc=base, charge=int(charge), mult=int(mult))
 
 
-def _build_uma_calculator(model: str, device_str: str, task_name: str):
+def _build_uma_calculator(model: str, device_str: str, task_name: str, *, ml_compile: bool = False):
+    """Build a FAIRChem (UMA) ASE calculator.
+
+    fairchem-core 2.20.x moved ``get_predict_unit`` to
+    ``fairchem.core.calculate.pretrained_mlip`` (the old
+    ``fairchem.core.pretrained_mlip`` path no longer imports). The predict unit
+    holds the torch model at ``predictor.model`` whose core network is
+    ``predictor.model.module``; ``ml_compile`` wraps that core in
+    ``torch.compile`` (UMA has no native compile flag).
+    """
     try:
         from fairchem.core import FAIRChemCalculator
-        from fairchem.core.pretrained_mlip import get_predict_unit
+        from fairchem.core.calculate.pretrained_mlip import get_predict_unit
     except ImportError as exc:
         raise RuntimeError(
             "fairchem-core>=2.20.0 is required for --ml-backend uma. "
-            "It should be pulled in automatically by `pixi run install-mlmm`."
+            "Install with `pixi run install-uma` and `huggingface-cli login` "
+            "(facebook/UMA is a gated HF repo)."
         ) from exc
     predictor = get_predict_unit(model, device=device_str)
+    if ml_compile:
+        import torch
+
+        predictor.model.module = torch.compile(predictor.model.module)
     return FAIRChemCalculator(predictor, task_name=task_name)
 
 
@@ -412,15 +450,17 @@ def _build_mlip_calculator(
     """
     backend = backend.lower()
     if backend == "mace":
-        return _build_mace_calculator(mace_model, device_str, mace_dtype, enable_cueq=enable_cueq)
+        return _build_mace_calculator(
+            mace_model, device_str, mace_dtype, enable_cueq=enable_cueq, ml_compile=ml_compile
+        )
     if backend == "orb":
-        return _build_orb_calculator(orb_model, device_str)
+        return _build_orb_calculator(orb_model, device_str, ml_compile=ml_compile)
     if backend == "aimnet2":
         return _build_aimnet2_calculator(
             aimnet2_model, device_str, ml_charge, ml_mult, compile_model=ml_compile
         )
     if backend == "uma":
-        return _build_uma_calculator(uma_model, device_str, uma_task_name)
+        return _build_uma_calculator(uma_model, device_str, uma_task_name, ml_compile=ml_compile)
     raise ValueError(f"Unknown ml_backend {backend!r}. Choose from {SUPPORTED_ML_BACKENDS}.")
 
 
@@ -672,16 +712,6 @@ class MLMMBackend:
         # MPS (Apple Silicon GPU) doesn't support float64; the MACE default
         # is float64 so we have to opt in to float32 when running on mps.
         mace_dtype = "float32" if device_str == "mps" else "float64"
-        if ml_compile and ml_backend != "aimnet2":
-            logger.warning(
-                "ml_compile is currently wired only for aimnet2; ignored for %s", ml_backend
-            )
-        if enable_cueq and ml_compile:
-            logger.warning(
-                "enable_cueq + ml_compile can silently break MACE's backward pass "
-                "(known cuEq bug). cuEq affects MACE, ml_compile affects AIMNet2, so "
-                "they don't collide today, but avoid enabling both."
-            )
         ml_calc = _build_mlip_calculator(
             ml_backend,
             device_str=device_str,
