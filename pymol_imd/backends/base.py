@@ -79,7 +79,13 @@ class Backend(Protocol):
         pdb_path: Path,
         *,
         pbc: bool = False,
+        work_dir: Path | None = None,
         **kwargs: object,
     ) -> SystemBundle:
-        """Construct the OpenMM ``System`` for the given inputs."""
+        """Construct the OpenMM ``System`` for the given inputs.
+
+        ``work_dir`` selects where intermediate / topology files (the prepared
+        PDB; for CG also ``cg.pdb`` / ``cg.top`` / ``*.itp``) are written. When
+        ``None`` each backend falls back to a fresh ``tempfile.mkdtemp()``.
+        """
         ...

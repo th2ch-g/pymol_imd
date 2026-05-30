@@ -158,7 +158,7 @@ def _highlight_ml_region(obj_name: str, ml_indices: tuple[int, ...]) -> str:
 
 
 # --------------------------------------------------------------- setup_* family
-def setup_aa(
+def imd_setup_aa(
     pdb_file: str,
     ligand_sdf: str | None = None,
     pbc: object = False,
@@ -167,6 +167,7 @@ def setup_aa(
     const_k: object = None,
     mouse_force: object = True,
     max_force_kj: object | None = None,
+    work_dir: str | None = None,
 ) -> None:
     """Set up an all-atom IMD simulation in vacuo (NVT) by default.
 
@@ -183,6 +184,7 @@ def setup_aa(
         pdb_path,
         ligand_sdf=ligand_path,
         pbc=_as_bool(pbc),
+        work_dir=Path(work_dir) if work_dir else None,
     )
     obj_name = _load_prepared_into_pymol(
         bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
@@ -202,10 +204,10 @@ def setup_aa(
     _imd_system = _make_imd(bundle, obj_name, **imd_kwargs)
     _timer = _make_qtimer()
     _timer_minimize = _make_qtimer()
-    print(f"setup_aa: ready (object={obj_name}, atoms={_imd_system.n_atoms}, pbc={bundle.pbc})")
+    print(f"imd_setup_aa: ready (object={obj_name}, atoms={_imd_system.n_atoms}, pbc={bundle.pbc})")
 
 
-def setup_cg(
+def imd_setup_cg(
     pdb_file: str,
     pbc: object = False,
     ff: str | None = None,
@@ -216,6 +218,7 @@ def setup_cg(
     mouse_force: object = True,
     timestep_ps: object = 0.020,
     max_force_kj: object | None = None,
+    work_dir: str | None = None,
 ) -> None:
     """Set up a Martini CG IMD simulation via vermouth + martini_openmm.
 
@@ -236,6 +239,8 @@ def setup_cg(
     }
     if ff is not None:
         cg_kwargs["ff"] = ff
+    if work_dir:
+        cg_kwargs["work_dir"] = Path(work_dir)
     backend = CGBackend()
     bundle = backend.build_system(pdb_path, **cg_kwargs)
     obj_name = _load_prepared_into_pymol(
@@ -254,12 +259,12 @@ def setup_cg(
     _timer = _make_qtimer()
     _timer_minimize = _make_qtimer()
     print(
-        f"setup_cg: ready (object={obj_name}, atoms={_imd_system.n_atoms}, "
+        f"imd_setup_cg: ready (object={obj_name}, atoms={_imd_system.n_atoms}, "
         f"dt={_as_float(timestep_ps) * 1000:.1f}fs, pbc={bundle.pbc})"
     )
 
 
-def setup_mlmm(
+def imd_setup_mlmm(
     pdb_file: str,
     ml_selection: str | None = None,
     ml_backend: str = "aimnet2",
@@ -274,6 +279,7 @@ def setup_mlmm(
     link_atom_method: str = "scaled",
     max_force_kj: object | None = None,
     timestep_ps: object = 0.0005,
+    work_dir: str | None = None,
 ) -> None:
     """Set up an ONIOM-style ML/MM IMD simulation.
 
@@ -310,14 +316,14 @@ def setup_mlmm(
     global _imd_system, _timer, _timer_minimize
     if ml_selection is None:
         raise ValueError(
-            "setup_mlmm requires ml_selection. Selection language is PyMOL's "
+            "imd_setup_mlmm requires ml_selection. Selection language is PyMOL's "
             "(full syntax: and / or / not / within / byres / resi / resn / "
             "chain / name). Examples:\n"
-            "  setup_mlmm input.pdb ml_selection='resi 30-50'\n"
-            "  setup_mlmm input.pdb ml_selection='resi 1 and resn MET'\n"
-            "  setup_mlmm input.pdb ml_selection='chain A and not resn HOH'\n"
-            "  setup_mlmm input.pdb ml_selection='byres (resn LIG) within 5 of chain A'\n"
-            "  setup_mlmm input.pdb ml_selection='all'  # whole system (slow)"
+            "  imd_setup_mlmm input.pdb ml_selection='resi 30-50'\n"
+            "  imd_setup_mlmm input.pdb ml_selection='resi 1 and resn MET'\n"
+            "  imd_setup_mlmm input.pdb ml_selection='chain A and not resn HOH'\n"
+            "  imd_setup_mlmm input.pdb ml_selection='byres (resn LIG) within 5 of chain A'\n"
+            "  imd_setup_mlmm input.pdb ml_selection='all'  # whole system (slow)"
         )
     pdb_path = Path(pdb_file)
 
@@ -331,6 +337,7 @@ def setup_mlmm(
         ml_charge=_as_int(ml_charge),
         ml_mult=_as_int(ml_mult),
         link_atom_method=link_atom_method,
+        work_dir=Path(work_dir) if work_dir else None,
     )
     obj_name = _load_prepared_into_pymol(
         bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
@@ -354,7 +361,7 @@ def setup_mlmm(
     sel_msg = f", ml_sel={ml_sel_name}" if ml_sel_name else ""
     link_msg = f", link_atoms={n_link}({link_atom_method})" if n_link else ""
     print(
-        f"setup_mlmm: ready (object={obj_name}, atoms={_imd_system.n_atoms}, "
+        f"imd_setup_mlmm: ready (object={obj_name}, atoms={_imd_system.n_atoms}, "
         f"ml_atoms={n_ml}, ml_backend={ml_backend}, "
         f"dt={_as_float(timestep_ps) * 1000:.2f}fs, "
         f"pbc={bundle.pbc}{link_msg}{sel_msg})"
@@ -399,7 +406,7 @@ def imd_record(
         imd_record off                       # disable recording
     """
     if _imd_system is None:
-        print("imd: no system loaded — call setup_aa / setup_cg / setup_mlmm first")
+        print("imd: no system loaded — call imd_setup_aa / imd_setup_cg / imd_setup_mlmm first")
         return
     # "off" (or no paths at all) clears recording.
     if traj == "off" or (traj is None and force_csv is None):
@@ -441,7 +448,7 @@ def imd_minimize(
         ``200 * 50 = 10000`` minimization iterations before forced stop.
     """
     if _imd_system is None:
-        print("imd: no system loaded — call setup_aa / setup_cg / setup_mlmm first")
+        print("imd: no system loaded — call imd_setup_aa / imd_setup_cg / imd_setup_mlmm first")
         return
     if _imd_system.running:
         print("imd: already running — call imd_stop first")
@@ -485,7 +492,7 @@ def imd_run() -> None:
     error). With no armed config this behaves exactly as before.
     """
     if _imd_system is None:
-        print("imd: no system loaded — call setup_aa / setup_cg / setup_mlmm first")
+        print("imd: no system loaded — call imd_setup_aa / imd_setup_cg / imd_setup_mlmm first")
         return
     if _imd_system.running:
         print("imd: already running")
@@ -597,9 +604,9 @@ def _register() -> None:
     except ImportError:
         logger.debug("pymol not importable; skipping cmd.extend registration")
         return
-    cmd.extend("setup_aa", setup_aa)
-    cmd.extend("setup_cg", setup_cg)
-    cmd.extend("setup_mlmm", setup_mlmm)
+    cmd.extend("imd_setup_aa", imd_setup_aa)
+    cmd.extend("imd_setup_cg", imd_setup_cg)
+    cmd.extend("imd_setup_mlmm", imd_setup_mlmm)
     cmd.extend("imd_record", imd_record)
     cmd.extend("imd_minimize", imd_minimize)
     cmd.extend("imd_run", imd_run)

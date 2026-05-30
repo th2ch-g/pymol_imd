@@ -104,7 +104,7 @@ def main(pdb_id: str = "1aki", n_steps: int = 10) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         pdb_path = fetch_pdb(pdb_id, out_dir=tmp_path)
-        # AA runs with LangevinMiddleIntegrator (matches setup_aa default) and
+        # AA runs with LangevinMiddleIntegrator (matches imd_setup_aa default) and
         # also exercises the |F| cap path under a synthetic large delta.
         _run_backend(
             AABackend(),

@@ -30,7 +30,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="pymol_imd",
         description=(
             "Launch PyMOL with a pymol_imd backend already configured. "
-            "Equivalent to typing `from pymol_imd import *; setup_<level>(<pdb>, ...)` "
+            "Equivalent to typing `from pymol_imd import *; imd_setup_<level>(<pdb>, ...)` "
             "inside PyMOL."
         ),
     )
@@ -79,7 +79,9 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help=(
             "Record a trajectory during imd_run. Format by extension: "
-            ".xtc / .dcd / .pdb. Requires --run."
+            ".xtc / .dcd / .pdb. Default: ./<pdb-stem>.xtc in the launch cwd "
+            "(recording is on by default; disable with --no-record). "
+            "Recording starts on --run."
         ),
     )
     common.add_argument(
@@ -94,7 +96,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Record user pull forces to CSV during imd_run (columns: "
             "frame,step,time_ps,atom_index,fx,fy,fz,fmag). atom_index is "
-            "0-based (add 1 for a PyMOL selection). Requires --run."
+            "0-based (add 1 for a PyMOL selection). Default: "
+            "./<pdb-stem>_forces.csv in the launch cwd (on by default; "
+            "disable with --no-record). Recording starts on --run."
         ),
     )
     common.add_argument(
@@ -102,6 +106,24 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         metavar="N",
         help="Write forces every N GUI frames (default 1).",
+    )
+    common.add_argument(
+        "--no-record",
+        action="store_true",
+        help=(
+            "Disable default recording. Without this a trajectory + force CSV "
+            "are written by default. Conflicts with an explicit "
+            "--traj-out / --force-csv."
+        ),
+    )
+    common.add_argument(
+        "--topology-dir",
+        metavar="DIR",
+        help=(
+            "Directory for the IMD intermediate / topology files (AA/MLMM: "
+            "<stem>_prepared.pdb; CG also cg.pdb / cg.top / *.itp). "
+            "Default: ./<pdb-stem>_topology in the launch cwd."
+        ),
     )
 
     # ---- AA-specific
@@ -138,7 +160,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             f"MLIP backend. One of: {', '.join(ML_BACKENDS)}. "
-            "If omitted, setup_mlmm picks 'aimnet2' — smallest model "
+            "If omitted, imd_setup_mlmm picks 'aimnet2' — smallest model "
             "(~10 MB), fastest CPU inference, no login required."
         ),
     )
@@ -208,6 +230,8 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
         kwargs["max_force_kj"] = args.max_force_kj
     if args.no_mouse_force:
         kwargs["mouse_force"] = False
+    if args.topology_dir is not None:
+        kwargs["work_dir"] = _resolve_path(args.topology_dir)
 
     if args.level == "aa":
         if args.ligand_sdf:
@@ -235,9 +259,9 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
 def _collect_record_kwargs(args: argparse.Namespace) -> dict:
     """Pull recording flags into an ``imd_record(...)``-compatible dict.
 
-    Returns an empty dict when neither output path is set: an interval alone
-    is meaningless and would otherwise produce ``imd_record(traj_interval=N)``,
-    which (no paths) reads as "disable recording".
+    ``main`` fills ``traj_out`` / ``force_csv`` with cwd defaults before this
+    runs, so both are normally set. Returns an empty dict only when both are
+    None (the ``--no-record`` path), which reads as "disable recording".
     """
     traj_out = _resolve_path(args.traj_out)
     force_csv = _resolve_path(args.force_csv)
@@ -269,7 +293,7 @@ def _build_pymol_statement(
     call_args = ", ".join([repr(pdb_path), *kw_parts])
     stmts = [
         "from pymol_imd import *",
-        f"setup_{level}({call_args})",
+        f"imd_setup_{level}({call_args})",
     ]
     # Arm recording right after setup so it is in place before imd_run.
     if record_kwargs:
@@ -323,12 +347,33 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 127
 
+    # Resolve recording / topology defaults now that the PDB stem is known
+    # (argparse defaults can't see it). All paths anchor at the launch cwd.
+    stem = pdb_path.stem
+    traj_explicit = args.traj_out is not None
+    force_explicit = args.force_csv is not None
+    if args.no_record:
+        if traj_explicit or force_explicit:
+            print(
+                "pymol_imd: --no-record conflicts with an explicit "
+                "--traj-out / --force-csv. Drop one.",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        if args.traj_out is None:
+            args.traj_out = str(Path.cwd() / f"{stem}.xtc")
+        if args.force_csv is None:
+            args.force_csv = str(Path.cwd() / f"{stem}_forces.csv")
+    if args.topology_dir is None:
+        args.topology_dir = str(Path.cwd() / f"{stem}_topology")
+
     kwargs = _collect_setup_kwargs(args)
     record_kwargs = _collect_record_kwargs(args)
-    if record_kwargs and not args.run:
+    if (traj_explicit or force_explicit) and not args.run:
         print(
-            "pymol_imd: --traj-out / --force-csv given without --run; no "
-            "recording will happen (recording starts on imd_run).",
+            "pymol_imd: --traj-out / --force-csv given without --run; "
+            "recording is armed but only starts on imd_run.",
             file=sys.stderr,
         )
     statement = _build_pymol_statement(

@@ -114,7 +114,7 @@ pixi run pymol_imd 1ubq.pdb --level aa --print-only
 
 ```
 PyMOL> from pymol_imd import *
-PyMOL> setup_aa /path/to/input.pdb
+PyMOL> imd_setup_aa /path/to/input.pdb
 PyMOL> imd_minimize             # converges on stable structure
 PyMOL> imd_record traj=traj.xtc, force_csv=forces.csv  # arm recording (optional)
 PyMOL> imd_run                  # production loop (recording starts here)
@@ -125,8 +125,8 @@ PyMOL> imd_stop                 # recording flushed + closed here
 CG / ML-MM analogues:
 
 ```
-PyMOL> setup_cg input.pdb timestep_ps=0.020
-PyMOL> setup_mlmm input.pdb ml_selection='resi 30-50' ml_charge=0 ml_mult=1
+PyMOL> imd_setup_cg input.pdb timestep_ps=0.020
+PyMOL> imd_setup_mlmm input.pdb ml_selection='resi 30-50' ml_charge=0 ml_mult=1
 ```
 
 After `setup_*`:
@@ -144,7 +144,7 @@ After `setup_*`:
 an automatic divergence / error halt). Minimization is never recorded.
 
 ```
-PyMOL> setup_aa input.pdb
+PyMOL> imd_setup_aa input.pdb
 PyMOL> imd_record traj=run.xtc, force_csv=pull.csv
 PyMOL> imd_run                  # recording begins
 PyMOL> imd_stop                 # files finalized
@@ -176,7 +176,7 @@ pixi run pymol_imd input.pdb --level aa --run \
 
 ## ML/MM region selection
 
-`setup_mlmm` requires `ml_selection`. The string is **PyMOL's full selection
+`imd_setup_mlmm` requires `ml_selection`. The string is **PyMOL's full selection
 language** (`and`, `or`, `not`, `within`, `byres`, `resi`, `resn`, `chain`,
 `name`, …) — resolved through `cmd.iterate` against a temporary load of the
 prepared PDB:
@@ -242,7 +242,7 @@ repo. After `pixi run install-uma`, run `pixi run huggingface-cli login`
 and request access at https://huggingface.co/facebook/UMA.
 
 ### CG initial Martini download
-First `setup_cg` downloads `martini_v3.0.0.itp` (~2 MB) into
+First `imd_setup_cg` downloads `martini_v3.0.0.itp` (~2 MB) into
 `~/.cache/pymol_imd/martini3/`. Subsequent runs are offline.
 
 ### Diverging simulation

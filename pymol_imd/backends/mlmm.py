@@ -495,6 +495,7 @@ class MLMMBackend:
         mace_model: str = "MACE-OMOL-0",
         constraints: str | None = None,
         link_atom_method: str = "scaled",
+        work_dir: Path | None = None,
         **_: object,
     ) -> SystemBundle:
         if ml_backend not in SUPPORTED_ML_BACKENDS:
@@ -531,7 +532,8 @@ class MLMMBackend:
         # ml_selection via its full selection language (`resi 1 and resn MET`
         # etc.). This is the same file commands.py later loads as the IMD
         # object — we just need it on disk earlier than usual.
-        work_dir = Path(tempfile.mkdtemp(prefix="pymol_imd_mlmm_"))
+        work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="pymol_imd_mlmm_"))
+        work_dir.mkdir(parents=True, exist_ok=True)
         prepared_pdb = write_prepared_pdb(
             modeller.topology,
             modeller.positions,

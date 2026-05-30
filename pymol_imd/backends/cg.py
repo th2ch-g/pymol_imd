@@ -67,7 +67,7 @@ def _ensure_martini_ff(cache_dir: Path | None = None) -> Path:
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to download Martini 3 forcefield {name} from {url}: {exc}. "
-                f"Place the file at {dest} manually or pass include_dir=... to setup_cg."
+                f"Place the file at {dest} manually or pass include_dir=... to imd_setup_cg."
             ) from exc
     return cache_dir
 
@@ -239,7 +239,7 @@ def _check_for_nan_bead_positions(
         "Cause: martinize2 averages constituent AA heavy atoms to place each "
         "bead, and every atom that maps to the listed beads is missing from "
         "the input. Complete the missing side-chain heavy atoms (e.g. with an "
-        "external tool such as tleap/CHARMM-GUI) and re-run setup_cg."
+        "external tool such as tleap/CHARMM-GUI) and re-run imd_setup_cg."
     )
 
 

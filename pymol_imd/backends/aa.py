@@ -44,6 +44,7 @@ class AABackend:
         pbc: bool = False,
         box_padding_nm: float = 1.0,
         constraints: str | None = "HBonds",
+        work_dir: Path | None = None,
         **_: object,
     ) -> SystemBundle:
         pdb_path = Path(pdb_path)
@@ -75,7 +76,8 @@ class AABackend:
             constraints=HBonds if constraints == "HBonds" else None,
         )
 
-        work_dir = Path(tempfile.mkdtemp(prefix="pymol_imd_aa_"))
+        work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="pymol_imd_aa_"))
+        work_dir.mkdir(parents=True, exist_ok=True)
         prepared_pdb = write_prepared_pdb(
             modeller.topology,
             modeller.positions,

@@ -514,6 +514,10 @@ class IMDSystem:
         # Overwrite any existing file so a second imd_run to the same path is
         # consistent across formats (XTCReporter raises on a non-empty file).
         out = Path(traj_path)
+        # Create the parent dir if missing — symmetry with the force-CSV path
+        # in start_recording(); XTC/DCD/PDBReporter all raise on a nonexistent
+        # directory. Cheap and idempotent.
+        out.parent.mkdir(parents=True, exist_ok=True)
         if out.exists():
             logger.warning("recording: overwriting existing trajectory %s", traj_path)
             out.unlink()
