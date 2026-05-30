@@ -24,13 +24,14 @@ import numpy as np
 from openmm import unit
 from openmm.app import PDBFile
 
+from .. import constants
 from .base import SystemBundle
 
 logger = logging.getLogger(__name__)
 
 # Forcefield label fed to martinize2 (-ff). Run `martinize2 -list-ff` to see
 # what's bundled; "martini3001" is Martini 3.0.0.1, the current standard.
-MARTINI_FF = "martini3001"
+MARTINI_FF = constants.CG_MARTINI_FF
 
 # Martini 3 forcefield itp files. martinize2-generated .top references
 # "martini.itp" by name, so we save the main forcefield under that exact
@@ -99,10 +100,12 @@ def _compute_ss_string(pdb_path: Path) -> str:
 
 class CGBackend:
     name = "cg"
-    # CG beads are heavier and bonds are softer; 50000 like AA overshoots
-    # and destabilises Martini's 20 fs timestep. 10000 stays inside Martini's
-    # safe range while still letting users drag beads visibly.
-    recommended_const_k = 10000.0
+    # CG beads are heavier and bonds are softer; AA's pull scale overshoots
+    # and destabilises Martini's 20 fs timestep, so CG uses a smaller one that
+    # stays in Martini's safe range. Values centralized in constants.py.
+    recommended_const_k = constants.CG_RECOMMENDED_CONST_K
+    recommended_integrator = constants.CG_INTEGRATOR
+    recommended_timestep_ps = constants.CG_TIMESTEP_PS
 
     def build_system(
         self,
@@ -112,6 +115,9 @@ class CGBackend:
         pbc: bool = False,
         ff: str = MARTINI_FF,
         elastic_network: bool = True,
+        nonbonded_cutoff_nm: float = constants.CG_NONBONDED_CUTOFF_NM,
+        box_padding_nm: float = constants.CG_BOX_PADDING_NM,
+        maxwarn: str = constants.CG_MARTINIZE_MAXWARN,
         work_dir: Path | None = None,
         include_dir: Path | None = None,
         **_: object,
@@ -137,9 +143,10 @@ class CGBackend:
         cg_top = work_dir / "cg.top"
 
         ss_string = _compute_ss_string(pdb_path)
-        # -maxwarn 99999: respect the input as-is. Non-protein residues (HOH,
-        # ions, ligands) raise "unknown-residue" warnings but martinize2
-        # itself does not abort on those, only on its warning-count gate.
+        # -maxwarn (default 99999): respect the input as-is. Non-protein
+        # residues (HOH, ions, ligands) raise "unknown-residue" warnings but
+        # martinize2 itself does not abort on those, only on its warning-count
+        # gate. Lower it if you want martinize2 to fail fast on warnings.
         cmd = [
             "martinize2",
             "-f",
@@ -153,7 +160,7 @@ class CGBackend:
             "-ss",
             ss_string,
             "-maxwarn",
-            "99999",
+            str(maxwarn),
         ]
         if elastic_network:
             cmd += ["-elastic"]
@@ -181,14 +188,14 @@ class CGBackend:
         # vacuum-like for short runs.
         box_vectors = coords.topology.getPeriodicBoxVectors()
         if box_vectors is None:
-            box_vectors = _bounding_box_vectors(coords.positions, padding_nm=1.0)
+            box_vectors = _bounding_box_vectors(coords.positions, padding_nm=box_padding_nm)
             coords.topology.setPeriodicBoxVectors(box_vectors)
         top = MartiniTopFile(
             str(cg_top),
             periodicBoxVectors=box_vectors,
             includeDir=str(martini_include),
         )
-        system = top.create_system(nonbonded_cutoff=1.1 * unit.nanometer)
+        system = top.create_system(nonbonded_cutoff=nonbonded_cutoff_nm * unit.nanometer)
 
         # Use martinize2's cg.pdb directly as the prepared PDB. Its CONECT
         # records list only chemical bonds + constraints (no elastic-network
@@ -243,7 +250,7 @@ def _check_for_nan_bead_positions(
     )
 
 
-def _bounding_box_vectors(positions, padding_nm: float = 1.0):
+def _bounding_box_vectors(positions, padding_nm: float = constants.CG_BOX_PADDING_NM):
     """Cubic periodic vectors enclosing positions with padding (nm).
 
     Returns a tuple of three ``Vec3 * nanometer`` Quantities, the form

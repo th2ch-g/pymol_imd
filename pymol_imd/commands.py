@@ -15,6 +15,7 @@ import contextlib
 import logging
 from pathlib import Path
 
+from . import constants
 from .backends.aa import AABackend
 from .backends.cg import CGBackend
 from .backends.mlmm import MLMMBackend
@@ -65,6 +66,75 @@ def _resolve_const_k(backend, const_k: object) -> float:
     return _as_float(const_k)
 
 
+def _resolve_integrator(backend, integrator: object) -> str:
+    """User-supplied integrator if explicit, else the backend recommendation.
+
+    Mirrors :func:`_resolve_const_k`: AA recommends ``langevin_middle``,
+    CG / MLMM recommend ``langevin`` — all sourced from constants.py.
+    """
+    if integrator is None:
+        return str(backend.recommended_integrator)
+    return str(integrator)
+
+
+def _resolve_timestep_ps(backend, timestep_ps: object) -> float:
+    """User-supplied timestep if explicit, else the backend recommendation.
+
+    The per-backend recommendations (AA 2 fs / CG 20 fs / MLMM 0.5 fs) live in
+    constants.py instead of being scattered across the setup functions.
+    """
+    if timestep_ps is None:
+        return float(backend.recommended_timestep_ps)
+    return _as_float(timestep_ps)
+
+
+def _build_imd_kwargs(
+    backend,
+    *,
+    temperature: object = None,
+    nsteps_per_frame: object = None,
+    const_k: object = None,
+    mouse_force: object = None,
+    integrator: object = None,
+    timestep_ps: object = None,
+    friction: object = None,
+    pressure: object = None,
+    max_force_kj: object = None,
+    energy_cutoff_kj: object = None,
+    frame_interval_ms: object = None,
+) -> dict:
+    """Coerce the common IMD knobs into an ``IMDConfig`` kwargs dict.
+
+    ``const_k`` / ``integrator`` / ``timestep_ps`` always resolve to a value
+    (the backend recommendation when the user did not pass one). Every other
+    knob is included only when explicitly set, so ``IMDConfig``'s own
+    constants-backed default applies otherwise — keeping a single source of
+    truth for the defaults instead of repeating literals in each setup_*.
+    """
+    kwargs: dict = {
+        "const_k": _resolve_const_k(backend, const_k),
+        "integrator": _resolve_integrator(backend, integrator),
+        "timestep_ps": _resolve_timestep_ps(backend, timestep_ps),
+    }
+    if temperature is not None:
+        kwargs["temperature"] = _as_float(temperature)
+    if nsteps_per_frame is not None:
+        kwargs["nsteps_per_frame"] = _as_int(nsteps_per_frame)
+    if mouse_force is not None:
+        kwargs["mouse_force"] = _as_bool(mouse_force)
+    if friction is not None:
+        kwargs["friction"] = _as_float(friction)
+    if pressure is not None:
+        kwargs["pressure"] = _as_float(pressure)
+    if max_force_kj is not None:
+        kwargs["max_force_kj"] = _as_float(max_force_kj)
+    if energy_cutoff_kj is not None:
+        kwargs["energy_cutoff_kj"] = _as_float(energy_cutoff_kj)
+    if frame_interval_ms is not None:
+        kwargs["frame_interval_ms"] = _as_int(frame_interval_ms)
+    return kwargs
+
+
 def _load_prepared_into_pymol(
     prepared_pdb_path: Path, base_name: str, *, backend_name: str = "aa"
 ) -> str:
@@ -96,8 +166,8 @@ def _load_prepared_into_pymol(
         # martinize2's cg.pdb directly so only chemical bonds are drawn).
         cmd.show_as("spheres", candidate)
         cmd.show("sticks", candidate)
-        cmd.set("sphere_scale", 0.4, candidate)
-        cmd.set("stick_radius", 0.25, candidate)
+        cmd.set("sphere_scale", constants.CG_SPHERE_SCALE, candidate)
+        cmd.set("stick_radius", constants.CG_STICK_RADIUS, candidate)
         # Martini bead types aren't standard elements, so PyMOL paints them
         # with arbitrary fallback colors. Override: backbone in skyblue, the
         # rest (side-chain beads) in yelloworange for a clean CG look.
@@ -107,7 +177,7 @@ def _load_prepared_into_pymol(
         cmd.show_as("cartoon", candidate)
         # Render any non-polymer atoms (ligands, ions left in) as sticks too.
         cmd.show("sticks", f"{candidate} and not polymer")
-    cmd.zoom(candidate, buffer=2.0)
+    cmd.zoom(candidate, buffer=constants.VIEW_ZOOM_BUFFER)
     # Drop into Editing mode so the user can immediately grab atoms with
     # Ctrl+left-drag and feed the pull-force mechanism without first
     # toggling Mouse > 3-Button Editing from the menu.
@@ -162,45 +232,68 @@ def imd_setup_aa(
     pdb_file: str,
     ligand_sdf: str | None = None,
     pbc: object = False,
-    temperature: object = 300.0,
-    nsteps_per_frame: object = 1,
+    temperature: object = None,
+    nsteps_per_frame: object = None,
     const_k: object = None,
-    mouse_force: object = True,
+    mouse_force: object = None,
+    integrator: object = None,
+    timestep_ps: object = None,
+    friction: object = None,
+    pressure: object = None,
     max_force_kj: object | None = None,
+    energy_cutoff_kj: object | None = None,
+    frame_interval_ms: object | None = None,
+    nonbonded_cutoff_nm: object | None = None,
+    box_padding_nm: object | None = None,
+    ph: object | None = None,
+    gaff_version: str | None = None,
     work_dir: str | None = None,
 ) -> None:
     """Set up an all-atom IMD simulation in vacuo (NVT) by default.
 
-    ``const_k`` falls back to ``AABackend.recommended_const_k`` (50000) when
-    omitted; the backend owns its own recommended scale. ``max_force_kj``
-    falls back to ``IMDConfig.max_force_kj`` (5000) when omitted.
+    Every knob left unset falls back to its single-source default: the
+    per-backend recommendations (``const_k`` / ``integrator`` /
+    ``timestep_ps``) come from ``AABackend``; the rest come from ``IMDConfig``
+    / ``AABackend.build_system`` (see ``constants.py``). ``integrator``
+    defaults to ``langevin_middle`` (BAOAB) for a wider stability margin under
+    user-injected pull forces.
     """
     global _imd_system, _timer, _timer_minimize
     pdb_path = Path(pdb_file)
     ligand_path = Path(ligand_sdf) if ligand_sdf else None
 
     backend = AABackend()
-    bundle = backend.build_system(
-        pdb_path,
-        ligand_sdf=ligand_path,
-        pbc=_as_bool(pbc),
-        work_dir=Path(work_dir) if work_dir else None,
-    )
+    aa_kwargs: dict = {
+        "ligand_sdf": ligand_path,
+        "pbc": _as_bool(pbc),
+        "work_dir": Path(work_dir) if work_dir else None,
+    }
+    if nonbonded_cutoff_nm is not None:
+        aa_kwargs["nonbonded_cutoff_nm"] = _as_float(nonbonded_cutoff_nm)
+    if box_padding_nm is not None:
+        aa_kwargs["box_padding_nm"] = _as_float(box_padding_nm)
+    if ph is not None:
+        aa_kwargs["ph"] = _as_float(ph)
+    if gaff_version is not None:
+        aa_kwargs["gaff_version"] = gaff_version
+    bundle = backend.build_system(pdb_path, **aa_kwargs)
     obj_name = _load_prepared_into_pymol(
         bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
     )
-    imd_kwargs: dict = {
-        "temperature": _as_float(temperature),
-        "nsteps_per_frame": _as_int(nsteps_per_frame),
-        "const_k": _resolve_const_k(backend, const_k),
-        "mouse_force": _as_bool(mouse_force),
-        # AA uses HBonds constraints + a relatively short timestep; the
-        # LangevinMiddleIntegrator (BAOAB) gives a wider stability margin
-        # under user-injected pull forces with no API cost.
-        "integrator": "langevin_middle",
-    }
-    if max_force_kj is not None:
-        imd_kwargs["max_force_kj"] = _as_float(max_force_kj)
+    imd_kwargs = _build_imd_kwargs(
+        backend,
+        temperature=temperature,
+        nsteps_per_frame=nsteps_per_frame,
+        const_k=const_k,
+        mouse_force=mouse_force,
+        integrator=integrator,
+        timestep_ps=timestep_ps,
+        friction=friction,
+        pressure=pressure,
+        max_force_kj=max_force_kj,
+        energy_cutoff_kj=energy_cutoff_kj,
+        frame_interval_ms=frame_interval_ms,
+    )
     _imd_system = _make_imd(bundle, obj_name, **imd_kwargs)
     _timer = _make_qtimer()
     _timer_minimize = _make_qtimer()
@@ -212,23 +305,32 @@ def imd_setup_cg(
     pbc: object = False,
     ff: str | None = None,
     elastic_network: object = True,
-    temperature: object = 300.0,
-    nsteps_per_frame: object = 1,
+    temperature: object = None,
+    nsteps_per_frame: object = None,
     const_k: object = None,
-    mouse_force: object = True,
-    timestep_ps: object = 0.020,
+    mouse_force: object = None,
+    integrator: object = None,
+    timestep_ps: object = None,
+    friction: object = None,
+    pressure: object = None,
     max_force_kj: object | None = None,
+    energy_cutoff_kj: object | None = None,
+    frame_interval_ms: object | None = None,
+    nonbonded_cutoff_nm: object | None = None,
+    box_padding_nm: object | None = None,
+    maxwarn: object | None = None,
     work_dir: str | None = None,
 ) -> None:
     """Set up a Martini CG IMD simulation via vermouth + martini_openmm.
 
-    Backend-owned defaults: ``ff=None`` → ``CGBackend.MARTINI_FF`` (martini3001),
-    ``const_k=None`` → ``CGBackend.recommended_const_k`` (10000).
+    Every unset knob falls back to its single-source default (``ff`` →
+    ``CGBackend.MARTINI_FF``; ``const_k`` / ``integrator`` / ``timestep_ps``
+    → ``CGBackend`` recommendations; the rest → ``IMDConfig`` /
+    ``CGBackend.build_system``; all defined in ``constants.py``).
 
-    ``timestep_ps`` defaults to 20 fs — the Martini 3 standard. CG beads
-    have no fast X-H modes, so the long timestep is safe and makes CG
-    actually feel ~10x faster than AA per wall-clock second. Override with
-    a smaller value if you observe instability.
+    ``timestep_ps`` defaults to the Martini 3 standard (20 fs). CG beads have
+    no fast X-H modes, so the long timestep is safe and makes CG feel ~10x
+    faster than AA per wall-clock second. Override if you observe instability.
     """
     global _imd_system, _timer, _timer_minimize
     pdb_path = Path(pdb_file)
@@ -241,51 +343,70 @@ def imd_setup_cg(
         cg_kwargs["ff"] = ff
     if work_dir:
         cg_kwargs["work_dir"] = Path(work_dir)
+    if nonbonded_cutoff_nm is not None:
+        cg_kwargs["nonbonded_cutoff_nm"] = _as_float(nonbonded_cutoff_nm)
+    if box_padding_nm is not None:
+        cg_kwargs["box_padding_nm"] = _as_float(box_padding_nm)
+    if maxwarn is not None:
+        cg_kwargs["maxwarn"] = str(maxwarn)
     backend = CGBackend()
     bundle = backend.build_system(pdb_path, **cg_kwargs)
     obj_name = _load_prepared_into_pymol(
         bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
     )
-    imd_kwargs: dict = {
-        "temperature": _as_float(temperature),
-        "nsteps_per_frame": _as_int(nsteps_per_frame),
-        "const_k": _resolve_const_k(backend, const_k),
-        "mouse_force": _as_bool(mouse_force),
-        "timestep_ps": _as_float(timestep_ps),
-    }
-    if max_force_kj is not None:
-        imd_kwargs["max_force_kj"] = _as_float(max_force_kj)
+    imd_kwargs = _build_imd_kwargs(
+        backend,
+        temperature=temperature,
+        nsteps_per_frame=nsteps_per_frame,
+        const_k=const_k,
+        mouse_force=mouse_force,
+        integrator=integrator,
+        timestep_ps=timestep_ps,
+        friction=friction,
+        pressure=pressure,
+        max_force_kj=max_force_kj,
+        energy_cutoff_kj=energy_cutoff_kj,
+        frame_interval_ms=frame_interval_ms,
+    )
     _imd_system = _make_imd(bundle, obj_name, **imd_kwargs)
     _timer = _make_qtimer()
     _timer_minimize = _make_qtimer()
     print(
         f"imd_setup_cg: ready (object={obj_name}, atoms={_imd_system.n_atoms}, "
-        f"dt={_as_float(timestep_ps) * 1000:.1f}fs, pbc={bundle.pbc})"
+        f"dt={imd_kwargs['timestep_ps'] * 1000:.1f}fs, pbc={bundle.pbc})"
     )
 
 
 def imd_setup_mlmm(
     pdb_file: str,
     ml_selection: str | None = None,
-    ml_backend: str = "aimnet2",
-    ml_device: str = "auto",
-    ml_charge: object = 0,
-    ml_mult: object = 1,
+    ml_backend: str = constants.MLMM_DEFAULT_BACKEND,
+    ml_device: str = constants.MLMM_DEFAULT_DEVICE,
+    ml_charge: object = constants.MLMM_DEFAULT_CHARGE,
+    ml_mult: object = constants.MLMM_DEFAULT_MULT,
     pbc: object = False,
-    temperature: object = 300.0,
-    nsteps_per_frame: object = 1,
+    temperature: object = None,
+    nsteps_per_frame: object = None,
     const_k: object = None,
-    mouse_force: object = True,
-    link_atom_method: str = "scaled",
+    mouse_force: object = None,
+    integrator: object = None,
+    link_atom_method: str = constants.MLMM_DEFAULT_LINK_ATOM_METHOD,
     max_force_kj: object | None = None,
-    timestep_ps: object = 0.0005,
+    energy_cutoff_kj: object | None = None,
+    frame_interval_ms: object | None = None,
+    nonbonded_cutoff_nm: object | None = None,
+    friction: object | None = None,
+    pressure: object | None = None,
+    timestep_ps: object = None,
     ml_compile: object = False,
     enable_cueq: object = False,
     work_dir: str | None = None,
 ) -> None:
     """Set up an ONIOM-style ML/MM IMD simulation.
 
-    ``const_k=None`` falls back to ``MLMMBackend.recommended_const_k``.
+    Unset knobs fall back to single-source defaults: ``const_k`` /
+    ``integrator`` / ``timestep_ps`` from ``MLMMBackend``; ``ml_backend`` /
+    ``ml_device`` / ``link_atom_method`` and the rest from ``constants.py``.
 
     ``timestep_ps`` defaults to 0.5 fs because the ML region carries no
     constraints (the MLIP and OpenMM constraint framework can't share state),
@@ -339,33 +460,40 @@ def imd_setup_mlmm(
     pdb_path = Path(pdb_file)
 
     backend = MLMMBackend()
-    bundle = backend.build_system(
-        pdb_path,
-        pbc=_as_bool(pbc),
-        ml_selection=ml_selection,
-        ml_backend=ml_backend,
-        ml_device=ml_device,
-        ml_charge=_as_int(ml_charge),
-        ml_mult=_as_int(ml_mult),
-        ml_compile=_as_bool(ml_compile),
-        enable_cueq=_as_bool(enable_cueq),
-        link_atom_method=link_atom_method,
-        work_dir=Path(work_dir) if work_dir else None,
-    )
+    mlmm_kwargs: dict = {
+        "pbc": _as_bool(pbc),
+        "ml_selection": ml_selection,
+        "ml_backend": ml_backend,
+        "ml_device": ml_device,
+        "ml_charge": _as_int(ml_charge),
+        "ml_mult": _as_int(ml_mult),
+        "ml_compile": _as_bool(ml_compile),
+        "enable_cueq": _as_bool(enable_cueq),
+        "link_atom_method": link_atom_method,
+        "work_dir": Path(work_dir) if work_dir else None,
+    }
+    if nonbonded_cutoff_nm is not None:
+        mlmm_kwargs["nonbonded_cutoff_nm"] = _as_float(nonbonded_cutoff_nm)
+    bundle = backend.build_system(pdb_path, **mlmm_kwargs)
     obj_name = _load_prepared_into_pymol(
         bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
     )
     ml_indices = bundle.extra["ml_indices"] if bundle.extra else ()
     ml_sel_name = _highlight_ml_region(obj_name, ml_indices) if ml_indices else None
-    imd_kwargs: dict = {
-        "temperature": _as_float(temperature),
-        "nsteps_per_frame": _as_int(nsteps_per_frame),
-        "const_k": _resolve_const_k(backend, const_k),
-        "mouse_force": _as_bool(mouse_force),
-        "timestep_ps": _as_float(timestep_ps),
-    }
-    if max_force_kj is not None:
-        imd_kwargs["max_force_kj"] = _as_float(max_force_kj)
+    imd_kwargs = _build_imd_kwargs(
+        backend,
+        temperature=temperature,
+        nsteps_per_frame=nsteps_per_frame,
+        const_k=const_k,
+        mouse_force=mouse_force,
+        integrator=integrator,
+        timestep_ps=timestep_ps,
+        friction=friction,
+        pressure=pressure,
+        max_force_kj=max_force_kj,
+        energy_cutoff_kj=energy_cutoff_kj,
+        frame_interval_ms=frame_interval_ms,
+    )
     _imd_system = _make_imd(bundle, obj_name, **imd_kwargs)
     _timer = _make_qtimer()
     _timer_minimize = _make_qtimer()
@@ -376,7 +504,7 @@ def imd_setup_mlmm(
     print(
         f"imd_setup_mlmm: ready (object={obj_name}, atoms={_imd_system.n_atoms}, "
         f"ml_atoms={n_ml}, ml_backend={ml_backend}, "
-        f"dt={_as_float(timestep_ps) * 1000:.2f}fs, "
+        f"dt={imd_kwargs['timestep_ps'] * 1000:.2f}fs, "
         f"pbc={bundle.pbc}{link_msg}{sel_msg})"
     )
 
@@ -384,9 +512,9 @@ def imd_setup_mlmm(
 # ----------------------------------------------------------------- imd_* family
 def imd_record(
     traj: object | None = None,
-    traj_interval: object = 1,
+    traj_interval: object = constants.DEFAULT_TRAJ_INTERVAL,
     force_csv: object | None = None,
-    force_csv_interval: object = 1,
+    force_csv_interval: object = constants.DEFAULT_FORCE_CSV_INTERVAL,
 ) -> None:
     """Arm trajectory / pull-force recording for the next ``imd_run``.
 
@@ -441,14 +569,15 @@ def imd_record(
 
 
 def imd_minimize(
-    max_iter_per_chunk: object = 50,
-    max_chunks: object = 200,
+    max_iter_per_chunk: object | None = None,
+    max_chunks: object | None = None,
+    tol_kj: object | None = None,
 ) -> None:
     """Run energy minimization on the Qt event loop.
 
     Stops when either:
       * two consecutive chunks differ in potential energy by less than
-        ``1e-3 kJ/mol`` (the convergence path), or
+        ``tol_kj`` (the convergence path), or
       * ``max_chunks`` chunks have run without converging (the cap path).
 
     Parameters
@@ -457,8 +586,11 @@ def imd_minimize(
         OpenMM minimizer iterations per Qt tick. Larger values make each
         tick heavier but reduce Python overhead.
     max_chunks:
-        Hard upper bound on the number of chunks. Default 200 → up to
-        ``200 * 50 = 10000`` minimization iterations before forced stop.
+        Hard upper bound on the number of chunks before a forced stop.
+    tol_kj:
+        Energy-change convergence tolerance (kJ/mol).
+
+    Each argument falls back to its ``constants.py`` default when omitted.
     """
     if _imd_system is None:
         print("imd: no system loaded — call imd_setup_aa / imd_setup_cg / imd_setup_mlmm first")
@@ -466,8 +598,13 @@ def imd_minimize(
     if _imd_system.running:
         print("imd: already running — call imd_stop first")
         return
-    max_iter = _as_int(max_iter_per_chunk)
-    chunk_cap = _as_int(max_chunks)
+    max_iter = (
+        _as_int(max_iter_per_chunk)
+        if max_iter_per_chunk is not None
+        else constants.DEFAULT_MIN_MAX_ITER_PER_CHUNK
+    )
+    chunk_cap = _as_int(max_chunks) if max_chunks is not None else constants.DEFAULT_MIN_MAX_CHUNKS
+    tol = _as_float(tol_kj) if tol_kj is not None else constants.DEFAULT_MIN_ENERGY_TOL_KJ
     _imd_system.running = True
 
     # Wrap counter in a list so the closure can rebind without `nonlocal`.
@@ -475,7 +612,7 @@ def imd_minimize(
 
     def _tick():
         chunks_done[0] += 1
-        converged = _imd_system.minimize_step(max_iterations=max_iter)
+        converged = _imd_system.minimize_step(max_iterations=max_iter, tol_kj=tol)
         if converged:
             _timer_minimize.stop()
             _imd_system.running = False
@@ -493,7 +630,7 @@ def imd_minimize(
 
     _reset_timer(_timer_minimize)
     _timer_minimize.timeout.connect(_tick)
-    _timer_minimize.start(1)
+    _timer_minimize.start(_imd_system.config.frame_interval_ms)
     print(f"imd_minimize: started (max_chunks={chunk_cap}, iter_per_chunk={max_iter})")
 
 
@@ -534,7 +671,7 @@ def imd_run() -> None:
 
     _reset_timer(_timer)
     _timer.timeout.connect(_tick)
-    _timer.start(1)
+    _timer.start(_imd_system.config.frame_interval_ms)
     print("imd_run: started")
 
 
@@ -581,7 +718,8 @@ def imd_change(
     ``temperature`` (live Langevin integrator update), ``max_force_kj``,
     ``energy_cutoff_kj``. Other ``IMDConfig`` fields (``friction``,
     ``timestep_ps``, ``pressure``, ``integrator``) need a fresh ``setup_*``
-    because they require rebuilding the integrator or the barostat.
+    because they require rebuilding the integrator or the barostat;
+    ``frame_interval_ms`` needs a stop/run cycle (it is read at timer start).
 
     Note: changing ``nsteps_per_frame`` while a recording is active does NOT
     retune the trajectory reporter's interval (it is fixed at ``imd_run``

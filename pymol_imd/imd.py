@@ -24,37 +24,43 @@ import openmm
 from openmm import LangevinIntegrator, LangevinMiddleIntegrator, MonteCarloBarostat, unit
 from openmm.app import DCDReporter, PDBReporter, Simulation, XTCReporter
 
+from . import constants
 from .backends.base import SystemBundle
 
 logger = logging.getLogger(__name__)
 
-# MLIP backends report energy in eV and forces in eV/Å; OpenMM expects
-# kJ/mol and kJ/(mol·nm). 1 eV = 96.485 kJ/mol; 1 Å = 0.1 nm.
-_EV_PER_A_TO_KJ_PER_MOL_NM = 96.48533212331 * 10.0
+# eV/Å -> kJ/(mol·nm) bridge. Single source of truth lives in constants.py;
+# kept as a module alias so the per-frame call sites below stay terse.
+_EV_PER_A_TO_KJ_PER_MOL_NM = constants.EV_PER_A_TO_KJ_PER_MOL_NM
 
 
 @dataclass
 class IMDConfig:
-    temperature: float = 300.0  # K
-    pressure: float = 1.0  # bar (NPT only)
-    friction: float = 1.0  # 1/ps
-    timestep_ps: float = 0.002  # ps
-    nsteps_per_frame: int = 1
-    const_k: float = 10000.0  # kJ/mol/nm scale for the pulling force
-    mouse_force: bool = True
+    # Field defaults are sourced from constants.py (single source of truth);
+    # the command layer overrides per-backend values via imd_setup_*.
+    temperature: float = constants.DEFAULT_TEMPERATURE_K  # K
+    pressure: float = constants.DEFAULT_PRESSURE_BAR  # bar (NPT only)
+    friction: float = constants.DEFAULT_FRICTION_PER_PS  # 1/ps
+    timestep_ps: float = constants.DEFAULT_TIMESTEP_PS  # ps
+    nsteps_per_frame: int = constants.DEFAULT_NSTEPS_PER_FRAME
+    const_k: float = constants.DEFAULT_CONST_K  # kJ/mol/nm scale for the pulling force
+    mouse_force: bool = constants.DEFAULT_MOUSE_FORCE
     # Integrator selection: "langevin" (legacy BBK-like) or "langevin_middle"
     # (Leimkuhler-Matthews BAOAB). The middle scheme has 2nd-order accurate
     # configurational sampling and a wider stability window under external
     # forcing, so AA backends default to it; CG/MLMM keep "langevin" for now.
-    integrator: str = "langevin"
+    integrator: str = constants.DEFAULT_INTEGRATOR
     # Per-atom hard cap on the pulling force magnitude (kJ/mol/nm). Replaces
     # the old |delta| cap: a |F| cap is unit-meaningful (force) and prevents
     # runaway accelerations directly, regardless of how far the user drags
     # an atom or what const_k is set to.
-    max_force_kj: float = 5000.0
+    max_force_kj: float = constants.DEFAULT_MAX_FORCE_KJ
     # If |potential energy| exceeds this (kJ/mol), the simulation is treated
     # as diverged and the IMD loop halts. NaN energies trip the same guard.
-    energy_cutoff_kj: float = 1e9
+    energy_cutoff_kj: float = constants.DEFAULT_ENERGY_CUTOFF_KJ
+    # QTimer tick interval (ms) for both the production and minimize loops.
+    # Read at timer start(); changing it mid-run needs a stop/run cycle.
+    frame_interval_ms: int = constants.DEFAULT_FRAME_INTERVAL_MS
 
 
 class IMDSystem:
@@ -470,14 +476,23 @@ class IMDSystem:
         self.running = False
         return True
 
-    def minimize_step(self, max_iterations: int = 50) -> bool:
-        """Run a chunk of minimization; returns True when converged."""
+    def minimize_step(
+        self,
+        max_iterations: int = constants.DEFAULT_MIN_MAX_ITER_PER_CHUNK,
+        *,
+        tol_kj: float = constants.DEFAULT_MIN_ENERGY_TOL_KJ,
+    ) -> bool:
+        """Run a chunk of minimization; returns True when converged.
+
+        ``tol_kj`` is the energy-change convergence tolerance: two consecutive
+        chunks differing by less than this (kJ/mol) count as converged.
+        """
         self.simulation.minimizeEnergy(maxIterations=max_iterations)
         self._sync_positions_to_pymol()
         energy = self.simulation.context.getState(getEnergy=True).getPotentialEnergy()
         energy_kj = energy.value_in_unit(unit.kilojoule_per_mole)
         converged = (
-            self._last_min_energy is not None and abs(energy_kj - self._last_min_energy) < 1e-3
+            self._last_min_energy is not None and abs(energy_kj - self._last_min_energy) < tol_kj
         )
         logger.info("minimize: U = %.4f kJ/mol%s", energy_kj, " (converged)" if converged else "")
         self._last_min_energy = energy_kj
@@ -487,9 +502,9 @@ class IMDSystem:
     def set_recording(
         self,
         traj: str | None = None,
-        traj_interval: int = 1,
+        traj_interval: int = constants.DEFAULT_TRAJ_INTERVAL,
         force_csv: str | None = None,
-        force_csv_interval: int = 1,
+        force_csv_interval: int = constants.DEFAULT_FORCE_CSV_INTERVAL,
     ) -> None:
         """Store the pending recording config (does NOT open any file).
 
@@ -655,12 +670,9 @@ class IMDSystem:
         self._force_csv_file.flush()
 
     # ------------------------------------------------------------- pulling logic
-    # Noise threshold: prepared.pdb is written with %8.3f (0.001 A = 1e-4 nm
-    # precision), and PyMOL stores coordinates as float32. The round-trip
-    # leaves a ~1e-4 nm "ghost delta" on every atom, which used to produce a
-    # uniform whole-molecule force. 1e-3 nm = 0.01 A sits comfortably above
-    # that floor while still catching realistic mouse drags.
-    _DELTA_NOISE_NM = 1e-3
+    # Drag noise floor (nm). Rationale (PDB %8.3f precision + float32) lives
+    # with the constant in constants.py.
+    _DELTA_NOISE_NM = constants.DELTA_NOISE_NM
 
     def _apply_pull_force_from_pymol(self) -> None:
         try:

@@ -25,50 +25,23 @@ import openmm
 from openmm import unit
 from openmm.app import HBonds, NoCutoff
 
+from .. import constants
 from ..prep import load_and_complete_hydrogens, write_prepared_pdb
 from .aa import FORCEFIELD_FILES
 from .base import SystemBundle
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_ML_BACKENDS = ("uma", "orb", "mace", "aimnet2")
-SUPPORTED_LINK_ATOM_METHODS = ("scaled", "fixed", "none")
-
-# Unit conversion: ASE returns eV / (eV/Å), OpenMM wants kJ/mol / kJ/(mol·nm).
-EV_PER_KJMOL = 96.48533212331  # 1 eV = 96.485... kJ/mol
-EV_PER_A_TO_KJ_PER_MOL_NM = EV_PER_KJMOL * 10.0
-
-# Covalent radii in Angstrom for the Morokuma/Dapprich g-factor.
-# Source: standard chemistry references (Cordero 2008, condensed). Only the
-# elements seen at QM/MM boundaries in biomolecules are listed; unusual
-# elements fall back to ``_DEFAULT_COVALENT_RADIUS``.
-_COVALENT_RADIUS_ANG: dict[str, float] = {
-    "H": 0.31,
-    "C": 0.76,
-    "N": 0.71,
-    "O": 0.66,
-    "F": 0.57,
-    "P": 1.07,
-    "S": 1.05,
-    "Cl": 1.02,
-    "Br": 1.20,
-    "I": 1.39,
-}
-_DEFAULT_COVALENT_RADIUS = 0.75
-
-# Fixed link-atom bond lengths (Angstrom) for the "fixed" mode. Only the
-# common QM-side anchors are tabulated — anything else raises so a silent
-# wrong-distance never sneaks in.
-_FIXED_LINK_DISTANCE_ANG: dict[str, float] = {
-    "C": 1.09,  # C-H
-    "N": 1.01,  # N-H
-    "O": 0.96,  # O-H
-    "S": 1.34,  # S-H
-}
+# Re-exported from constants.py (single source shared with cli.py) so error
+# messages and validation here stay in lockstep with the CLI's --choices.
+SUPPORTED_ML_BACKENDS = constants.SUPPORTED_ML_BACKENDS
+SUPPORTED_LINK_ATOM_METHODS = constants.SUPPORTED_LINK_ATOM_METHODS
 
 
 def _covalent_radius(elem: str) -> float:
-    return _COVALENT_RADIUS_ANG.get(elem.capitalize(), _DEFAULT_COVALENT_RADIUS)
+    return constants.COVALENT_RADIUS_ANG.get(
+        elem.capitalize(), constants.DEFAULT_COVALENT_RADIUS_ANG
+    )
 
 
 def _g_factor(qm_elem: str, mm_elem: str, link_elem: str = "H") -> float:
@@ -120,13 +93,13 @@ def _detect_link_atoms(
         if method == "scaled":
             param = _g_factor(q_elem, m_elem)
         else:  # "fixed"
-            if q_elem not in _FIXED_LINK_DISTANCE_ANG:
+            if q_elem not in constants.FIXED_LINK_DISTANCE_ANG:
                 raise ValueError(
                     f"Fixed link-atom mode does not support QM-side element "
                     f"{q_elem!r} (atom {q_atom.index}). Use link_atom_method="
-                    f"'scaled' or extend _FIXED_LINK_DISTANCE_ANG."
+                    f"'scaled' or extend constants.FIXED_LINK_DISTANCE_ANG."
                 )
-            param = _FIXED_LINK_DISTANCE_ANG[q_elem]
+            param = constants.FIXED_LINK_DISTANCE_ANG[q_elem]
         records.append((q_atom.index, m_atom.index, float(param)))
     return tuple(records)
 
@@ -297,7 +270,7 @@ def _build_mace_calculator(
 
     if device_str == "mps":
         device_str = _mps_to_cpu_fallback(device_str, "MACE")
-        dtype = "float64"  # reset dtype that was forced to float32 for MPS
+        dtype = constants.MLMM_MACE_DTYPE  # reset dtype forced to float32 for MPS
 
     # Forwarded to MACECalculator via the factory **kwargs passthrough. Only
     # the foundation factories (mp/omol/off) forward kwargs; anicc is left as-is.
@@ -310,7 +283,7 @@ def _build_mace_calculator(
                 "compile (cuEq + torch.compile is a known broken combo)."
             )
     elif ml_compile:
-        extra_kw["compile_mode"] = "default"
+        extra_kw["compile_mode"] = constants.MLMM_MACE_COMPILE_MODE
     lower = model.lower()
     if lower.startswith("mp:") or lower.startswith("mace-mp"):
         name = model.split(":", 1)[-1] if ":" in model else model
@@ -431,12 +404,12 @@ def _build_mlip_calculator(
     ml_mult: int = 1,
     ml_compile: bool = False,
     enable_cueq: bool = False,
-    mace_model: str = "MACE-OMOL-0",
-    mace_dtype: str = "float64",
-    orb_model: str = "orb_v3_conservative_omol",
-    aimnet2_model: str = "aimnet2",
-    uma_model: str = "uma-s-1p1",
-    uma_task_name: str = "omol",
+    mace_model: str = constants.MLMM_MACE_MODEL,
+    mace_dtype: str = constants.MLMM_MACE_DTYPE,
+    orb_model: str = constants.MLMM_ORB_MODEL,
+    aimnet2_model: str = constants.MLMM_AIMNET2_MODEL,
+    uma_model: str = constants.MLMM_UMA_MODEL,
+    uma_task_name: str = constants.MLMM_UMA_TASK_NAME,
 ):
     """Build an ASE Calculator for the requested MLIP backend.
 
@@ -629,7 +602,10 @@ def _atoms_from_topology(topology, indices: tuple[int, ...]):
 # ----------------------------------------------------------------------------
 class MLMMBackend:
     name = "mlmm"
-    recommended_const_k = 50000.0  # same as AA (ML region is atomistic)
+    # Per-backend recommendations (values centralized in constants.py).
+    recommended_const_k = constants.MLMM_RECOMMENDED_CONST_K
+    recommended_integrator = constants.MLMM_INTEGRATOR
+    recommended_timestep_ps = constants.MLMM_TIMESTEP_PS
 
     def build_system(
         self,
@@ -637,16 +613,17 @@ class MLMMBackend:
         *,
         ligand_sdf: Path | None = None,
         pbc: bool = False,
-        ml_selection: str = "all",
-        ml_backend: str = "mace",
-        ml_device: str = "auto",
-        ml_charge: int = 0,
-        ml_mult: int = 1,
+        ml_selection: str = constants.MLMM_DEFAULT_ML_SELECTION,
+        ml_backend: str = constants.MLMM_DEFAULT_BACKEND,
+        ml_device: str = constants.MLMM_DEFAULT_DEVICE,
+        ml_charge: int = constants.MLMM_DEFAULT_CHARGE,
+        ml_mult: int = constants.MLMM_DEFAULT_MULT,
         ml_compile: bool = False,
         enable_cueq: bool = False,
-        mace_model: str = "MACE-OMOL-0",
+        mace_model: str = constants.MLMM_MACE_MODEL,
+        nonbonded_cutoff_nm: float = constants.MLMM_NONBONDED_CUTOFF_NM,
         constraints: str | None = None,
-        link_atom_method: str = "scaled",
+        link_atom_method: str = constants.MLMM_DEFAULT_LINK_ATOM_METHOD,
         work_dir: Path | None = None,
         **_: object,
     ) -> SystemBundle:
@@ -676,7 +653,7 @@ class MLMMBackend:
         system = forcefield.createSystem(
             modeller.topology,
             nonbondedMethod=nonbonded_method,
-            nonbondedCutoff=1.0 * unit.nanometer,
+            nonbondedCutoff=nonbonded_cutoff_nm * unit.nanometer,
             constraints=HBonds if constraints == "HBonds" else None,
         )
 
@@ -711,7 +688,7 @@ class MLMMBackend:
         _configure_torch_threads(device_str, len(ml_indices))
         # MPS (Apple Silicon GPU) doesn't support float64; the MACE default
         # is float64 so we have to opt in to float32 when running on mps.
-        mace_dtype = "float32" if device_str == "mps" else "float64"
+        mace_dtype = "float32" if device_str == "mps" else constants.MLMM_MACE_DTYPE
         ml_calc = _build_mlip_calculator(
             ml_backend,
             device_str=device_str,

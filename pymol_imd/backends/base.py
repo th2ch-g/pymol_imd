@@ -56,10 +56,14 @@ class Backend(Protocol):
     They are intentionally duck-typed: any object exposing ``build_system``
     with the right signature is a valid backend.
 
-    Each backend also exposes ``recommended_const_k`` so the command layer
-    can pick a sensible default pulling-force scale per backend (heavier CG
-    beads need a smaller ``const_k`` than fast AA atoms) without spreading
-    those numbers across the codebase.
+    Each backend also exposes a set of ``recommended_*`` class attributes so
+    the command layer can pick sensible per-backend defaults (heavier CG beads
+    need a smaller ``const_k`` than fast AA atoms; the AA HBonds setup is
+    stable with a 2 fs ``langevin_middle`` step while the constraint-free ML
+    region needs 0.5 fs) without spreading those numbers across the codebase:
+    ``recommended_const_k`` (pull-force scale), ``recommended_integrator``
+    (``"langevin"`` / ``"langevin_middle"``), and ``recommended_timestep_ps``.
+    The command layer resolves "user value else backend recommendation".
 
     ``ligand_sdf`` is **AA-only**; CG and ML/MM backends raise if it is
     passed. Backend-specific kwargs (``ff`` / ``elastic_network`` for CG,
@@ -73,6 +77,8 @@ class Backend(Protocol):
 
     name: str
     recommended_const_k: float
+    recommended_integrator: str
+    recommended_timestep_ps: float
 
     def build_system(
         self,

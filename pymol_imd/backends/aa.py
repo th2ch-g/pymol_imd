@@ -14,6 +14,7 @@ from pathlib import Path
 from openmm import unit
 from openmm.app import PME, ForceField, HBonds, Modeller, NoCutoff
 
+from .. import constants
 from ..prep import load_and_complete_hydrogens, prepare_ligand_am1bcc, write_prepared_pdb
 from .base import SystemBundle
 
@@ -30,11 +31,13 @@ FORCEFIELD_FILES = (
 
 class AABackend:
     name = "aa"
-    # Pull-force spring constant (kJ/mol/nm). The actual per-atom |F| is
-    # bounded by IMDConfig.max_force_kj (default 5000) regardless of this
-    # value, so const_k mostly controls how aggressively the pull responds
+    # Per-backend recommendations (values centralized in constants.py). The
+    # actual per-atom |F| is bounded by IMDConfig.max_force_kj regardless of
+    # const_k, so const_k mostly controls how aggressively the pull responds
     # to small drags before it saturates at the cap.
-    recommended_const_k = 50000.0
+    recommended_const_k = constants.AA_RECOMMENDED_CONST_K
+    recommended_integrator = constants.AA_INTEGRATOR
+    recommended_timestep_ps = constants.AA_TIMESTEP_PS
 
     def build_system(
         self,
@@ -42,8 +45,11 @@ class AABackend:
         *,
         ligand_sdf: Path | None = None,
         pbc: bool = False,
-        box_padding_nm: float = 1.0,
+        box_padding_nm: float = constants.AA_BOX_PADDING_NM,
         constraints: str | None = "HBonds",
+        nonbonded_cutoff_nm: float = constants.AA_NONBONDED_CUTOFF_NM,
+        gaff_version: str = constants.AA_GAFF_VERSION,
+        ph: float = constants.AA_PH,
         work_dir: Path | None = None,
         **_: object,
     ) -> SystemBundle:
@@ -54,13 +60,13 @@ class AABackend:
             ligand = prepare_ligand_am1bcc(ligand_sdf)
             from openmmforcefields.generators import GAFFTemplateGenerator
 
-            generator = GAFFTemplateGenerator(molecules=ligand, forcefield="gaff-2.2.20")
+            generator = GAFFTemplateGenerator(molecules=ligand, forcefield=gaff_version)
             forcefield.registerTemplateGenerator(generator.generator)
             logger.info("Registered GAFF template for ligand %s", ligand.name)
         else:
             ligand = None
 
-        modeller = load_and_complete_hydrogens(pdb_path, forcefield)
+        modeller = load_and_complete_hydrogens(pdb_path, forcefield, ph=ph)
         if ligand is not None:
             ligand_top = ligand.to_topology()
             modeller.add(ligand_top.to_openmm(), ligand_top.get_positions().to_openmm())
@@ -72,7 +78,7 @@ class AABackend:
         system = forcefield.createSystem(
             modeller.topology,
             nonbondedMethod=nonbonded_method,
-            nonbondedCutoff=1.0 * unit.nanometer,
+            nonbondedCutoff=nonbonded_cutoff_nm * unit.nanometer,
             constraints=HBonds if constraints == "HBonds" else None,
         )
 

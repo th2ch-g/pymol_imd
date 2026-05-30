@@ -20,6 +20,8 @@ from pathlib import Path
 from openmm.app import ForceField, Modeller, PDBFile, Topology
 from openmm.unit import Quantity
 
+from . import constants
+
 logger = logging.getLogger(__name__)
 
 RCSB_URL = "https://files.rcsb.org/download/{pdb_id}.pdb"
@@ -55,7 +57,7 @@ def load_and_complete_hydrogens(
     pdb_path: Path | str,
     forcefield: ForceField,
     *,
-    ph: float = 7.4,
+    ph: float = constants.AA_PH,
 ) -> Modeller:
     """Load ``pdb_path`` and add missing hydrogens using OpenMM's ``Modeller``.
 
@@ -147,11 +149,17 @@ def write_prepared_pdb(
     return out_path
 
 
-def prepare_ligand_am1bcc(sdf_path: Path | str):
-    """Load an SDF ligand and assign AM1-BCC partial charges via OpenFF.
+def prepare_ligand_am1bcc(
+    sdf_path: Path | str,
+    *,
+    partial_charge_method: str = constants.AA_PARTIAL_CHARGE_METHOD,
+):
+    """Load an SDF ligand and assign partial charges via OpenFF.
 
     Returns the ``openff.toolkit.Molecule`` ready to be handed to
     :class:`openmmforcefields.generators.GAFFTemplateGenerator`.
+    ``partial_charge_method`` defaults to AM1-BCC (the standard for GAFF); it
+    is exposed for completeness but rarely needs changing.
 
     Imported lazily so that the AA backend stays importable even if the user is
     only running CG simulations.
@@ -166,5 +174,5 @@ def prepare_ligand_am1bcc(sdf_path: Path | str):
         if len(mol) != 1:
             raise ValueError(f"Expected exactly one molecule in {sdf_path}, got {len(mol)}")
         mol = mol[0]
-    mol.assign_partial_charges(partial_charge_method="am1bcc")
+    mol.assign_partial_charges(partial_charge_method=partial_charge_method)
     return mol

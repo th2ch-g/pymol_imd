@@ -82,27 +82,50 @@ pixi run pymol_imd 1ubq.pdb --level aa --print-only
 
 ### CLI flags
 
+All numeric / string knobs are optional; each falls back to its single-source
+default in `pymol_imd/constants.py` (per-backend where noted).
+
 | Flag | Levels | Description |
 |---|---|---|
 | `--level {aa,cg,mlmm}` | all | Simulation backend (default: `aa`) |
 | `--pbc` | all | Enable periodic box / NPT (default: NVT vacuum, CG auto-boxes) |
-| `--temperature K` | all | Langevin thermostat temperature |
-| `--nsteps-per-frame N` | all | MD steps per GUI frame |
-| `--const-k K` | all | Pull-force scale (kJ/mol/nm); default comes from each backend |
+| `--temperature K` | all | Langevin thermostat temperature (default 300) |
+| `--nsteps-per-frame N` | all | MD steps per GUI frame (default 1) |
+| `--const-k K` | all | Pull-force scale (kJ/mol/nm); default per backend (AA/MLMM 50000, CG 10000) |
+| `--max-force-kj F` | all | Per-atom \|F\| cap on the pull force (kJ/mol/nm, default 5000) |
+| `--integrator {langevin,langevin_middle}` | all | Langevin scheme; default per backend (AA `langevin_middle`, CG/MLMM `langevin`) |
+| `--timestep-ps PS` | all | MD timestep; default per backend (AA 0.002 / CG 0.020 / MLMM 0.0005) |
+| `--friction PER_PS` | all | Langevin friction 1/ps (default 1.0) |
+| `--pressure BAR` | all | Barostat pressure with `--pbc` (default 1.0) |
+| `--energy-cutoff-kj E` | all | \|U\| above this halts the loop as diverged (default 1e9) |
+| `--frame-interval-ms MS` | all | Qt timer tick interval for the IMD / minimize loops (default 1) |
+| `--nonbonded-cutoff-nm NM` | all | Nonbonded cutoff; default per backend (AA/MLMM 1.0, CG 1.1) |
+| `--box-padding-nm NM` | `aa`, `cg` | Bounding-box padding when a box is built (default 1.0) |
 | `--no-mouse-force` | all | Disable user-pull |
 | `--minimize` | all | Run `imd_minimize` after setup |
+| `--min-max-iter N` | all | Minimizer iterations per chunk, with `--minimize` (default 50) |
+| `--min-max-chunks N` | all | Max minimize chunks, with `--minimize` (default 200) |
+| `--min-tol-kj E` | all | Minimize convergence tolerance kJ/mol, with `--minimize` (default 1e-3) |
 | `--run` | all | Run `imd_run` after setup |
 | `--traj-out PATH` | all | Record a trajectory during `imd_run` (`.xtc`/`.dcd`/`.pdb` by extension); needs `--run` |
 | `--traj-interval N` | all | Trajectory: write every N GUI frames (default 1) |
 | `--force-csv PATH` | all | Record user pull forces to CSV (`frame,step,time_ps,atom_index,fx,fy,fz,fmag`, atom_index 0-based); needs `--run` |
 | `--force-csv-interval N` | all | Force CSV: write every N GUI frames (default 1) |
+| `--no-record` | all | Disable the default trajectory + force-CSV recording |
+| `--topology-dir DIR` | all | Output dir for intermediate / topology files (default `./<stem>_topology`) |
 | `--ligand-sdf PATH` | `aa` | Ligand SDF for GAFF + AM1-BCC parameterisation |
+| `--ph PH` | `aa` | `Modeller.addHydrogens` protonation pH (default 7.4) |
+| `--gaff-version VER` | `aa` | GAFF version for ligand templates (default `gaff-2.2.20`) |
 | `--ff NAME` | `cg`  | Martini forcefield label (default: `martini3001`) |
 | `--no-elastic-network` | `cg` | Skip martinize2 `-elastic` |
+| `--martinize-maxwarn N` | `cg` | martinize2 `-maxwarn` value (default 99999) |
 | `--ml-selection SEL` | `mlmm` | **Required.** PyMOL selection language (`resi 1 and resn MET`, `chain A and not resn HOH`, …) |
 | `--ml-backend {uma,orb,mace,aimnet2}` | `mlmm` | MLIP backend (default: `aimnet2`) |
 | `--ml-device {auto,cuda,mps,cpu}` | `mlmm` | Torch device; `auto` prefers cuda → mps → cpu |
-| `--ml-charge Z`, `--ml-mult M` | `mlmm` | ML region net charge / spin multiplicity |
+| `--ml-charge Z`, `--ml-mult M` | `mlmm` | **Required.** ML region net charge / spin multiplicity |
+| `--link-atom-method {scaled,fixed,none}` | `mlmm` | QM/MM boundary link-atom placement (default `scaled`) |
+| `--ml-compile` | `mlmm` | Opt-in `torch.compile` for the MLIP (numerically ~identical) |
+| `--enable-cueq` | `mlmm` | Opt-in cuEquivariance for MACE (CUDA; `pixi run install-cueq`) |
 | `--pymol PATH` | all | Override PyMOL executable |
 | `--print-only` | all | Show the underlying `pymol -d ...` and exit |
 
@@ -199,6 +222,22 @@ Headless / no-PyMOL contexts fall back to a strict mini-grammar
 (`all`, `resi <range>`, `chain <id>`, `resn <name>`, comma-separated
 indices) without combiners.
 
+### Link atoms at the QM/MM boundary
+
+When the ML selection cuts across a covalent bond, a hydrogen **link atom**
+caps the dangling QM bond so the selection no longer has to be molecularly
+closed. `--link-atom-method` (`imd_setup_mlmm link_atom_method=...`) picks the
+placement:
+
+- `scaled` (default): Morokuma/Dapprich g-factor — the link H sits at
+  `r_Q + g·(r_M − r_Q)` and stretches with the broken bond.
+- `fixed`: keeps the Q–H distance at a tabulated bond length (1.09 Å for C,
+  1.01 Å for N, …) via the IMOMM projector Jacobian.
+- `none`: disables link atoms — only for molecularly closed selections.
+
+The link H's force is redistributed back onto the real QM- and MM-side atoms
+through the placement Jacobian.
+
 ---
 
 ## How it works
@@ -216,9 +255,9 @@ indices) without combiners.
    `CustomExternalForce` for the per-frame ONIOM correction
    `F_ML - F_MM_subset`.
 4. **Loop**: a Qt timer steps the simulation, reads PyMOL atom positions,
-   computes `delta = pymol_xyz - openmm_xyz` for each atom, caps the
-   magnitude at `max_pull_nm`, multiplies by `const_k` and pushes the
-   resulting force into the pull `CustomExternalForce`. Then OpenMM
+   computes `delta = pymol_xyz - openmm_xyz` for each atom, multiplies by
+   `const_k`, then caps the resulting force magnitude at `max_force_kj` (a
+   |F| cap) and pushes it into the pull `CustomExternalForce`. Then OpenMM
    integrates one frame's worth of steps and the new coordinates are
    written back into PyMOL via `cmd.alter_state`.
 5. **Safety**: every step potential energy is checked; NaN / |U| above
@@ -247,9 +286,10 @@ First `imd_setup_cg` downloads `martini_v3.0.0.itp` (~2 MB) into
 
 ### Diverging simulation
 If the structure flies apart, `imd_run` stops automatically with a hint:
-> `imd_run: stopped (divergence or error). Adjust const_k / max_pull_nm.`
+> `imd_run: stopped (divergence or error). Adjust const_k / max_force_kj.`
 
-Try `imd_change const_k=10000 max_pull_nm=0.3` and re-run.
+Try `imd_change const_k=10000 max_force_kj=2000` and re-run, or shorten
+`--timestep-ps`. The loop also self-halts when |U| exceeds `--energy-cutoff-kj`.
 
 ---
 
@@ -260,16 +300,19 @@ pymol_imd/
 ├── __init__.py        Re-exports setup_* / imd_*; sets PYTORCH_ENABLE_MPS_FALLBACK
 ├── cli.py             pymol_imd executable (argparse → pymol -d ...)
 ├── commands.py        PyMOL command surface (setup_*, imd_*)
+├── constants.py       Single source of truth: tunable defaults + fixed physical constants
 ├── imd.py             IMDSystem driver: CustomExternalForce + Qt timer + ONIOM hook
 ├── prep.py            RCSB fetch / Modeller.addHydrogens / AM1-BCC / prepared-PDB
 ├── backends/
 │   ├── base.py        Backend Protocol + SystemBundle dataclass
 │   ├── aa.py          Amber backend
 │   ├── cg.py          Martini 3 backend (vermouth + martini_openmm)
-│   └── mlmm.py        ONIOM ML/MM backend (UMA / ORB / MACE / AIMNet2)
+│   └── mlmm.py        ONIOM ML/MM backend (UMA / ORB / MACE / AIMNet2) + link atoms
 └── tests/
     ├── smoke.py        Headless AA + CG smoke
-    └── smoke_record.py Headless trajectory + force-CSV recording smoke
+    ├── smoke_mlmm.py   Headless ML/MM ONIOM delta regression (vs refs/*.npy)
+    ├── smoke_record.py Headless trajectory + force-CSV recording smoke
+    └── refs/           Pinned coordinates + reference ML/MM delta arrays
 ```
 
 ---
