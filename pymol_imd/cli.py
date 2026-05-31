@@ -625,6 +625,15 @@ def _main_serve(argv: list[str]) -> int:
     rc = _validate_mlmm_args(args)
     if rc:
         return rc
+    if args.const_k is not None or args.max_force_kj is not None:
+        # The pull force is computed client-side in socket mode, so these knobs
+        # are dead on the server. Warn instead of silently ignoring them.
+        print(
+            "pymol_imd serve: --const-k / --max-force-kj have NO effect in socket "
+            "mode (the pull force is computed client-side). Pass them to "
+            "`pymol_imd connect` / imd_connect instead.",
+            file=sys.stderr,
+        )
     _resolve_topology_dir(args, pdb_path)
     from .server import IMDServer
 

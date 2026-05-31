@@ -806,9 +806,13 @@ def imd_connect(
         PyMOL object whose atoms mirror the server topology. Defaults to the
         most recently loaded object.
     const_k, max_force_kj:
-        Client-side drag sensitivity (kJ/mol/nm) and per-atom |F| cap. Default
-        to the AA recommendation / global cap; tune if dragging feels too weak
-        or too strong (these are independent of the server's own knobs).
+        Client-side drag sensitivity (kJ/mol/nm) and per-atom |F| cap. When
+        omitted, ``const_k`` defaults to the per-backend recommendation (CG
+        10000, AA / ML-MM 50000 — CG is auto-detected from the ``BB`` bead
+        naming) so the pull feels identical to the same-process ``imd_setup_*``
+        path; ``max_force_kj`` defaults to the global cap. The force is computed
+        entirely client-side, so the server's own ``const_k`` (e.g.
+        ``serve --const-k``) has NO effect — set it here instead.
     """
     global _imd_client
     try:
@@ -846,7 +850,19 @@ def imd_connect(
         client.disconnect()
         return
 
-    ck = _as_float(const_k) if const_k is not None else constants.AA_RECOMMENDED_CONST_K
+    # The server's backend isn't carried over the IMD wire, so detect CG from
+    # its bead naming (BB backbone bead). Used for BOTH the default pull-force
+    # scale and the representation, so a connect with no const_k matches the
+    # same-process imd_setup_* default for that backend (CG beads want a smaller
+    # const_k than AA atoms: 10000 vs 50000; AA and ML-MM both use 50000, and
+    # ML-MM has no BB beads so it falls into the AA branch correctly).
+    backend_name = "cg" if cmd.count_atoms(f"({obj}) and name BB") > 0 else "aa"
+    default_const_k = (
+        constants.CG_RECOMMENDED_CONST_K
+        if backend_name == "cg"
+        else constants.AA_RECOMMENDED_CONST_K
+    )
+    ck = _as_float(const_k) if const_k is not None else default_const_k
     mf = _as_float(max_force_kj) if max_force_kj is not None else constants.DEFAULT_MAX_FORCE_KJ
     fi = (
         _as_int(frame_interval_ms)
@@ -857,10 +873,7 @@ def imd_connect(
     # Show the first frame right away, then start the streaming timer.
     pclient._display(frame.positions_ang)
     pclient._last_server_ang = frame.positions_ang
-    # Mirror the in-process setup view + 3-Button Editing. The server's backend
-    # isn't carried over IMD, so detect CG from its bead naming (BB backbone
-    # bead); everything else gets the atomistic cartoon + ligand-sticks view.
-    backend_name = "cg" if cmd.count_atoms(f"({obj}) and name BB") > 0 else "aa"
+    # Mirror the in-process setup view + 3-Button Editing (CG beads vs cartoon).
     _apply_imd_representation(cmd, obj, backend_name)
     pclient.start()
     _imd_client = pclient
