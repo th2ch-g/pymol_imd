@@ -158,11 +158,23 @@ The `connect` client must load the server's **prepared** PDB (the
 topology. Inside PyMOL the same is available as `imd_connect host, port` /
 `imd_disconnect`.
 
-`serve` / `local` accept every `--level` / backend / IMD flag from the table
-above (e.g. `--ml-selection` for `--level mlmm`, `--minimize`) plus server
-flags: `--host`, `--port`, `--rate` (MD steps per streamed frame),
-`--send-velocities`, `--send-forces`. Wire units follow the IMDv3 spec
-(angstrom, kJ/mol/angstrom, ps). Only IMDv3 is implemented (not VMD's IMDv2).
+`serve` accepts every `--level` / backend / IMD flag from the table above
+(e.g. `--ml-selection` for `--level mlmm`, `--minimize`) plus server flags:
+`--host`, `--port`, `--rate` (MD steps per streamed frame), `--send-velocities`,
+`--send-forces`. `local` takes only the launch flags (it is **not** a socket
+server, so it has no `--host/--port/--rate`). `connect` shares the setup view
+(cartoon for AA/ML-MM, colored spheres for CG — auto-detected) and 3-Button
+Editing, so Ctrl+left-drag pulls atoms just like in-process.
+
+**Smoothness**: the same-process path (`local`) is the smoothest — zero
+latency, memory-direct. Over a socket every frame and every drag makes a TCP
+round-trip, so motion is slightly less fluid. Lower the client tick to tune it
+(`imd_connect host, port, frame_interval_ms=4`; default 8 ms) or raise `--rate`
+on the server (fewer, larger-step frames). For normal local interactive work
+prefer `local`; reach for the socket only when compute must live elsewhere.
+
+Wire units follow the IMDv3 spec (angstrom, kJ/mol/angstrom, ps). Only IMDv3 is
+implemented (not VMD's older IMDv2).
 
 ---
 
