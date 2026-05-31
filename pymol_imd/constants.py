@@ -40,6 +40,16 @@ SUPPORTED_LINK_ATOM_METHODS = ("scaled", "fixed", "none")
 EV_PER_KJMOL = 96.48533212331  # 1 eV = 96.485... kJ/mol
 EV_PER_A_TO_KJ_PER_MOL_NM = EV_PER_KJMOL * 10.0
 
+# IMDv3 wire-unit bridge (FIXED — IMDv3 mandates these units on the socket).
+# IMDv3 lengths are angstrom and forces are kJ/(mol·angstrom); OpenMM uses nm
+# and kJ/(mol·nm). Kept as explicit named factors so the server/client
+# conversion at the socket boundary has a single source — the protocol module
+# itself stays unit-agnostic. Mirrors the EV_PER_A_TO_KJ_PER_MOL_NM pattern.
+NM_TO_ANGSTROM = 10.0  # nm -> angstrom (positions / box, server -> wire)
+ANGSTROM_TO_NM = 0.1  # angstrom -> nm (positions in / drag delta, client side)
+KJ_PER_NM_TO_KJ_PER_ANGSTROM = 0.1  # kJ/mol/nm -> kJ/mol/angstrom (forces out)
+KJ_PER_ANGSTROM_TO_KJ_PER_NM = 10.0  # kJ/mol/angstrom -> kJ/mol/nm (MDComm in)
+
 # Covalent radii in Angstrom for the Morokuma/Dapprich link-atom g-factor.
 # Source: standard chemistry references (Cordero 2008, condensed). Only the
 # elements seen at QM/MM boundaries in biomolecules are listed; unusual
@@ -151,3 +161,23 @@ DELTA_NOISE_NM = 1e-3
 CG_SPHERE_SCALE = 0.4
 CG_STICK_RADIUS = 0.25
 VIEW_ZOOM_BUFFER = 2.0
+
+# ---------------------------------------------------------------------------
+# IMDv3 socket protocol (optional client/server mode; default path unaffected)
+# ---------------------------------------------------------------------------
+# These back the `pymol_imd serve` / `imd_connect` / `pymol_imd local` surface.
+# Defaulting the host to loopback keeps the server local-only unless the user
+# opts into a routable address. Port 8888 is the IMDv3 community default.
+IMD_VERSION = 3  # protocol version announced in the handshake
+IMD_DEFAULT_HOST = "127.0.0.1"  # loopback; server binds here unless overridden
+IMD_DEFAULT_PORT = 8888  # IMDv3 default port
+IMD_GO_TIMEOUT_S = 1.0  # engine waits this long for the client Go after handshake
+IMD_CONNECT_TIMEOUT_S = 5.0  # client socket connect() timeout (s)
+IMD_ACCEPT_TIMEOUT_S = None  # server accept() timeout (None = block forever)
+IMD_DEFAULT_RATE = 1  # MD steps advanced per transmitted frame (>= 1)
+IMD_SEND_VELOCITIES = False  # include a velocities packet in each frame
+IMD_SEND_FORCES = False  # include a forces packet in each frame
+IMD_RECV_BUFSIZE = 65536  # transport recv() chunk size (bytes)
+IMD_CLIENT_FRAME_INTERVAL_MS = 8  # PyMOL client QTimer tick (ms); lower = smoother streaming
+IMD_CLIENT_POLL_TIMEOUT_S = 0.01  # client per-tick wait for the first frame header
+IMD_CLIENT_MAX_FRAMES_PER_TICK = 64  # cap frames drained per tick so the Qt loop never wedges

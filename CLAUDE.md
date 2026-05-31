@@ -46,12 +46,17 @@ pixi run pymol_imd input.pdb --level mlmm \
     --ml-selection "resi 30-50" --ml-charge 0 --ml-mult 1 --run   # ONIOM ML/MM (default: aimnet2)
 pixi run pymol_imd <pdb> --level <aa|cg|mlmm> --print-only   # show the underlying pymol -d command
 pixi run pymol <pdb> -d "from pymol_imd import *; imd_setup_aa <pdb>; imd_run"  # legacy interactive route
+# --- IMDv3 socket mode (optional): MD on a headless server, PyMOL as the client ---
+pixi run pymol_imd serve <pdb> --level aa --port 8888        # headless compute server (no PyMOL)
+pixi run pymol_imd connect <prepared.pdb> --port 8888        # PyMOL client -> (remote) server
+pixi run pymol_imd local <pdb> --level aa                    # one box: classic same-process QTimer (NO socket); = launch + run
 pixi run ruff-format
 pixi run ruff-lint
 pixi run r                        # format + lint
 pixi run smoke                    # headless AA + CG build/minimize/step + force-cap check
 pixi run smoke-mlmm               # ML/MM ONIOM delta regression vs tests/refs/*.npy (atol 1e-4)
 pixi run record-smoke             # trajectory (XTC/DCD/PDB) + force-CSV recording smoke
+pixi run smoke-socket             # IMDv3 server<->client localhost round-trip + protocol/units regression
 ```
 
 The `pymol_imd` CLI (`pymol_imd/cli.py`) is a thin wrapper: it builds a
@@ -80,6 +85,17 @@ The plugin is organized into separated layers (the earlier monolithic
 4. **Preparation utilities** (`pymol_imd/prep.py`): hydrogen completion (`Modeller.addHydrogens` only), ligand parameterization (AM1-BCC via AmberTools), CG mapping (martinize2), MM-region selection for ML/MM.
 5. **Constants** (`pymol_imd/constants.py`): single source of truth for tunable defaults (`DEFAULT_*` global, `AA_*`/`CG_*`/`MLMM_*` per-backend) and fixed physical constants (eV→kJ/mol, covalent radii, link-atom bond lengths). **Do not hardcode magic numbers inline** — add the default here and expose it via an `imd_setup_*` kwarg + CLI flag. Must stay import-light (no `pymol`/`openmm` imports) since `cli.py` imports it.
 
+### IMDv3 socket mode (optional)
+
+A second, opt-in run mode splits MD (OpenMM) from the viewer (PyMOL) across a TCP socket using the **IMDv3 protocol**, so the compute can live on a (possibly remote) machine while PyMOL stays local. The default same-process `QTimer` mode is unchanged. Four new modules sit alongside the layers above:
+
+- **Protocol** (`pymol_imd/protocol.py`): pure pack/unpack of the IMDv3 wire format — 8-byte **big-endian** headers (`int32 type` + `int32 dataslot`) + **native-endian** bodies, with a handshake endianness oracle. Stdlib + numpy only (no socket/openmm/pymol); unit-agnostic (NO unit conversion lives here).
+- **Transport** (`pymol_imd/transport.py`): `recv_exact` framing, `IMDConnection`, `bind_listen` / `accept_one` / `connect`. Stdlib `socket` only.
+- **Server** (`pymol_imd/server.py`): `IMDServer` wraps an `IMDSystem` and runs its own step loop. A **receiver thread** stages incoming MDComm forces into a lock-guarded buffer; the **step thread is the ONLY thread that touches OpenMM** (Context is not thread-safe), draining the buffer into the pull `CustomExternalForce` via `IMDSystem.set_pull_forces`, applying the ML/MM correction (`apply_mlmm_if_present`), stepping (`advance_openmm`), then streaming the frame. Recording is preserved.
+- **Client** (`pymol_imd/client.py`): `IMDClient` (headless protocol receiver) + `PyMOLIMDClient` (Qt-timer viewer: displays frames via `cmd.alter_state`, turns mouse drags into MDComm forces reusing `imd.compute_pull_forces` so the feel matches in-process).
+
+**Units**: the wire is IMDv3-fixed (length angstrom, force kJ/mol/angstrom, time ps). OpenMM is nm / kJ/mol/nm, so server/client convert at the OpenMM boundary using the named factors in `constants.py` (`NM_TO_ANGSTROM`, `KJ_PER_ANGSTROM_TO_KJ_PER_NM`, …) — `protocol.py` stays unit-free. **Atom order must match**: the server prints `IMD_READY port=<P> prepared=<path>`; the client MUST load that prepared PDB. CLI: `serve` (headless engine) + `connect` (PyMOL client) are the **split, cross-machine socket setup**; `local` is **NOT socket** — it is the classic same-process QTimer mode (`= launch + run`) in one command, so normal local interactive work never pays socket latency/backpressure. PyMOL commands: `imd_connect` / `imd_disconnect`. **Client freeze guard**: `PyMOLIMDClient._drain_to_latest` caps frames read per Qt tick (`IMD_CLIENT_MAX_FRAMES_PER_TICK`) — an unbounded drain wedges the Qt loop because the server streams a frame per step. The `smoke-socket` task is a headless localhost round-trip + protocol/unit/endianness + freeze-guard regression (no PyMOL, no VMD). Only IMDv3 is implemented (not VMD's older IMDv2).
+
 ### Critical design constraints
 
 - **Pull-force mechanism**: A single `CustomExternalForce("- fx*x - fy*y - fz*z")` with per-particle `(fx,fy,fz)` parameters is added to every System. Each frame, compare PyMOL coords vs OpenMM coords; deltas above `DELTA_NOISE_NM` become forces scaled by `const_k`, then the per-atom force magnitude is capped at `max_force_kj` (a |F| cap that replaced the old |delta| cap). This is the mechanism that lets the user drag atoms in the PyMOL window during MD.
@@ -99,4 +115,4 @@ The plugin is organized into separated layers (the earlier monolithic
 - All comments and docstrings in code: **English**.
 - User-facing messages (errors, prints) should be clear and actionable; on failures (e.g., missing hydrogens that can't be auto-completed), emit a single explicit error rather than silently continuing.
 - Debug / verify changes inside the plugin yourself (smoke-test with a small PDB) before reporting work as done; the user explicitly asked Claude to absorb debugging load.
-- Ask before adding a non-approved dependency, before making a non-trivial spec interpretation, and before changing the public command surface (`imd_setup_cg/imd_setup_aa/imd_setup_mlmm/imd_record/imd_minimize/imd_run/imd_stop/imd_change`).
+- Ask before adding a non-approved dependency, before making a non-trivial spec interpretation, and before changing the public command surface (`imd_setup_cg/imd_setup_aa/imd_setup_mlmm/imd_record/imd_minimize/imd_run/imd_stop/imd_change/imd_connect/imd_disconnect`).

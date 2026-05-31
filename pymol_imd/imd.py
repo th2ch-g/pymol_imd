@@ -34,6 +34,46 @@ logger = logging.getLogger(__name__)
 _EV_PER_A_TO_KJ_PER_MOL_NM = constants.EV_PER_A_TO_KJ_PER_MOL_NM
 
 
+def compute_pull_forces(
+    delta_nm: np.ndarray,
+    const_k: float,
+    max_force_kj: float,
+    noise_nm: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Turn a per-atom position delta (nm) into capped pull forces (kJ/mol/nm).
+
+    Shared by the in-process IMD path
+    (:meth:`IMDSystem._apply_pull_force_from_pymol`) and the socket client
+    (:mod:`pymol_imd.client`) so dragging feels numerically identical in both.
+    Pure / side-effect free.
+
+    Parameters
+    ----------
+    delta_nm:
+        ``(n_atoms, 3)`` array of ``target - current`` positions in nm.
+    const_k, max_force_kj, noise_nm:
+        Pull-force scale (kJ/mol/nm), per-atom |F| cap (kJ/mol/nm), and the
+        drag noise floor (nm) below which an atom counts as not dragged.
+
+    Returns
+    -------
+    (active_idx, forces):
+        ``active_idx`` are the atom indices whose |delta| crossed ``noise_nm``;
+        ``forces`` is the full ``(n_atoms, 3)`` array (kJ/mol/nm) with inactive
+        atoms zeroed and active ones scaled by ``const_k`` and magnitude-capped.
+    """
+    delta = np.array(delta_nm, dtype=float, copy=True)
+    atom_max = np.max(np.abs(delta), axis=1)
+    active_mask = atom_max >= noise_nm
+    delta[~active_mask] = 0.0
+    forces = delta * const_k
+    fmag = np.linalg.norm(forces, axis=1, keepdims=True)
+    safe_fmag = np.where(fmag > 0.0, fmag, 1.0)
+    forces = forces * (np.minimum(fmag, max_force_kj) / safe_fmag)
+    active_idx = np.where(active_mask)[0]
+    return active_idx, forces
+
+
 @dataclass
 class IMDConfig:
     # Field defaults are sourced from constants.py (single source of truth);
@@ -238,6 +278,35 @@ class IMDSystem:
             self._record_force_csv()
         self._frame_index += 1
         self._sync_positions_to_pymol()
+
+    def apply_mlmm_if_present(self) -> None:
+        """Apply the ONIOM ML/MM correction if this is an ML/MM bundle.
+
+        OpenMM-only (no PyMOL). The socket server calls this each frame before
+        stepping, mirroring the same-process ``step()`` order. No-op for the
+        AA / CG backends (``_mlmm_force`` is ``None``).
+        """
+        if self._mlmm_force is not None:
+            self._apply_mlmm_correction_force()
+
+    def advance_openmm(self) -> bool:
+        """Advance one frame WITHOUT any PyMOL interaction. Returns ``running``.
+
+        Server-side core of :meth:`step`: it steps ``nsteps_per_frame``, runs
+        the divergence guard, and writes the force CSV when recording. It does
+        NOT pull from PyMOL (the socket server injects MDComm forces into
+        ``_pull_force`` via :meth:`set_pull_forces`) and does NOT sync positions
+        to PyMOL (the socket client renders the received frame). ML/MM
+        correction is applied separately via :meth:`apply_mlmm_if_present` so
+        the server controls the inject -> correct -> step ordering.
+        """
+        self.simulation.step(self.config.nsteps_per_frame)
+        if self._diverged():
+            return False
+        if self._recording:
+            self._record_force_csv()
+        self._frame_index += 1
+        return self.running
 
     def _init_mlmm_cache(self) -> None:
         """Precompute per-frame-invariant ML/MM data once (Tier-1 lossless).
@@ -687,24 +756,30 @@ class IMDSystem:
 
         openmm_xyz = self._read_openmm_positions_nm()
         delta = pymol_xyz - openmm_xyz
-        atom_max = np.max(np.abs(delta), axis=1)
-        active_mask = atom_max >= self._DELTA_NOISE_NM
-        delta[~active_mask] = 0.0
+        active_idx, forces = compute_pull_forces(
+            delta, self.config.const_k, self.config.max_force_kj, self._DELTA_NOISE_NM
+        )
+        self.set_pull_forces(active_idx, forces)
 
-        # Apply the |F| cap directly on the per-atom force vector. Compared
-        # to the previous |delta| cap, this makes the upper bound an explicit
-        # function of force (in kJ/mol/nm) rather than an implicit one via
-        # const_k * |delta|, so users tuning max_force_kj see a predictable
-        # ceiling regardless of how const_k is set.
-        forces = delta * self.config.const_k
-        fmag = np.linalg.norm(forces, axis=1, keepdims=True)
-        safe_fmag = np.where(fmag > 0.0, fmag, 1.0)
-        forces = forces * (np.minimum(fmag, self.config.max_force_kj) / safe_fmag)
-        active_idx = np.where(active_mask)[0]
+        if active_idx.size:
+            # cap-free |F| the user requested — for the debug log only.
+            requested = np.linalg.norm(delta[active_idx] * self.config.const_k, axis=1)
+            logger.debug(
+                "pull: %d atoms dragged, |F|max requested=%.1f / cap=%.1f kJ/mol/nm",
+                int(active_idx.size),
+                float(np.max(requested)),
+                self.config.max_force_kj,
+            )
 
-        # Update only atoms that are active now OR were active last frame
-        # (so we zero them on release). Skips the O(n_atoms) hot loop —
-        # mouse drag normally touches ≤ a few dozen atoms.
+    def set_pull_forces(self, active_idx: np.ndarray, forces: np.ndarray) -> None:
+        """Write per-atom pull forces into the pull ``CustomExternalForce``.
+
+        ``forces`` is the full ``(n_atoms, 3)`` array; only ``active_idx`` rows
+        are applied. Atoms active last call but not now are zeroed (drag
+        release), so the hot loop touches only the few dozen dragged atoms
+        instead of all n_atoms. Calls ``updateParametersInContext`` once.
+        Shared by the PyMOL drag path and the socket MDComm path.
+        """
         to_zero = self._active_pull_idx_prev - set(active_idx.tolist())
         if active_idx.size or to_zero:
             for idx in active_idx:
@@ -719,14 +794,6 @@ class IMDSystem:
         # Cache for the force CSV writer (consumed by _record_force_csv).
         self._last_pull_active_idx = active_idx
         self._last_pull_forces = forces
-
-        if active_idx.size:
-            logger.debug(
-                "pull: %d atoms dragged, |F|max requested=%.1f / cap=%.1f kJ/mol/nm",
-                int(active_idx.size),
-                float(np.max(fmag)),
-                self.config.max_force_kj,
-            )
 
     # ------------------------------------------------------------ coord sync IO
     def _read_openmm_positions_nm(self) -> np.ndarray:

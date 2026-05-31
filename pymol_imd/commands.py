@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 from pathlib import Path
 
 from . import constants
 from .backends.aa import AABackend
 from .backends.cg import CGBackend
 from .backends.mlmm import MLMMBackend
+from .client import IMDClient, PyMOLIMDClient
 from .imd import IMDConfig, IMDSystem
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,10 @@ logger = logging.getLogger(__name__)
 _imd_system: IMDSystem | None = None
 _timer = None  # type: ignore[var-annotated]
 _timer_minimize = None  # type: ignore[var-annotated]
+# Socket client mode (imd_connect / imd_disconnect). Kept separate from
+# _imd_system (the in-process / server-side simulation) so the two modes never
+# alias each other.
+_imd_client: PyMOLIMDClient | None = None
 
 
 # --------------------------------------------------------------------- helpers
@@ -135,6 +141,36 @@ def _build_imd_kwargs(
     return kwargs
 
 
+def _apply_imd_representation(cmd, obj: str, backend_name: str) -> None:
+    """Backend-aware default representation + drop into 3-Button Editing.
+
+    Shared by the in-process setup path (:func:`_load_prepared_into_pymol`) and
+    the socket client (:func:`imd_connect`) so both render and drag the same:
+    AA / ML-MM get cartoon + ligand sticks, CG gets colored bead spheres.
+    """
+    if backend_name == "cg":
+        # Spheres for the beads + sticks for the bonds (CONECT comes from
+        # martinize2's cg.pdb directly so only chemical bonds are drawn).
+        cmd.show_as("spheres", obj)
+        cmd.show("sticks", obj)
+        cmd.set("sphere_scale", constants.CG_SPHERE_SCALE, obj)
+        cmd.set("stick_radius", constants.CG_STICK_RADIUS, obj)
+        # Martini bead types aren't standard elements, so PyMOL paints them
+        # with arbitrary fallback colors. Override: backbone skyblue, the rest
+        # (side-chain beads) yelloworange for a clean CG look.
+        cmd.color("skyblue", f"{obj} and name BB")
+        cmd.color("yelloworange", f"{obj} and not name BB")
+    else:  # aa, mlmm
+        cmd.show_as("cartoon", obj)
+        # Render any non-polymer atoms (ligands, ions left in) as sticks too.
+        cmd.show("sticks", f"{obj} and not polymer")
+    cmd.zoom(obj, buffer=constants.VIEW_ZOOM_BUFFER)
+    # Drop into Editing mode so the user can immediately grab atoms with
+    # Ctrl+left-drag and feed the pull-force mechanism without first toggling
+    # Mouse > 3-Button Editing from the menu.
+    cmd.config_mouse("three_button_editing")
+
+
 def _load_prepared_into_pymol(
     prepared_pdb_path: Path, base_name: str, *, backend_name: str = "aa"
 ) -> str:
@@ -160,28 +196,7 @@ def _load_prepared_into_pymol(
         candidate = f"{base_name}_imd_{suffix}"
     cmd.load(str(prepared_pdb_path), candidate)
 
-    # Backend-aware default representation. Users can always override later.
-    if backend_name == "cg":
-        # Spheres for the beads + sticks for the bonds (CONECT comes from
-        # martinize2's cg.pdb directly so only chemical bonds are drawn).
-        cmd.show_as("spheres", candidate)
-        cmd.show("sticks", candidate)
-        cmd.set("sphere_scale", constants.CG_SPHERE_SCALE, candidate)
-        cmd.set("stick_radius", constants.CG_STICK_RADIUS, candidate)
-        # Martini bead types aren't standard elements, so PyMOL paints them
-        # with arbitrary fallback colors. Override: backbone in skyblue, the
-        # rest (side-chain beads) in yelloworange for a clean CG look.
-        cmd.color("skyblue", f"{candidate} and name BB")
-        cmd.color("yelloworange", f"{candidate} and not name BB")
-    else:  # aa, mlmm
-        cmd.show_as("cartoon", candidate)
-        # Render any non-polymer atoms (ligands, ions left in) as sticks too.
-        cmd.show("sticks", f"{candidate} and not polymer")
-    cmd.zoom(candidate, buffer=constants.VIEW_ZOOM_BUFFER)
-    # Drop into Editing mode so the user can immediately grab atoms with
-    # Ctrl+left-drag and feed the pull-force mechanism without first
-    # toggling Mouse > 3-Button Editing from the menu.
-    cmd.config_mouse("three_button_editing")
+    _apply_imd_representation(cmd, candidate, backend_name)
     return candidate
 
 
@@ -748,6 +763,121 @@ def imd_change(
     print(f"imd_change: {cfg}")
 
 
+# ------------------------------------------------------------- socket client
+def _default_imd_object(cmd) -> str | None:
+    """Most recently loaded object (the usual target after loading a PDB)."""
+    objs = cmd.get_object_list()
+    return objs[-1] if objs else None
+
+
+def _await_first_frame(client, timeout: float = 5.0):
+    """Block briefly for the first coords frame so :func:`imd_connect` can
+    validate the atom count before starting the viewer timer."""
+    end = time.time() + timeout
+    while time.time() < end:
+        frame = client.poll_frame()
+        if frame is not None and frame.positions_ang is not None:
+            return frame
+        time.sleep(0.01)
+    return None
+
+
+def imd_connect(
+    host: str = constants.IMD_DEFAULT_HOST,
+    port: object = constants.IMD_DEFAULT_PORT,
+    object: str | None = None,
+    const_k: object | None = None,
+    max_force_kj: object | None = None,
+    frame_interval_ms: object | None = None,
+) -> None:
+    """Connect this PyMOL to a running IMDv3 server and stream interactively.
+
+    The MD runs on the server (e.g. ``pymol_imd serve ...``); this PyMOL
+    displays each frame and turns your mouse-drag into forces, so you grab
+    atoms exactly like the in-process mode. Load the server's PREPARED PDB
+    first (same atom order) — its path is printed by the server as
+    ``IMD_READY ... prepared=<path>``.
+
+    Parameters
+    ----------
+    host, port:
+        Server address. Defaults to 127.0.0.1:8888.
+    object:
+        PyMOL object whose atoms mirror the server topology. Defaults to the
+        most recently loaded object.
+    const_k, max_force_kj:
+        Client-side drag sensitivity (kJ/mol/nm) and per-atom |F| cap. Default
+        to the AA recommendation / global cap; tune if dragging feels too weak
+        or too strong (these are independent of the server's own knobs).
+    """
+    global _imd_client
+    try:
+        from pymol import cmd
+    except ImportError:
+        print("imd_connect: PyMOL not available")
+        return
+    if _imd_client is not None:
+        imd_disconnect()
+    cmd.set("retain_order", 1)
+    obj = object or _default_imd_object(cmd)
+    if obj is None:
+        print("imd_connect: no object loaded — load the server's prepared PDB first")
+        return
+
+    client = IMDClient(host, _as_int(port))
+    try:
+        client.connect()
+    except OSError as exc:
+        print(f"imd_connect: cannot reach {host}:{port} — {exc}")
+        return
+    frame = _await_first_frame(client)
+    if frame is None:
+        print(f"imd_connect: connected to {host}:{port} but no frame arrived")
+        client.disconnect()
+        return
+    n_server = frame.positions_ang.shape[0]
+    n_pymol = cmd.count_atoms(f"({obj})")
+    if n_pymol != n_server:
+        print(
+            f"imd_connect: atom mismatch — PyMOL object '{obj}' has {n_pymol} "
+            f"atoms but the server has {n_server}. Load the server's prepared "
+            f"PDB (printed as 'IMD_READY ... prepared=<path>')."
+        )
+        client.disconnect()
+        return
+
+    ck = _as_float(const_k) if const_k is not None else constants.AA_RECOMMENDED_CONST_K
+    mf = _as_float(max_force_kj) if max_force_kj is not None else constants.DEFAULT_MAX_FORCE_KJ
+    fi = (
+        _as_int(frame_interval_ms)
+        if frame_interval_ms is not None
+        else constants.IMD_CLIENT_FRAME_INTERVAL_MS
+    )
+    pclient = PyMOLIMDClient(client, obj, const_k=ck, max_force_kj=mf, frame_interval_ms=fi)
+    # Show the first frame right away, then start the streaming timer.
+    pclient._display(frame.positions_ang)
+    pclient._last_server_ang = frame.positions_ang
+    # Mirror the in-process setup view + 3-Button Editing. The server's backend
+    # isn't carried over IMD, so detect CG from its bead naming (BB backbone
+    # bead); everything else gets the atomistic cartoon + ligand-sticks view.
+    backend_name = "cg" if cmd.count_atoms(f"({obj}) and name BB") > 0 else "aa"
+    _apply_imd_representation(cmd, obj, backend_name)
+    pclient.start()
+    _imd_client = pclient
+    print(f"imd_connect: streaming from {host}:{port} on '{obj}' ({n_server} atoms)")
+
+
+def imd_disconnect() -> None:
+    """Stop the socket client viewer and disconnect from the server."""
+    global _imd_client
+    if _imd_client is None:
+        print("imd: no active socket client")
+        return
+    _imd_client.stop()
+    _imd_client = None
+    print("imd_disconnect: stopped")
+
+
 # ----------------------------------------------------------- pymol registration
 def _register() -> None:
     try:
@@ -763,6 +893,8 @@ def _register() -> None:
     cmd.extend("imd_run", imd_run)
     cmd.extend("imd_stop", imd_stop)
     cmd.extend("imd_change", imd_change)
+    cmd.extend("imd_connect", imd_connect)
+    cmd.extend("imd_disconnect", imd_disconnect)
 
 
 _register()

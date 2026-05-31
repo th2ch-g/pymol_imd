@@ -131,6 +131,41 @@ default in `pymol_imd/constants.py` (per-backend where noted).
 
 ---
 
+## IMDv3 socket mode (client / server)
+
+By default MD and the viewer run in one process. Optionally you can split them
+over a TCP socket using the **IMDv3 protocol**: run the MD on a (possibly
+remote) headless compute server and drive it from a local PyMOL — dragging
+atoms works exactly as in-process.
+
+```bash
+# Normal local work needs NO socket: `local` is the classic same-process mode
+# (= launch + run) in one command — the most robust path for interactive drag.
+pixi run pymol_imd local 1ubq.pdb --level aa
+
+# Split across machines with the socket. On the compute host (no PyMOL needed):
+pixi run pymol_imd serve 1ubq.pdb --level aa --port 8888
+#   -> prints  IMD_READY port=8888 prepared=<path>/1ubq_prepared.pdb
+
+# On your workstation, load that SAME prepared PDB and connect:
+pixi run pymol_imd connect <path>/1ubq_prepared.pdb --host <server> --port 8888
+```
+
+Only `serve` + `connect` use the socket (for splitting compute across
+machines); `local` runs everything in one process via the classic QTimer loop.
+The `connect` client must load the server's **prepared** PDB (the
+`prepared=<path>` from the `IMD_READY` line) so the atom order matches OpenMM's
+topology. Inside PyMOL the same is available as `imd_connect host, port` /
+`imd_disconnect`.
+
+`serve` / `local` accept every `--level` / backend / IMD flag from the table
+above (e.g. `--ml-selection` for `--level mlmm`, `--minimize`) plus server
+flags: `--host`, `--port`, `--rate` (MD steps per streamed frame),
+`--send-velocities`, `--send-forces`. Wire units follow the IMDv3 spec
+(angstrom, kJ/mol/angstrom, ps). Only IMDv3 is implemented (not VMD's IMDv2).
+
+---
+
 ## Use from inside PyMOL
 
 `pymol_imd` registers the same commands at the PyMOL prompt:
@@ -302,6 +337,10 @@ pymol_imd/
 ├── commands.py        PyMOL command surface (setup_*, imd_*)
 ├── constants.py       Single source of truth: tunable defaults + fixed physical constants
 ├── imd.py             IMDSystem driver: CustomExternalForce + Qt timer + ONIOM hook
+├── protocol.py        IMDv3 wire format: pack/unpack, header enum, endianness oracle
+├── transport.py       TCP framing: recv_exact, IMDConnection, bind/accept/connect
+├── server.py          IMDServer: headless OpenMM engine streaming IMDv3 frames
+├── client.py          IMDClient (headless) + PyMOLIMDClient (Qt-timer viewer)
 ├── prep.py            RCSB fetch / Modeller.addHydrogens / AM1-BCC / prepared-PDB
 ├── backends/
 │   ├── base.py        Backend Protocol + SystemBundle dataclass
@@ -312,6 +351,7 @@ pymol_imd/
     ├── smoke.py        Headless AA + CG smoke
     ├── smoke_mlmm.py   Headless ML/MM ONIOM delta regression (vs refs/*.npy)
     ├── smoke_record.py Headless trajectory + force-CSV recording smoke
+    ├── smoke_socket.py Headless IMDv3 server<->client round-trip + protocol regression
     └── refs/           Pinned coordinates + reference ML/MM delta arrays
 ```
 

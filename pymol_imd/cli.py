@@ -484,7 +484,216 @@ def _build_pymol_statement(
     return "; ".join(stmts)
 
 
+# --------------------------------------------------------------- socket modes
+# IMDConfig knobs that _collect_setup_kwargs may emit; everything else it
+# returns is a backend build_system kwarg. Used to split the two for the
+# headless serve / local path (build_system rejects IMDConfig-only knobs).
+_IMD_KNOB_KEYS = frozenset(
+    {
+        "temperature",
+        "nsteps_per_frame",
+        "const_k",
+        "mouse_force",
+        "integrator",
+        "timestep_ps",
+        "friction",
+        "pressure",
+        "max_force_kj",
+        "energy_cutoff_kj",
+        "frame_interval_ms",
+    }
+)
+
+
+def _backend_for_level(level: str):
+    if level == "aa":
+        from .backends.aa import AABackend
+
+        return AABackend()
+    if level == "cg":
+        from .backends.cg import CGBackend
+
+        return CGBackend()
+    from .backends.mlmm import MLMMBackend
+
+    return MLMMBackend()
+
+
+def _server_flag_parser() -> argparse.ArgumentParser:
+    """Server-only flags, split off (parse_known_args) before the shared setup
+    parser runs, so serve / local reuse every setup flag without redefining them."""
+    sp = argparse.ArgumentParser(add_help=False)
+    sp.add_argument("--host", default=constants.IMD_DEFAULT_HOST, metavar="ADDR")
+    # None here so each mode picks its own default: serve -> 8888 (fixed, so a
+    # remote client can target it), local -> 0 (ephemeral, avoids clashes).
+    sp.add_argument("--port", type=int, default=None, metavar="PORT")
+    sp.add_argument(
+        "--rate", type=int, default=None, metavar="N", help="MD steps per transmitted frame."
+    )
+    sp.add_argument("--send-velocities", action="store_true", help="Include velocities each frame.")
+    sp.add_argument("--send-forces", action="store_true", help="Include forces each frame.")
+    return sp
+
+
+def _build_connect_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="pymol_imd connect",
+        description="Launch PyMOL as an IMDv3 client of a running `pymol_imd serve`.",
+    )
+    p.add_argument("pdb", help="The server's PREPARED PDB (same atom order as the server).")
+    p.add_argument("--host", default=constants.IMD_DEFAULT_HOST, metavar="ADDR")
+    p.add_argument("--port", type=int, default=constants.IMD_DEFAULT_PORT, metavar="PORT")
+    p.add_argument("--object", default=None, metavar="NAME", help="PyMOL object name.")
+    p.add_argument("--const-k", type=float, default=None, metavar="K", help="Drag sensitivity.")
+    p.add_argument("--max-force-kj", type=float, default=None, metavar="F", help="Pull |F| cap.")
+    p.add_argument("--pymol", default=None, metavar="PATH", help="Path to the pymol executable.")
+    p.add_argument("--print-only", action="store_true", help="Print the PyMOL command and exit.")
+    return p
+
+
+def _validate_mlmm_args(args: argparse.Namespace) -> int | None:
+    """Mirror the up-front MLMM required-flag check used by the launch path."""
+    if args.level != "mlmm":
+        return None
+    missing = [
+        flag
+        for flag, val in (
+            ("--ml-selection", args.ml_selection),
+            ("--ml-charge", args.ml_charge),
+            ("--ml-mult", args.ml_mult),
+        )
+        if val is None
+    ]
+    if missing:
+        print(f"pymol_imd: --level mlmm requires {', '.join(missing)}.", file=sys.stderr)
+        return 2
+    return None
+
+
+def _run_minimize(imd, args: argparse.Namespace) -> None:
+    max_iter = args.min_max_iter or constants.DEFAULT_MIN_MAX_ITER_PER_CHUNK
+    chunks = args.min_max_chunks or constants.DEFAULT_MIN_MAX_CHUNKS
+    tol = args.min_tol_kj or constants.DEFAULT_MIN_ENERGY_TOL_KJ
+    for _ in range(chunks):
+        if imd.minimize_step(max_iterations=max_iter, tol_kj=tol):
+            break
+
+
+def _build_imd_system_headless(args: argparse.Namespace, pdb_path: Path):
+    """Build a backend SystemBundle + IMDSystem with no PyMOL (serve / local)."""
+    from . import commands
+    from .imd import IMDConfig, IMDSystem
+
+    setup_kwargs = _collect_setup_kwargs(args)
+    build_kwargs = {k: v for k, v in setup_kwargs.items() if k not in _IMD_KNOB_KEYS}
+    backend = _backend_for_level(args.level)
+    bundle = backend.build_system(pdb_path, **build_kwargs)
+    imd_knobs = commands._build_imd_kwargs(
+        backend,
+        temperature=args.temperature,
+        nsteps_per_frame=args.nsteps_per_frame,
+        const_k=args.const_k,
+        integrator=args.integrator,
+        timestep_ps=args.timestep_ps,
+        friction=args.friction,
+        pressure=args.pressure,
+        max_force_kj=args.max_force_kj,
+        energy_cutoff_kj=args.energy_cutoff_kj,
+        frame_interval_ms=args.frame_interval_ms,
+    )
+    return IMDSystem(bundle, IMDConfig(**imd_knobs)), bundle
+
+
+def _resolve_topology_dir(args: argparse.Namespace, pdb_path: Path) -> None:
+    if args.topology_dir is None:
+        args.topology_dir = str(Path.cwd() / f"{pdb_path.stem}_topology")
+
+
+def _connect_statement(prepared: str, host: str, port: int, obj: str, extra: dict) -> str:
+    kw = {"host": host, "port": port, "object": obj, **extra}
+    kw_str = ", ".join(f"{k}={v!r}" for k, v in kw.items())
+    return f"from pymol_imd import *; cmd.load({prepared!r}, {obj!r}); imd_connect({kw_str})"
+
+
+def _main_serve(argv: list[str]) -> int:
+    srv_args, rest = _server_flag_parser().parse_known_args(argv)
+    args = _build_parser().parse_args(rest)
+    pdb_path = Path(args.pdb).expanduser().resolve()
+    if not pdb_path.exists():
+        print(f"pymol_imd: PDB file not found: {pdb_path}", file=sys.stderr)
+        return 2
+    rc = _validate_mlmm_args(args)
+    if rc:
+        return rc
+    _resolve_topology_dir(args, pdb_path)
+    from .server import IMDServer
+
+    imd, _bundle = _build_imd_system_headless(args, pdb_path)
+    if args.minimize:
+        _run_minimize(imd, args)
+    port = srv_args.port if srv_args.port is not None else constants.IMD_DEFAULT_PORT
+    server = IMDServer(
+        imd,
+        host=srv_args.host,
+        port=port,
+        rate=srv_args.rate,
+        send_velocities=srv_args.send_velocities,
+        send_forces=srv_args.send_forces,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\npymol_imd serve: stopping")
+        server.request_stop()
+    return 0
+
+
+def _main_connect(argv: list[str]) -> int:
+    args = _build_connect_parser().parse_args(argv)
+    pdb_path = Path(args.pdb).expanduser().resolve()
+    if not pdb_path.exists():
+        print(f"pymol_imd: PDB file not found: {pdb_path}", file=sys.stderr)
+        return 2
+    pymol_bin = args.pymol or shutil.which("pymol")
+    if not pymol_bin:
+        print("pymol_imd: pymol executable not found in PATH.", file=sys.stderr)
+        return 127
+    obj = args.object or f"{pdb_path.stem}_imd"
+    extra: dict = {}
+    if args.const_k is not None:
+        extra["const_k"] = args.const_k
+    if args.max_force_kj is not None:
+        extra["max_force_kj"] = args.max_force_kj
+    statement = _connect_statement(str(pdb_path), args.host, args.port, obj, extra)
+    cmd = [pymol_bin, "-d", statement]
+    if args.print_only:
+        print(shlex.join(cmd))
+        return 0
+    return subprocess.run(cmd).returncode
+
+
+def _main_local(argv: list[str]) -> int:
+    # local == the classic SAME-PROCESS QTimer mode (NO socket): one command to
+    # launch PyMOL, set up the backend, and run interactively with mouse-drag
+    # pulling — exactly the mechanism that has always worked. The IMDv3 socket
+    # transport is only for serve/connect (splitting compute across machines),
+    # so `local` simply implies --run on the standard launch path. This keeps
+    # the local experience free of any socket latency / backpressure / freeze.
+    return _main_launch([*argv, "--run"])
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "serve":
+        return _main_serve(argv[1:])
+    if argv and argv[0] == "connect":
+        return _main_connect(argv[1:])
+    if argv and argv[0] == "local":
+        return _main_local(argv[1:])
+    return _main_launch(argv)
+
+
+def _main_launch(argv: list[str] | None) -> int:
     args = _build_parser().parse_args(argv)
 
     pdb_path = Path(args.pdb).expanduser().resolve()

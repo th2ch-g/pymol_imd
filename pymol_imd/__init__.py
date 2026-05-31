@@ -25,6 +25,8 @@ __version__ = "0.1.0"
 
 from .commands import (  # noqa: F401
     imd_change,
+    imd_connect,
+    imd_disconnect,
     imd_minimize,
     imd_record,
     imd_run,
@@ -43,6 +45,8 @@ __all__ = [
     "imd_run",
     "imd_stop",
     "imd_change",
+    "imd_connect",
+    "imd_disconnect",
 ]
 
 print(f"pymol_imd {__version__} loaded")
