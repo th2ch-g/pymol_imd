@@ -23,11 +23,11 @@ from pathlib import Path
 
 import openmm
 from openmm import unit
-from openmm.app import HBonds, NoCutoff
+from openmm.app import PME, HBonds, NoCutoff
 
 from .. import constants
 from ..prep import load_and_complete_hydrogens, write_prepared_pdb
-from .aa import FORCEFIELD_FILES
+from .aa import FORCEFIELD_FILES, _set_bounding_box
 from .base import SystemBundle
 
 logger = logging.getLogger(__name__)
@@ -542,7 +542,15 @@ def _resolve_ml_indices(
 # ----------------------------------------------------------------------------
 # MM subset for the ONIOM subtraction
 # ----------------------------------------------------------------------------
-def _build_subset_mm_system(full_topology, forcefield, ml_indices: tuple[int, ...]):
+def _build_subset_mm_system(
+    full_topology,
+    forcefield,
+    ml_indices: tuple[int, ...],
+    *,
+    pbc: bool = False,
+    box_vectors=None,
+    nonbonded_cutoff_nm: float = constants.MLMM_NONBONDED_CUTOFF_NM,
+):
     """Build an OpenMM System covering only the ML region for MM subtraction.
 
     The returned System reports the Amber MM forces on the ML region atoms;
@@ -550,6 +558,10 @@ def _build_subset_mm_system(full_topology, forcefield, ml_indices: tuple[int, ..
     the ONIOM correction. Bonds whose both ends lie in ``ml_indices`` are
     retained — cross-region 1-2/1-3/1-4 terms (the link-atom problem) are
     left as a future improvement.
+
+    The nonbonded treatment MUST match the full system so the ONIOM
+    subtraction ``E_MM(full) - E_MM(region)`` cancels consistently: PME with
+    the same ``box_vectors`` under PBC, NoCutoff in vacuo.
     """
     from openmm.app import Topology
 
@@ -582,12 +594,27 @@ def _build_subset_mm_system(full_topology, forcefield, ml_indices: tuple[int, ..
     # boundary residues of the ML region whose peptide partner sits in the
     # MM region. Without it, every boundary residue is rejected with
     # "set of externally bonded atoms is missing N C atoms".
-    sub_system = forcefield.createSystem(
-        sub_top,
-        nonbondedMethod=NoCutoff,
-        constraints=None,
-        ignoreExternalBonds=True,
-    )
+    #
+    # PME on an isolated ML fragment is an approximation inherent to
+    # ML/MM-under-PBC; the in-vacuo default (both terms NoCutoff) is the exact
+    # path and stays bitwise-unchanged.
+    if pbc:
+        if box_vectors is not None:
+            sub_top.setPeriodicBoxVectors(box_vectors)
+        sub_system = forcefield.createSystem(
+            sub_top,
+            nonbondedMethod=PME,
+            nonbondedCutoff=nonbonded_cutoff_nm * unit.nanometer,
+            constraints=None,
+            ignoreExternalBonds=True,
+        )
+    else:
+        sub_system = forcefield.createSystem(
+            sub_top,
+            nonbondedMethod=NoCutoff,
+            constraints=None,
+            ignoreExternalBonds=True,
+        )
     return sub_top, sub_system
 
 
@@ -613,6 +640,7 @@ class MLMMBackend:
         *,
         ligand_sdf: Path | None = None,
         pbc: bool = False,
+        box_padding_nm: float = constants.MLMM_BOX_PADDING_NM,
         ml_selection: str = constants.MLMM_DEFAULT_ML_SELECTION,
         ml_backend: str = constants.MLMM_DEFAULT_BACKEND,
         ml_device: str = constants.MLMM_DEFAULT_DEVICE,
@@ -637,7 +665,7 @@ class MLMMBackend:
                 f"Choose from {SUPPORTED_LINK_ATOM_METHODS}."
             )
 
-        from openmm.app import PME, ForceField
+        from openmm.app import ForceField
 
         forcefield = ForceField(*FORCEFIELD_FILES)
 
@@ -650,6 +678,11 @@ class MLMMBackend:
         modeller = load_and_complete_hydrogens(pdb_path, forcefield)
 
         nonbonded_method = PME if pbc else NoCutoff
+        if pbc:
+            # Switch NVT(vacuo) -> NPT under PBC: enclose the molecule in a
+            # bounding box so PME has periodic vectors (mirrors the AA backend).
+            # The IMD driver adds a MonteCarloBarostat when bundle.pbc is set.
+            _set_bounding_box(modeller, padding_nm=box_padding_nm)
         system = forcefield.createSystem(
             modeller.topology,
             nonbondedMethod=nonbonded_method,
@@ -708,8 +741,18 @@ class MLMMBackend:
             "spin": int(ml_mult) - 1,
         }
 
-        # MM subset for the ONIOM subtraction.
-        _, sub_system = _build_subset_mm_system(modeller.topology, forcefield, ml_indices)
+        # MM subset for the ONIOM subtraction. Under PBC it reuses the
+        # full-system box + PME so the subtracted E_MM(region) matches the
+        # PME treatment of E_MM(full).
+        box_vectors = modeller.topology.getPeriodicBoxVectors() if pbc else None
+        _, sub_system = _build_subset_mm_system(
+            modeller.topology,
+            forcefield,
+            ml_indices,
+            pbc=pbc,
+            box_vectors=box_vectors,
+            nonbonded_cutoff_nm=nonbonded_cutoff_nm,
+        )
         sub_integrator = openmm.VerletIntegrator(0.0 * unit.femtoseconds)
         sub_context = openmm.Context(sub_system, sub_integrator)
 

@@ -122,6 +122,7 @@ MLMM_RECOMMENDED_CONST_K = 50000.0  # same as AA (ML region is atomistic)
 MLMM_INTEGRATOR = "langevin"
 MLMM_TIMESTEP_PS = 0.0005  # 0.5 fs (ML region carries no H-bond constraints)
 MLMM_NONBONDED_CUTOFF_NM = 1.0
+MLMM_BOX_PADDING_NM = 1.0  # bounding-box slack when pbc=True (mirrors AA/CG)
 MLMM_DEFAULT_BACKEND = "aimnet2"  # smallest/fastest/login-free MLIP
 MLMM_DEFAULT_LINK_ATOM_METHOD = "scaled"  # Morokuma/Dapprich g-factor
 MLMM_DEFAULT_ML_SELECTION = "all"  # whole system (slow); users normally narrow it

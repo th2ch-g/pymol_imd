@@ -102,10 +102,26 @@ class AABackend:
 
 def _set_bounding_box(modeller: Modeller, *, padding_nm: float) -> None:
     """Set a cubic periodic box that encloses the molecule with ``padding_nm`` slack."""
+    from openmm import Vec3
+
     positions = modeller.positions.value_in_unit(unit.nanometer)
     xs = [p[0] for p in positions]
     ys = [p[1] for p in positions]
     zs = [p[2] for p in positions]
     side = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) + 2.0 * padding_nm
-    box = side * unit.nanometer
-    modeller.topology.setUnitCellDimensions((box, box, box))
+    # The unit must wrap the WHOLE triple: ``(Vec3, Vec3, Vec3) * nanometer``
+    # yields one Quantity(list-of-Vec3), which is what getPeriodicBoxVectors
+    # returns and what computeLengthsAndAngles strips on PDB write. Uniting each
+    # Vec3 separately (or passing scalar Quantities to setUnitCellDimensions)
+    # leaves the CRYST1 lengths as Quantity and crashes PDBFile.writeHeader's
+    # float formatting under pbc=True. (CG's _bounding_box_vectors unites each
+    # Vec3 separately but dodges this by copying martinize2's PDB, never writing
+    # one through PDBFile.)
+    modeller.topology.setPeriodicBoxVectors(
+        (
+            Vec3(side, 0.0, 0.0),
+            Vec3(0.0, side, 0.0),
+            Vec3(0.0, 0.0, side),
+        )
+        * unit.nanometer
+    )

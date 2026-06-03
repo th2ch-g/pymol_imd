@@ -140,7 +140,11 @@ def _build_imd_kwargs(
     if frame_interval_ms is not None:
         kwargs["frame_interval_ms"] = _as_int(frame_interval_ms)
     if drag_level is not None:
-        kwargs["drag_level"] = str(drag_level)
+        # Validate at the shared confluence so every imd_setup_* path rejects a
+        # bad level with one clear error, instead of silently degrading to
+        # chain/residue dragging inside IMDSystem (only "atom" is special-cased
+        # there, so any other string expands groups).
+        kwargs["drag_level"] = _validate_drag_level(str(drag_level))
     return kwargs
 
 
@@ -423,6 +427,7 @@ def imd_setup_mlmm(
     ml_charge: object = constants.MLMM_DEFAULT_CHARGE,
     ml_mult: object = constants.MLMM_DEFAULT_MULT,
     pbc: object = False,
+    box_padding_nm: object | None = None,
     temperature: object = None,
     nsteps_per_frame: object = None,
     const_k: object = None,
@@ -513,6 +518,8 @@ def imd_setup_mlmm(
     }
     if nonbonded_cutoff_nm is not None:
         mlmm_kwargs["nonbonded_cutoff_nm"] = _as_float(nonbonded_cutoff_nm)
+    if box_padding_nm is not None:
+        mlmm_kwargs["box_padding_nm"] = _as_float(box_padding_nm)
     bundle = backend.build_system(pdb_path, **mlmm_kwargs)
     obj_name = _load_prepared_into_pymol(
         bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
@@ -888,6 +895,13 @@ def imd_connect(
         return
     if _imd_client is not None:
         imd_disconnect()
+    # imd_connect bypasses _build_imd_kwargs, so validate drag_level here too
+    # (same single explicit error as the imd_setup_* path).
+    try:
+        drag_level = _validate_drag_level(str(drag_level))
+    except ValueError as exc:
+        print(f"imd_connect: {exc}")
+        return
     cmd.set("retain_order", 1)
     obj = object or _default_imd_object(cmd)
     if obj is None:

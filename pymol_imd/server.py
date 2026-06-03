@@ -259,6 +259,21 @@ class IMDServer:
             forces_nm = None if self._pending_forces_nm is None else self._pending_forces_nm.copy()
             self._pending_dirty = False
         active = np.asarray(idx, dtype=int) if idx is not None else np.empty(0, dtype=int)
+        # MDComm indices come from an untrusted socket; drop any outside
+        # [0, n_atoms) before scattering. An index >= n_atoms would raise an
+        # uncaught IndexError that unwinds the step thread and kills the whole
+        # server; a negative index would silently apply the force to the wrong
+        # atom via numpy's negative indexing.
+        if active.size:
+            valid = (active >= 0) & (active < self.imd.n_atoms)
+            if not valid.all():
+                logger.warning(
+                    "dropping %d out-of-range MDComm atom index(es) (n_atoms=%d)",
+                    int((~valid).sum()),
+                    self.imd.n_atoms,
+                )
+                active = active[valid]
+                forces_nm = forces_nm[valid]
         full = np.zeros((self.imd.n_atoms, 3), dtype=float)
         if active.size:
             full[active] = forces_nm

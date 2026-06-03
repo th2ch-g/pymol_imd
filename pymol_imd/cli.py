@@ -131,7 +131,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         metavar="NM",
         help=(
-            "Bounding-box padding (nm) when a periodic box is built (AA --pbc / CG). "
+            "Bounding-box padding (nm) when a periodic box is built (AA/MLMM --pbc; CG always). "
             f"Default {constants.AA_BOX_PADDING_NM:g}."
         ),
     )
@@ -359,9 +359,10 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
     """Pull non-default values from argparse into a setup_*-compatible dict.
 
     Keys must match the ``imd_setup_*`` parameter names exactly, because
-    ``_build_pymol_statement`` emits them verbatim as ``k=v``. Only flags every
-    backend accepts go in the common block; ``box_padding_nm`` is AA/CG-only
-    (MLMM never builds a box) so it lives in those branches.
+    ``_build_pymol_statement`` emits them verbatim as ``k=v``. Flags every
+    backend accepts (incl. ``box_padding_nm`` — each builds a box under
+    ``pbc``, and CG always) go in the common block; backend-specific ones
+    live in the per-level branches below.
     """
     kwargs: dict = {}
 
@@ -385,6 +386,7 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
         "energy_cutoff_kj",
         "frame_interval_ms",
         "nonbonded_cutoff_nm",
+        "box_padding_nm",
         "drag_level",
     ):
         val = getattr(args, src)
@@ -394,8 +396,6 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
     if args.level == "aa":
         if args.ligand_sdf:
             kwargs["ligand_sdf"] = _resolve_path(args.ligand_sdf)
-        if args.box_padding_nm is not None:
-            kwargs["box_padding_nm"] = args.box_padding_nm
         if args.ph is not None:
             kwargs["ph"] = args.ph
         if args.gaff_version is not None:
@@ -405,8 +405,6 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
             kwargs["ff"] = args.ff
         if args.no_elastic_network:
             kwargs["elastic_network"] = False
-        if args.box_padding_nm is not None:
-            kwargs["box_padding_nm"] = args.box_padding_nm
         if args.maxwarn is not None:
             kwargs["maxwarn"] = args.maxwarn
     elif args.level == "mlmm":

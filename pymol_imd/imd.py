@@ -281,6 +281,13 @@ class IMDSystem:
     def step(self) -> None:
         if self.config.mouse_force:
             self._apply_pull_force_from_pymol()
+        elif self._active_pull_idx_prev:
+            # mouse_force was just disabled mid-drag: clear the latched pull
+            # force so no phantom constant force lingers in the OpenMM context.
+            # Empty active_idx makes set_pull_forces zero exactly the
+            # previously-active atoms, then clears _active_pull_idx_prev so this
+            # runs only once per disable.
+            self.set_pull_forces(np.empty(0, dtype=int), np.zeros((self.n_atoms, 3)))
         if self._mlmm_force is not None:
             self._apply_mlmm_correction_force()
         self.simulation.step(self.config.nsteps_per_frame)  # trajectory reporter fires here
