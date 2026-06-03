@@ -285,10 +285,11 @@ def imd_setup_aa(
     box_padding_nm: object | None = None,
     ph: object | None = None,
     gaff_version: str | None = None,
+    implicit_solvent: str | None = None,
     drag_level: str = constants.DEFAULT_DRAG_LEVEL,
     work_dir: str | None = None,
 ) -> None:
-    """Set up an all-atom IMD simulation in vacuo (NVT) by default.
+    """Set up an all-atom IMD simulation with GBn2 implicit solvent (NVT) by default.
 
     Every knob left unset falls back to its single-source default: the
     per-backend recommendations (``const_k`` / ``integrator`` /
@@ -296,6 +297,10 @@ def imd_setup_aa(
     / ``AABackend.build_system`` (see ``constants.py``). ``integrator``
     defaults to ``langevin_middle`` (BAOAB) for a wider stability margin under
     user-injected pull forces.
+
+    ``implicit_solvent`` defaults to ``"auto"`` = GBn2 generalized-Born solvent
+    (NoCutoff). Pass ``implicit_solvent="none"`` for the old in-vacuo behavior;
+    ``pbc=True`` switches to explicit PME/NPT and disables GB.
     """
     global _imd_system, _timer, _timer_minimize
     pdb_path = Path(pdb_file)
@@ -315,6 +320,8 @@ def imd_setup_aa(
         aa_kwargs["ph"] = _as_float(ph)
     if gaff_version is not None:
         aa_kwargs["gaff_version"] = gaff_version
+    if implicit_solvent is not None:
+        aa_kwargs["implicit_solvent"] = str(implicit_solvent)
     bundle = backend.build_system(pdb_path, **aa_kwargs)
     obj_name = _load_prepared_into_pymol(
         bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name
@@ -443,10 +450,11 @@ def imd_setup_mlmm(
     timestep_ps: object = None,
     ml_compile: object = False,
     enable_cueq: object = False,
+    implicit_solvent: str | None = None,
     drag_level: str = constants.DEFAULT_DRAG_LEVEL,
     work_dir: str | None = None,
 ) -> None:
-    """Set up an ONIOM-style ML/MM IMD simulation.
+    """Set up an ONIOM-style ML/MM IMD simulation (GBn2 implicit solvent by default).
 
     Unset knobs fall back to single-source defaults: ``const_k`` /
     ``integrator`` / ``timestep_ps`` from ``MLMMBackend``; ``ml_backend`` /
@@ -488,6 +496,11 @@ def imd_setup_mlmm(
         cuequivariance packages via ``pixi run install-cueq``). Safe to leave
         off elsewhere — MACE logs it as disabled. Do not combine with
         ``ml_compile``.
+    implicit_solvent :
+        GB implicit-solvent model for the MM terms. Defaults to ``"auto"`` =
+        GBn2 (NoCutoff); ``"none"`` runs in vacuo. GB is applied to BOTH the
+        full system and the subtracted MM subset, so the ONIOM subtraction
+        stays consistent. ``pbc=True`` switches to PME/NPT and disables GB.
     """
     global _imd_system, _timer, _timer_minimize
     if ml_selection is None:
@@ -520,6 +533,8 @@ def imd_setup_mlmm(
         mlmm_kwargs["nonbonded_cutoff_nm"] = _as_float(nonbonded_cutoff_nm)
     if box_padding_nm is not None:
         mlmm_kwargs["box_padding_nm"] = _as_float(box_padding_nm)
+    if implicit_solvent is not None:
+        mlmm_kwargs["implicit_solvent"] = str(implicit_solvent)
     bundle = backend.build_system(pdb_path, **mlmm_kwargs)
     obj_name = _load_prepared_into_pymol(
         bundle.prepared_pdb_path, pdb_path.stem, backend_name=bundle.backend_name

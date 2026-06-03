@@ -652,6 +652,7 @@ class MLMMBackend:
         nonbonded_cutoff_nm: float = constants.MLMM_NONBONDED_CUTOFF_NM,
         constraints: str | None = None,
         link_atom_method: str = constants.MLMM_DEFAULT_LINK_ATOM_METHOD,
+        implicit_solvent: str = constants.MLMM_IMPLICIT_SOLVENT,
         work_dir: Path | None = None,
         **_: object,
     ) -> SystemBundle:
@@ -667,7 +668,13 @@ class MLMMBackend:
 
         from openmm.app import ForceField
 
-        forcefield = ForceField(*FORCEFIELD_FILES)
+        # GB implicit solvent (default) is appended to the shared ForceField, so
+        # BOTH the full system and the subtracted MM subset (which reuses this
+        # same object) carry GB -- the ONIOM subtraction E_MM(full) - E_MM(subset)
+        # stays consistent. Resolver yields None for vacuo / under pbc (PME path).
+        implicit_xml = constants.resolve_implicit_solvent(implicit_solvent, pbc=pbc)
+        ff_files = (*FORCEFIELD_FILES, implicit_xml) if implicit_xml else FORCEFIELD_FILES
+        forcefield = ForceField(*ff_files)
 
         if ligand_sdf is not None:
             raise NotImplementedError(

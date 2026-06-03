@@ -29,6 +29,7 @@ LINK_ATOM_METHODS = constants.SUPPORTED_LINK_ATOM_METHODS
 LEVELS = constants.SUPPORTED_LEVELS
 INTEGRATORS = constants.SUPPORTED_INTEGRATORS
 DRAG_LEVELS = constants.SUPPORTED_DRAG_LEVELS
+IMPLICIT_SOLVENT_MODELS = constants.SUPPORTED_IMPLICIT_SOLVENT_MODELS
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -124,6 +125,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Nonbonded cutoff (nm). Default: per-backend (AA/MLMM 1.0; CG 1.1, the "
             "Martini minimum)."
+        ),
+    )
+    common.add_argument(
+        "--implicit-solvent",
+        choices=IMPLICIT_SOLVENT_MODELS,
+        default=None,
+        metavar="MODEL",
+        help=(
+            f"Implicit-solvent (GB) model for AA / ML-MM. One of: {', '.join(IMPLICIT_SOLVENT_MODELS)}. "
+            "Default 'auto' = GBn2 in a non-periodic run, off under --pbc; 'none' = in-vacuo. "
+            "Not valid for --level cg (Martini has its own solvent treatment)."
         ),
     )
     common.add_argument(
@@ -400,6 +412,8 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
             kwargs["ph"] = args.ph
         if args.gaff_version is not None:
             kwargs["gaff_version"] = args.gaff_version
+        if args.implicit_solvent is not None:
+            kwargs["implicit_solvent"] = args.implicit_solvent
     elif args.level == "cg":
         if args.ff is not None:
             kwargs["ff"] = args.ff
@@ -423,6 +437,8 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
             kwargs["ml_compile"] = True
         if args.enable_cueq:
             kwargs["enable_cueq"] = True
+        if args.implicit_solvent is not None:
+            kwargs["implicit_solvent"] = args.implicit_solvent
     return kwargs
 
 
@@ -588,6 +604,31 @@ def _validate_mlmm_args(args: argparse.Namespace) -> int | None:
     return None
 
 
+def _validate_implicit_solvent_args(args: argparse.Namespace) -> int | None:
+    """Reject --implicit-solvent for CG and surface GB/pbc conflicts before launch.
+
+    The authoritative check is ``constants.resolve_implicit_solvent`` (it runs
+    again inside the backend at build time); this just turns it into a clean
+    pre-launch error for the AA / ML-MM launch + serve paths instead of an
+    in-PyMOL / in-server traceback.
+    """
+    if getattr(args, "implicit_solvent", None) is None:
+        return None
+    if args.level == "cg":
+        print(
+            "pymol_imd: --implicit-solvent is not valid for --level cg "
+            "(Martini has its own solvent treatment).",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        constants.resolve_implicit_solvent(args.implicit_solvent, pbc=bool(args.pbc))
+    except ValueError as exc:
+        print(f"pymol_imd: {exc}", file=sys.stderr)
+        return 2
+    return None
+
+
 def _run_minimize(imd, args: argparse.Namespace) -> None:
     # Use `is not None`, not `or`: an explicit 0 (uncapped iterations / disabled
     # early-convergence / zero chunks) is falsy, so `or` would silently swap it
@@ -650,6 +691,9 @@ def _main_serve(argv: list[str]) -> int:
         print(f"pymol_imd: PDB file not found: {pdb_path}", file=sys.stderr)
         return 2
     rc = _validate_mlmm_args(args)
+    if rc:
+        return rc
+    rc = _validate_implicit_solvent_args(args)
     if rc:
         return rc
     if args.const_k is not None or args.max_force_kj is not None:
@@ -762,6 +806,10 @@ def _main_launch(argv: list[str] | None) -> int:
                 file=sys.stderr,
             )
             return 2
+
+    rc = _validate_implicit_solvent_args(args)
+    if rc:
+        return rc
 
     pymol_bin = args.pymol or shutil.which("pymol")
     if not pymol_bin:

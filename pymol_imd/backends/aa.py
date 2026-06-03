@@ -50,11 +50,16 @@ class AABackend:
         nonbonded_cutoff_nm: float = constants.AA_NONBONDED_CUTOFF_NM,
         gaff_version: str = constants.AA_GAFF_VERSION,
         ph: float = constants.AA_PH,
+        implicit_solvent: str = constants.AA_IMPLICIT_SOLVENT,
         work_dir: Path | None = None,
         **_: object,
     ) -> SystemBundle:
         pdb_path = Path(pdb_path)
-        forcefield = ForceField(*FORCEFIELD_FILES)
+        # GB implicit solvent (default) is selected by appending its XML to the
+        # ForceField file list; the resolver yields None for vacuo / under pbc.
+        implicit_xml = constants.resolve_implicit_solvent(implicit_solvent, pbc=pbc)
+        ff_files = (*FORCEFIELD_FILES, implicit_xml) if implicit_xml else FORCEFIELD_FILES
+        forcefield = ForceField(*ff_files)
 
         if ligand_sdf is not None:
             ligand = prepare_ligand_am1bcc(ligand_sdf)

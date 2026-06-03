@@ -21,6 +21,13 @@ Supported MLIP backends for `--level mlmm` (in order of "ready to use"):
 | [ORB](https://github.com/orbital-materials/orb-models) | no | no | ~100 MB | `atoms.info["spin"]` driven |
 | [UMA](https://huggingface.co/facebook/UMA) | no | **yes** | gated | Needs HF auth + `pixi run install-uma` |
 
+**Solvent:** `aa` and `mlmm` default to **GBn2 generalized-Born implicit solvent**
+(`NoCutoff`, NVT) — electrostatic screening without explicit waters or a box. Pass
+`--implicit-solvent none` for the old in-vacuo behavior, or `--pbc` for an explicit
+periodic box with PME/NPT (which disables GB). `cg` (Martini) keeps its own solvent
+treatment. For ML/MM the GB term is applied to both the full system and the
+subtracted MM region so the ONIOM energy stays consistent.
+
 ---
 
 ## Install
@@ -52,6 +59,17 @@ kept out of the default lock because:
 ```bash
 pixi run install-orb        # orb-models
 pixi run install-uma        # fairchem-core; UMA also needs `huggingface-cli login`
+```
+
+### CUDA acceleration (Linux + NVIDIA)
+
+A separate `gpu` environment resolves a CUDA torch build — the single biggest
+ML/MM speedup (10-100x vs CPU). The default env stays CPU-only and unaffected.
+
+```bash
+pixi install -e gpu
+pixi run -e gpu pymol_imd input.pdb --level mlmm \
+    --ml-selection "resi 30-50" --ml-charge 0 --ml-mult 1 --run
 ```
 
 ---
@@ -88,9 +106,11 @@ default in `pymol_imd/constants.py` (per-backend where noted).
 | Flag | Levels | Description |
 |---|---|---|
 | `--level {aa,cg,mlmm}` | all | Simulation backend (default: `aa`) |
-| `--pbc` | all | Enable periodic box / NPT (default: NVT vacuum, CG auto-boxes) |
+| `--pbc` | all | Enable periodic box / NPT. Without it (default): AA/MLMM use GBn2 implicit solvent, CG auto-boxes — all NVT |
+| `--implicit-solvent {auto,none,gbn2,obc2,obc1,gbn,hct}` | `aa`, `mlmm` | GB implicit-solvent model. Default `auto` = GBn2 (off under `--pbc`); `none` = in-vacuo |
 | `--temperature K` | all | Langevin thermostat temperature (default 300) |
 | `--nsteps-per-frame N` | all | MD steps per GUI frame (default 1) |
+| `--drag-level {atom,residue,chain}` | all | Mouse-drag granularity; `residue`/`chain` grab and pull a whole residue/chain (default `atom`) |
 | `--const-k K` | all | Pull-force scale (kJ/mol/nm); default per backend (AA/MLMM 50000, CG 10000) |
 | `--max-force-kj F` | all | Per-atom \|F\| cap on the pull force (kJ/mol/nm, default 5000) |
 | `--integrator {langevin,langevin_middle}` | all | Langevin scheme; default per backend (AA `langevin_middle`, CG/MLMM `langevin`) |
@@ -189,6 +209,7 @@ PyMOL> imd_minimize             # converges on stable structure
 PyMOL> imd_record traj=traj.xtc, force_csv=forces.csv  # arm recording (optional)
 PyMOL> imd_run                  # production loop (recording starts here)
 PyMOL> imd_change const_k=20000 # hot-patch on the fly
+PyMOL> imd_drag_level residue   # pull a whole residue/chain at once (atom|residue|chain)
 PyMOL> imd_stop                 # recording flushed + closed here
 ```
 
@@ -363,6 +384,7 @@ pymol_imd/
     ├── smoke.py        Headless AA + CG smoke
     ├── smoke_mlmm.py   Headless ML/MM ONIOM delta regression (vs refs/*.npy)
     ├── smoke_record.py Headless trajectory + force-CSV recording smoke
+    ├── smoke_drag.py   Headless drag-level (atom/residue/chain) group-expansion smoke
     ├── smoke_socket.py Headless IMDv3 server<->client round-trip + protocol regression
     └── refs/           Pinned coordinates + reference ML/MM delta arrays
 ```

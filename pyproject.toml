@@ -104,7 +104,10 @@ ruff-format = "ruff format --force-exclude"
 ruff-lint = "ruff check --fix --exit-non-zero-on-fix --force-exclude"
 r = { cmd = "echo OK", depends-on = ["ruff-format", "ruff-lint"] }
 smoke = "python -m pymol_imd.tests.smoke"
-smoke-mlmm = "python -m pymol_imd.tests.smoke_mlmm"
+# PYTHONUTF8=1: AIMNet2 reads its model-registry YAML with a plain open() (no
+# encoding=), which crashes under a non-UTF-8 subprocess locale (UnicodeDecodeError
+# on the em-dash in the registry). Force UTF-8 so the MLIP load is locale-robust.
+smoke-mlmm = { cmd = "python -m pymol_imd.tests.smoke_mlmm", env = { PYTHONUTF8 = "1" } }
 record-smoke = "python -m pymol_imd.tests.smoke_record"
 smoke-socket = "python -m pymol_imd.tests.smoke_socket"
 smoke-drag = "python -m pymol_imd.tests.smoke_drag"

@@ -70,11 +70,12 @@ def _run_backend(
     n_steps: int,
     integrator: str = "langevin",
     check_force_cap: bool = False,
+    build_kwargs: dict | None = None,
 ) -> None:
     from pymol_imd.imd import IMDConfig, IMDSystem
 
     log.info("[%s] Building system from %s", label, pdb_path)
-    bundle = backend.build_system(pdb_path)
+    bundle = backend.build_system(pdb_path, **(build_kwargs or {}))
     log.info(
         "[%s] System built: %d atoms (pbc=%s)", label, bundle.topology.getNumAtoms(), bundle.pbc
     )
@@ -133,23 +134,62 @@ def _run_pbc_build(backend, pdb_path: Path, *, label: str) -> None:
     log.info("[%s] pbc=True OK: box set, prepared PDB written, NPT barostat, steps", label)
 
 
+def _check_implicit_solvent_resolver() -> None:
+    """Headless unit check of the implicit-solvent knob resolution (no OpenMM)."""
+    from pymol_imd import constants as C
+
+    cases = [
+        (("auto", False), "implicit/gbn2.xml"),  # default -> GBn2 in a non-periodic run
+        (("auto", True), None),  # pbc wins: GB yields to PME
+        (("none", False), None),  # explicit vacuo
+        (("none", True), None),
+        (("obc2", False), "implicit/obc2.xml"),  # explicit model passthrough
+    ]
+    for (val, pbc), expected in cases:
+        got = C.resolve_implicit_solvent(val, pbc=pbc)
+        if got != expected:
+            raise AssertionError(
+                f"resolve_implicit_solvent({val!r}, pbc={pbc}) = {got!r}, expected {expected!r}"
+            )
+    # explicit GB + pbc (conflict) and an unknown model must both raise
+    for val, pbc in (("gbn2", True), ("bogus", False)):
+        try:
+            C.resolve_implicit_solvent(val, pbc=pbc)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"resolve_implicit_solvent({val!r}, pbc={pbc}) should have raised")
+    log.info("implicit-solvent resolver OK (auto/none/explicit/conflict)")
+
+
 def main(pdb_id: str = "1aki", n_steps: int = 10) -> int:
     from pymol_imd.backends.aa import AABackend
     from pymol_imd.backends.cg import CGBackend
     from pymol_imd.prep import fetch_pdb
 
+    _check_implicit_solvent_resolver()
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         pdb_path = fetch_pdb(pdb_id, out_dir=tmp_path)
         # AA runs with LangevinMiddleIntegrator (matches imd_setup_aa default) and
-        # also exercises the |F| cap path under a synthetic large delta.
+        # also exercises the |F| cap path under a synthetic large delta. The
+        # default now carries GBn2 implicit solvent (the new AA / ML-MM default).
         _run_backend(
             AABackend(),
             pdb_path,
-            label="AA",
+            label="AA(GBn2-default)",
             n_steps=n_steps,
             integrator="langevin_middle",
             check_force_cap=True,
+        )
+        # Vacuo opt-out: implicit_solvent="none" restores the old NoCutoff path.
+        _run_backend(
+            AABackend(),
+            pdb_path,
+            label="AA(vacuo)",
+            n_steps=n_steps,
+            integrator="langevin_middle",
+            build_kwargs={"implicit_solvent": "none"},
         )
         _run_backend(CGBackend(), pdb_path, label="CG", n_steps=n_steps, integrator="langevin")
         # pbc=True regression: this path was uncovered and once crashed every

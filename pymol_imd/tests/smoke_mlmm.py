@@ -130,6 +130,63 @@ def _run_pbc_build(pdb_path: Path, *, backend: str, ml_selection: str) -> None:
     )
 
 
+def _run_gb_build(pdb_path: Path, *, backend: str, ml_selection: str) -> None:
+    """Build the MLMM (ONIOM) system with GBn2 implicit solvent (the new default)
+    and confirm BOTH MM terms carry a GB force and the per-frame ONIOM delta
+    stays finite across a few steps.
+
+    The numerical-regression run in :func:`main` pins ``implicit_solvent="none"``
+    so the saved vacuo refs stay bitwise-valid; GB Born radii are geometry- and
+    system-size dependent, so the GB path is checked for finiteness here rather
+    than pinned to a reference.
+    """
+    from openmm import CustomGBForce, GBSAOBCForce
+
+    from pymol_imd.backends.mlmm import MLMMBackend
+    from pymol_imd.imd import IMDConfig, IMDSystem
+
+    log.info("Building MLMM GBn2 (default implicit solvent) system (backend=%s)...", backend)
+    bundle = MLMMBackend().build_system(
+        pdb_path,
+        ml_selection=ml_selection,
+        ml_backend=backend,
+        ml_device="cpu",
+        ml_charge=0,
+        ml_mult=1,
+        implicit_solvent="gbn2",
+        work_dir=pdb_path.parent / "mlmm_gb",
+    )
+
+    def _has_gb(system) -> bool:
+        # gbn/gbn2 build a CustomGBForce; obc1/obc2/hct build a GBSAOBCForce.
+        return any(
+            isinstance(system.getForce(i), (CustomGBForce, GBSAOBCForce))
+            for i in range(system.getNumForces())
+        )
+
+    if not _has_gb(bundle.system):
+        raise AssertionError("GBn2 requested but the full system carries no GB force")
+    sub_system = bundle.extra["ml_subset_context"].getSystem()
+    if not _has_gb(sub_system):
+        raise AssertionError(
+            "GBn2 requested but the ONIOM MM subset carries no GB force "
+            "(E_MM(full) - E_MM(subset) would be inconsistent)"
+        )
+
+    cfg = IMDConfig(nsteps_per_frame=1, mouse_force=False, timestep_ps=0.0005)
+    imd = IMDSystem(bundle, cfg)
+    imd.simulation.minimizeEnergy(maxIterations=50)
+    imd.running = True
+    for i in range(3):
+        imd.step()
+        if not imd.running:
+            raise AssertionError(f"GBn2 run diverged at frame {i}")
+    delta = _compute_ml_delta(imd)
+    if not np.all(np.isfinite(delta)):
+        raise AssertionError("non-finite ML delta force with GBn2 implicit solvent")
+    log.info("MLMM GBn2 OK: GB force on full + MM subset, finite ONIOM delta across steps")
+
+
 def main(pdb_id: str = "1aki", backend: str = "aimnet2", ml_selection: str = "resi 1-3") -> int:
     from pymol_imd.backends.mlmm import MLMMBackend
     from pymol_imd.imd import IMDConfig, IMDSystem
@@ -145,6 +202,10 @@ def main(pdb_id: str = "1aki", backend: str = "aimnet2", ml_selection: str = "re
             ml_device="cpu",  # pin so the reference is machine-independent
             ml_charge=0,
             ml_mult=1,
+            # GBn2 is the new default; pin the numerical-regression run to vacuo so
+            # the saved refs (tests/refs/mlmm_<backend>_delta.npy) stay bitwise
+            # valid. The GB path is covered separately by _run_gb_build below.
+            implicit_solvent="none",
         )
         extra = bundle.extra or {}
         n_ml = len(extra.get("ml_indices", ()))
@@ -225,6 +286,8 @@ def main(pdb_id: str = "1aki", backend: str = "aimnet2", ml_selection: str = "re
         # (bounding box + PME MM-subset + NPT barostat) added in 6f1761b, which
         # the rest of the suite skipped. Reuses the same pdb + selection.
         _run_pbc_build(pdb_path, backend=backend, ml_selection=ml_selection)
+        # GBn2 implicit-solvent (the new default) build + step coverage.
+        _run_gb_build(pdb_path, backend=backend, ml_selection=ml_selection)
         log.info("Smoke MLMM OK (backend=%s)", backend)
     return 0
 

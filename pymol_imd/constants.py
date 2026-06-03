@@ -30,6 +30,11 @@ SUPPORTED_INTEGRATORS = ("langevin", "langevin_middle")
 SUPPORTED_ML_BACKENDS = ("uma", "orb", "mace", "aimnet2")
 SUPPORTED_LINK_ATOM_METHODS = ("scaled", "fixed", "none")
 SUPPORTED_DRAG_LEVELS = ("atom", "residue", "chain")
+# Implicit-solvent (GB) knob for AA / ML-MM. "auto" = GB on in a non-periodic
+# run (resolves to DEFAULT_IMPLICIT_SOLVENT_MODEL) and off under pbc; "none" =
+# in-vacuo; the rest pick a specific OpenMM GB model. CG (Martini) has its own
+# solvent treatment and does not expose this.
+SUPPORTED_IMPLICIT_SOLVENT_MODELS = ("auto", "none", "gbn2", "obc2", "obc1", "gbn", "hct")
 
 # ---------------------------------------------------------------------------
 # Physical constants (FIXED — never user-tunable)
@@ -107,6 +112,9 @@ AA_BOX_PADDING_NM = 1.0
 AA_GAFF_VERSION = "gaff-2.2.20"
 AA_PH = 7.4  # Modeller.addHydrogens protonation pH
 AA_PARTIAL_CHARGE_METHOD = "am1bcc"  # OpenFF charge model for GAFF ligands
+AA_IMPLICIT_SOLVENT = (
+    "auto"  # GB model knob: auto -> gbn2 (non-periodic) / none (vacuo) / explicit model
+)
 
 # CG (Martini)
 CG_RECOMMENDED_CONST_K = 10000.0
@@ -137,6 +145,64 @@ MLMM_AIMNET2_MODEL = "aimnet2"
 MLMM_UMA_MODEL = "uma-s-1p1"
 MLMM_UMA_TASK_NAME = "omol"
 MLMM_MACE_COMPILE_MODE = "default"  # torch.compile mode passed to MACECalculator
+MLMM_IMPLICIT_SOLVENT = "auto"  # GB model knob (same semantics as AA_IMPLICIT_SOLVENT)
+
+# ---------------------------------------------------------------------------
+# Implicit solvent (GB) mapping + resolver
+# ---------------------------------------------------------------------------
+# OpenMM selects the GB model via an implicit-solvent forcefield XML added to
+# the ForceField file list (the `createSystem(implicitSolvent=...)` kwarg is the
+# prmtop-only API and does NOT apply to the ForceField path). These five XMLs
+# ship inside OpenMM (openmm/app/data/implicit/). GBn2 is the modern Amber
+# recommendation, so it is what "auto" resolves to.
+DEFAULT_IMPLICIT_SOLVENT_MODEL = "gbn2"  # what "auto" resolves to in a non-periodic run
+IMPLICIT_SOLVENT_XML: dict[str, str] = {
+    "gbn2": "implicit/gbn2.xml",
+    "obc2": "implicit/obc2.xml",
+    "obc1": "implicit/obc1.xml",
+    "gbn": "implicit/gbn.xml",
+    "hct": "implicit/hct.xml",
+}
+
+
+def resolve_implicit_solvent(value: str, *, pbc: bool) -> str | None:
+    """Resolve the ``implicit_solvent`` knob to an OpenMM implicit-solvent XML
+    name, or ``None`` when no GB force should be added.
+
+    ``value`` is case-insensitive, one of ``SUPPORTED_IMPLICIT_SOLVENT_MODELS``:
+
+    * ``"auto"`` (default): GB on (``DEFAULT_IMPLICIT_SOLVENT_MODEL``) in a
+      non-periodic run; off under ``pbc=True`` (GB yields to the explicit PME
+      request rather than conflicting with it).
+    * ``"none"``: GB off (in-vacuo), regardless of ``pbc``.
+    * an explicit model (``"gbn2"`` / ``"obc2"`` / ...): that model, but raises
+      ``ValueError`` under ``pbc=True`` since GB needs NoCutoff while PME is
+      periodic — the two cannot coexist.
+
+    Returns the XML resource name (e.g. ``"implicit/gbn2.xml"``) or ``None``.
+    Kept here (not in ``prep.py``) so the import-light ``cli.py`` can reuse it
+    for pre-launch validation without pulling in OpenMM. Raises ``ValueError``
+    on an unknown model name or an explicit-GB-with-pbc conflict.
+    """
+    key = str(value).strip().lower()
+    if key not in SUPPORTED_IMPLICIT_SOLVENT_MODELS:
+        raise ValueError(
+            f"Unknown implicit_solvent {value!r}. Choose from {SUPPORTED_IMPLICIT_SOLVENT_MODELS}."
+        )
+    if key == "none":
+        return None
+    if key == "auto":
+        if pbc:
+            return None  # GB yields to an explicit periodic (PME) request
+        key = DEFAULT_IMPLICIT_SOLVENT_MODEL
+    elif pbc:
+        raise ValueError(
+            f"implicit_solvent={value!r} (GB) is incompatible with pbc=True: GB implicit "
+            "solvent requires a non-periodic NoCutoff system, while pbc=True uses PME. "
+            "Use implicit_solvent='none' under pbc, or drop pbc to keep GB."
+        )
+    return IMPLICIT_SOLVENT_XML[key]
+
 
 # ---------------------------------------------------------------------------
 # Minimize defaults
