@@ -60,6 +60,76 @@ def _compute_ml_delta(imd) -> np.ndarray:
     return out
 
 
+def _run_pbc_build(pdb_path: Path, *, backend: str, ml_selection: str) -> None:
+    """Build the MLMM (ONIOM) system with ``pbc=True`` and take a few NPT steps.
+
+    The numerical-regression run in :func:`main` is in vacuo; this covers the
+    MLMM ``pbc=True`` path it skips. 6f1761b added MLMM bounding-box + PME-subset
+    support and fixed a shared box-vector crash. Beyond the AA pbc checks (box
+    set, PBC System, prepared-PDB written, NPT barostat, no divergence) this also
+    asserts the ONIOM MM subset runs PME under PBC -- so ``E_MM(full) -
+    E_MM(region)`` stays consistent -- and that the per-frame ML correction
+    force stays finite across NPT steps.
+    """
+    from openmm import MonteCarloBarostat, NonbondedForce
+
+    from pymol_imd.backends.mlmm import MLMMBackend
+    from pymol_imd.imd import IMDConfig, IMDSystem
+
+    log.info("Building MLMM pbc=True system (backend=%s)...", backend)
+    bundle = MLMMBackend().build_system(
+        pdb_path,
+        ml_selection=ml_selection,
+        ml_backend=backend,
+        ml_device="cpu",
+        ml_charge=0,
+        ml_mult=1,
+        pbc=True,
+        work_dir=pdb_path.parent / "mlmm_pbc",
+    )
+    if bundle.topology.getPeriodicBoxVectors() is None:
+        raise AssertionError("pbc=True but no periodic box vectors set")
+    if not bundle.system.usesPeriodicBoundaryConditions():
+        raise AssertionError("pbc=True but System reports no PBC")
+    if not Path(bundle.prepared_pdb_path).exists():
+        raise AssertionError("prepared PDB not written under pbc=True")
+
+    # ONIOM-under-PBC core: the MM subset (the E_MM(region) term) MUST run PME
+    # with the same box as the full system, or the subtraction is inconsistent.
+    sub_system = bundle.extra["ml_subset_context"].getSystem()
+    sub_nb = next(
+        sub_system.getForce(i)
+        for i in range(sub_system.getNumForces())
+        if isinstance(sub_system.getForce(i), NonbondedForce)
+    )
+    if sub_nb.getNonbondedMethod() != NonbondedForce.PME:
+        raise AssertionError(
+            f"pbc=True but ONIOM MM subset uses method {sub_nb.getNonbondedMethod()}, not PME"
+        )
+
+    cfg = IMDConfig(nsteps_per_frame=1, mouse_force=False, timestep_ps=0.0005)
+    imd = IMDSystem(bundle, cfg)
+    has_barostat = any(
+        isinstance(bundle.system.getForce(i), MonteCarloBarostat)
+        for i in range(bundle.system.getNumForces())
+    )
+    if not has_barostat:
+        raise AssertionError("pbc=True but no MonteCarloBarostat (NPT) added")
+
+    imd.simulation.minimizeEnergy(maxIterations=50)
+    imd.running = True
+    for i in range(3):
+        imd.step()
+        if not imd.running:
+            raise AssertionError(f"pbc=True diverged at NPT frame {i}")
+    delta = _compute_ml_delta(imd)
+    if not np.all(np.isfinite(delta)):
+        raise AssertionError("non-finite ML delta force under pbc=True")
+    log.info(
+        "MLMM pbc=True OK: box set, PME subset, prepared PDB, NPT barostat, finite ONIOM delta"
+    )
+
+
 def main(pdb_id: str = "1aki", backend: str = "aimnet2", ml_selection: str = "resi 1-3") -> int:
     from pymol_imd.backends.mlmm import MLMMBackend
     from pymol_imd.imd import IMDConfig, IMDSystem
@@ -149,6 +219,12 @@ def main(pdb_id: str = "1aki", backend: str = "aimnet2", ml_selection: str = "re
         delta_after = _compute_ml_delta(imd)
         if not np.all(np.isfinite(delta_after)):
             raise AssertionError("non-finite ML delta force after stepping")
+
+        # --- pbc=True (NPT / PME bounding-box) regression --------------------
+        # The run above is in vacuo; this exercises the MLMM pbc=True path
+        # (bounding box + PME MM-subset + NPT barostat) added in 6f1761b, which
+        # the rest of the suite skipped. Reuses the same pdb + selection.
+        _run_pbc_build(pdb_path, backend=backend, ml_selection=ml_selection)
         log.info("Smoke MLMM OK (backend=%s)", backend)
     return 0
 
