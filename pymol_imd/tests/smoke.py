@@ -96,6 +96,43 @@ def _run_backend(
     log.info("[%s] OK", label)
 
 
+def _run_pbc_build(backend, pdb_path: Path, *, label: str) -> None:
+    """Build with ``pbc=True`` and take a couple of NPT steps.
+
+    Covers the ``pbc=True`` path the rest of the suite skips. A box-vector
+    format bug once crashed ``PDBFile.writeHeader`` here on every backend, so
+    this asserts the periodic box is set, the System uses PBC, the prepared PDB
+    was actually written (writeHeader survived), a ``MonteCarloBarostat`` was
+    added for NPT, and the system does not immediately diverge.
+    """
+    from openmm import MonteCarloBarostat
+
+    from pymol_imd.imd import IMDConfig, IMDSystem
+
+    log.info("[%s] Building pbc=True system...", label)
+    bundle = backend.build_system(pdb_path, pbc=True)
+    if bundle.topology.getPeriodicBoxVectors() is None:
+        raise AssertionError(f"[{label}] pbc=True but no periodic box vectors set")
+    if not bundle.system.usesPeriodicBoundaryConditions():
+        raise AssertionError(f"[{label}] pbc=True but System reports no PBC")
+    if not Path(bundle.prepared_pdb_path).exists():
+        raise AssertionError(f"[{label}] prepared PDB not written under pbc=True")
+
+    cfg = IMDConfig(nsteps_per_frame=1, mouse_force=False, integrator="langevin_middle")
+    imd = IMDSystem(bundle, cfg)
+    has_barostat = any(
+        isinstance(bundle.system.getForce(i), MonteCarloBarostat)
+        for i in range(bundle.system.getNumForces())
+    )
+    if not has_barostat:
+        raise AssertionError(f"[{label}] pbc=True but no MonteCarloBarostat (NPT) added")
+    imd.simulation.minimizeEnergy(maxIterations=50)
+    imd.simulation.step(2)
+    if imd._diverged():
+        raise AssertionError(f"[{label}] pbc=True diverged after 2 steps")
+    log.info("[%s] pbc=True OK: box set, prepared PDB written, NPT barostat, steps", label)
+
+
 def main(pdb_id: str = "1aki", n_steps: int = 10) -> int:
     from pymol_imd.backends.aa import AABackend
     from pymol_imd.backends.cg import CGBackend
@@ -115,6 +152,9 @@ def main(pdb_id: str = "1aki", n_steps: int = 10) -> int:
             check_force_cap=True,
         )
         _run_backend(CGBackend(), pdb_path, label="CG", n_steps=n_steps, integrator="langevin")
+        # pbc=True regression: this path was uncovered and once crashed every
+        # backend at prepared-PDB write. AA exercises it (CG always builds a box).
+        _run_pbc_build(AABackend(), pdb_path, label="AA-pbc")
         log.info("Smoke test OK")
     return 0
 

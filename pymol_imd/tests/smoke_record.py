@@ -92,6 +92,28 @@ def _check_pdb_footer(pdb_path: Path) -> None:
     log.info("PDB OK: END footer present")
 
 
+def _check_csv_steps_match_traj(
+    csv_path: Path, *, interval: int, nsteps_per_frame: int, n_frames: int
+) -> None:
+    """The CSV ``step`` values must equal the trajectory's frame steps.
+
+    Both the force CSV and the trajectory reporter gate on
+    ``currentStep % (interval * nsteps_per_frame) == 0``, so equal intervals
+    MUST select identical steps. Guards the bug where the CSV gated on the
+    per-run frame counter (reset by start_recording) while the trajectory gated
+    on cumulative ``currentStep``, making ``interval > 1`` sample different
+    frames.
+    """
+    with open(csv_path, newline="") as fh:
+        rows = list(csv.reader(fh))[1:]
+    csv_steps = sorted({int(r[1]) for r in rows})
+    report_interval = interval * nsteps_per_frame
+    expected = [report_interval * k for k in range(1, n_frames // interval + 1)]
+    if csv_steps != expected:
+        raise AssertionError(f"CSV steps {csv_steps} != expected trajectory steps {expected}")
+    log.info("CSV/traj step alignment OK (interval=%d): steps=%s", interval, csv_steps)
+
+
 def main(pdb_id: str = "1aki", n_steps: int = 6) -> int:
     from pymol_imd.backends.aa import AABackend
     from pymol_imd.prep import fetch_pdb
@@ -121,6 +143,22 @@ def main(pdb_id: str = "1aki", n_steps: int = 6) -> int:
         imd.stop_recording()
         _check_xtc(xtc, bundle, expected_frames=n_steps)
         log.info("Re-run OK: trajectory overwritten, not doubled")
+
+        # --- interval > 1: CSV and trajectory must sample the SAME steps ---
+        xtc2 = tmp_path / "traj_i2.xtc"
+        csv2 = tmp_path / "forces_i2.csv"
+        imd3 = _make_dragging_imd(bundle)
+        imd3.set_recording(
+            traj=str(xtc2), traj_interval=2, force_csv=str(csv2), force_csv_interval=2
+        )
+        imd3.start_recording()
+        for _ in range(n_steps):
+            imd3.step()
+        imd3.stop_recording()
+        _check_xtc(xtc2, bundle, expected_frames=n_steps // 2)
+        _check_csv_steps_match_traj(
+            csv2, interval=2, nsteps_per_frame=imd3.config.nsteps_per_frame, n_frames=n_steps
+        )
 
         # --- PDB footer close path ---
         pdb_traj = tmp_path / "traj.pdb"

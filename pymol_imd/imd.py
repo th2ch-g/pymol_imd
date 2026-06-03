@@ -729,12 +729,19 @@ class IMDSystem:
         """
         if self._force_csv_writer is None:
             return
-        if self._frame_index % self._force_csv_interval != 0:
+        # Gate on the cumulative MD step (mirrors the trajectory reporter's
+        # currentStep % (interval * nsteps_per_frame)), NOT the per-run GUI
+        # frame counter: equal force_csv_interval / traj_interval then sample
+        # the SAME frames, even across imd_stop -> imd_run cycles (currentStep
+        # is never reset, _frame_index is). The CSV `step` column is the join
+        # key to the trajectory; `frame` stays an advisory per-run ordinal.
+        report_interval = max(1, self._force_csv_interval * self.config.nsteps_per_frame)
+        step = self.simulation.currentStep
+        if step % report_interval != 0:
             return
         active = self._last_pull_active_idx
         if active.size == 0:
             return
-        step = self.simulation.currentStep
         time_ps = step * self.config.timestep_ps
         forces = self._last_pull_forces
         rows = []

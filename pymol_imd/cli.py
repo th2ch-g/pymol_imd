@@ -589,9 +589,18 @@ def _validate_mlmm_args(args: argparse.Namespace) -> int | None:
 
 
 def _run_minimize(imd, args: argparse.Namespace) -> None:
-    max_iter = args.min_max_iter or constants.DEFAULT_MIN_MAX_ITER_PER_CHUNK
-    chunks = args.min_max_chunks or constants.DEFAULT_MIN_MAX_CHUNKS
-    tol = args.min_tol_kj or constants.DEFAULT_MIN_ENERGY_TOL_KJ
+    # Use `is not None`, not `or`: an explicit 0 (uncapped iterations / disabled
+    # early-convergence / zero chunks) is falsy, so `or` would silently swap it
+    # for the default. Mirrors _collect_minimize_kwargs / imd_minimize.
+    max_iter = (
+        args.min_max_iter
+        if args.min_max_iter is not None
+        else constants.DEFAULT_MIN_MAX_ITER_PER_CHUNK
+    )
+    chunks = (
+        args.min_max_chunks if args.min_max_chunks is not None else constants.DEFAULT_MIN_MAX_CHUNKS
+    )
+    tol = args.min_tol_kj if args.min_tol_kj is not None else constants.DEFAULT_MIN_ENERGY_TOL_KJ
     for _ in range(chunks):
         if imd.minimize_step(max_iterations=max_iter, tol_kj=tol):
             break
