@@ -28,6 +28,7 @@ ML_BACKENDS = constants.SUPPORTED_ML_BACKENDS
 LINK_ATOM_METHODS = constants.SUPPORTED_LINK_ATOM_METHODS
 LEVELS = constants.SUPPORTED_LEVELS
 INTEGRATORS = constants.SUPPORTED_INTEGRATORS
+DRAG_LEVELS = constants.SUPPORTED_DRAG_LEVELS
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -136,6 +137,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     common.add_argument(
         "--no-mouse-force", action="store_true", help="Disable the user-pull mechanism."
+    )
+    common.add_argument(
+        "--drag-level",
+        choices=DRAG_LEVELS,
+        default=None,
+        metavar="LEVEL",
+        help=(
+            f"Mouse-drag granularity for 3-Button Editing: {' / '.join(DRAG_LEVELS)}. "
+            "Default: atom. residue / chain grab and pull a whole residue / chain at once."
+        ),
     )
     common.add_argument(
         "--minimize", action="store_true", help="Call imd_minimize() right after setup."
@@ -374,6 +385,7 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
         "energy_cutoff_kj",
         "frame_interval_ms",
         "nonbonded_cutoff_nm",
+        "drag_level",
     ):
         val = getattr(args, src)
         if val is not None:
@@ -501,6 +513,7 @@ _IMD_KNOB_KEYS = frozenset(
         "max_force_kj",
         "energy_cutoff_kj",
         "frame_interval_ms",
+        "drag_level",
     }
 )
 
@@ -546,6 +559,13 @@ def _build_connect_parser() -> argparse.ArgumentParser:
     p.add_argument("--object", default=None, metavar="NAME", help="PyMOL object name.")
     p.add_argument("--const-k", type=float, default=None, metavar="K", help="Drag sensitivity.")
     p.add_argument("--max-force-kj", type=float, default=None, metavar="F", help="Pull |F| cap.")
+    p.add_argument(
+        "--drag-level",
+        choices=constants.SUPPORTED_DRAG_LEVELS,
+        default=None,
+        metavar="LEVEL",
+        help="Mouse-drag granularity: atom / residue / chain (default atom).",
+    )
     p.add_argument("--pymol", default=None, metavar="PATH", help="Path to the pymol executable.")
     p.add_argument("--print-only", action="store_true", help="Print the PyMOL command and exit.")
     return p
@@ -673,6 +693,8 @@ def _main_connect(argv: list[str]) -> int:
         extra["const_k"] = args.const_k
     if args.max_force_kj is not None:
         extra["max_force_kj"] = args.max_force_kj
+    if args.drag_level is not None:
+        extra["drag_level"] = args.drag_level
     statement = _connect_statement(str(pdb_path), args.host, args.port, obj, extra)
     cmd = [pymol_bin, "-d", statement]
     if args.print_only:

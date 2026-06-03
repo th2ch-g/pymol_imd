@@ -29,6 +29,7 @@ SUPPORTED_LEVELS = ("aa", "cg", "mlmm")
 SUPPORTED_INTEGRATORS = ("langevin", "langevin_middle")
 SUPPORTED_ML_BACKENDS = ("uma", "orb", "mace", "aimnet2")
 SUPPORTED_LINK_ATOM_METHODS = ("scaled", "fixed", "none")
+SUPPORTED_DRAG_LEVELS = ("atom", "residue", "chain")
 
 # ---------------------------------------------------------------------------
 # Physical constants (FIXED — never user-tunable)
@@ -92,6 +93,7 @@ DEFAULT_INTEGRATOR = "langevin"  # "langevin" | "langevin_middle"; AA overrides
 DEFAULT_MAX_FORCE_KJ = 5000.0  # per-atom hard cap on pull-force magnitude (kJ/mol/nm)
 DEFAULT_ENERGY_CUTOFF_KJ = 1e9  # |U| above this halts the loop as diverged (kJ/mol)
 DEFAULT_FRAME_INTERVAL_MS = 1  # QTimer tick interval for the IMD / minimize loops (ms)
+DEFAULT_DRAG_LEVEL = "atom"  # mouse-drag granularity: atom | residue | chain
 
 # ---------------------------------------------------------------------------
 # Per-backend defaults

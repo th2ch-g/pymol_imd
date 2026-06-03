@@ -101,6 +101,12 @@ class IMDConfig:
     # QTimer tick interval (ms) for both the production and minimize loops.
     # Read at timer start(); changing it mid-run needs a stop/run cycle.
     frame_interval_ms: int = constants.DEFAULT_FRAME_INTERVAL_MS
+    # Mouse-drag granularity for 3-Button Editing (atom | residue | chain),
+    # applied by the PyMOL command layer via cmd.set("mouse_selection_mode", N).
+    # Stored here so imd_change / imd_drag_level can re-apply it live; the force
+    # path is unaffected — PyMOL moves the whole residue/chain at once and the
+    # existing per-atom delta turns that into a pull force on all those atoms.
+    drag_level: str = constants.DEFAULT_DRAG_LEVEL
 
 
 class IMDSystem:
@@ -187,6 +193,12 @@ class IMDSystem:
         self._bdy_local: dict[int, int] = {}
         self._init_mlmm_cache()
         self._warmup_mlmm()
+
+        # Per-atom group indices for the residue / chain drag levels. PyMOL's
+        # editing drag moves a covalent fragment (mouse_selection_mode does NOT
+        # affect it), so to drag a whole residue / chain we expand the pull
+        # ourselves using these maps. Built once — topology is fixed after setup.
+        self._atom_residue_idx, self._atom_chain_idx = self._build_group_indices()
 
     # ------------------------------------------------------------------ setup
     _PULL_FORCE_EXPR = "- fx*x - fy*y - fz*z"
@@ -759,6 +771,11 @@ class IMDSystem:
         active_idx, forces = compute_pull_forces(
             delta, self.config.const_k, self.config.max_force_kj, self._DELTA_NOISE_NM
         )
+        # Drag a whole residue / chain when requested: PyMOL only moves a
+        # covalent fragment under the mouse, so we propagate that pull to the
+        # rest of the group here (no-op for the default atom level).
+        if self.config.drag_level != "atom" and active_idx.size:
+            active_idx, forces = self._expand_drag_groups(active_idx, forces)
         self.set_pull_forces(active_idx, forces)
 
         if active_idx.size:
@@ -794,6 +811,46 @@ class IMDSystem:
         # Cache for the force CSV writer (consumed by _record_force_csv).
         self._last_pull_active_idx = active_idx
         self._last_pull_forces = forces
+
+    # --------------------------------------------------------- drag-level groups
+    def _build_group_indices(self) -> tuple[np.ndarray, np.ndarray]:
+        """Map each atom to its residue index and chain index (once at setup).
+
+        Used to expand a per-atom pull to a whole residue / chain when
+        ``drag_level`` is not ``"atom"``. OpenMM's ``residue.index`` and
+        ``chain.index`` are globally unique within the topology, so equal
+        indices reliably mark same-residue / same-chain membership.
+        """
+        residue_idx = np.empty(self.n_atoms, dtype=np.int64)
+        chain_idx = np.empty(self.n_atoms, dtype=np.int64)
+        for atom in self.bundle.topology.atoms():
+            residue_idx[atom.index] = atom.residue.index
+            chain_idx[atom.index] = atom.residue.chain.index
+        return residue_idx, chain_idx
+
+    def _expand_drag_groups(
+        self, active_idx: np.ndarray, forces: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Expand a per-atom pull to whole residues / chains.
+
+        PyMOL's 3-Button Editing drags a covalent fragment, not a residue or
+        chain (its ``mouse_selection_mode`` does not affect editing drag), so
+        ``drag_level`` is realized here: every atom of a touched residue / chain
+        receives the mean pull force of that group's dragged atoms, dragging the
+        whole group along. The per-atom |F| cap is already applied upstream in
+        :func:`compute_pull_forces`, so each member force stays bounded.
+        """
+        group_of = (
+            self._atom_residue_idx if self.config.drag_level == "residue" else self._atom_chain_idx
+        )
+        touched = np.unique(group_of[active_idx])
+        expanded = np.where(np.isin(group_of, touched))[0]
+        new_forces = forces.copy()
+        for g in touched:
+            members = expanded[group_of[expanded] == g]
+            dragged = active_idx[group_of[active_idx] == g]
+            new_forces[members] = forces[dragged].mean(axis=0)
+        return expanded, new_forces
 
     # ------------------------------------------------------------ coord sync IO
     def _read_openmm_positions_nm(self) -> np.ndarray:

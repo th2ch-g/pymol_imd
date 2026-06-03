@@ -108,6 +108,7 @@ def _build_imd_kwargs(
     max_force_kj: object = None,
     energy_cutoff_kj: object = None,
     frame_interval_ms: object = None,
+    drag_level: object = None,
 ) -> dict:
     """Coerce the common IMD knobs into an ``IMDConfig`` kwargs dict.
 
@@ -138,7 +139,25 @@ def _build_imd_kwargs(
         kwargs["energy_cutoff_kj"] = _as_float(energy_cutoff_kj)
     if frame_interval_ms is not None:
         kwargs["frame_interval_ms"] = _as_int(frame_interval_ms)
+    if drag_level is not None:
+        kwargs["drag_level"] = str(drag_level)
     return kwargs
+
+
+def _validate_drag_level(drag_level: str) -> str:
+    """Validate a drag level (atom / residue / chain), returning it unchanged.
+
+    The pull is expanded to the whole residue / chain inside ``IMDSystem`` each
+    frame. PyMOL's own ``mouse_selection_mode`` does NOT affect 3-Button Editing
+    drag (Ctrl+drag moves a covalent fragment regardless), so nothing is set on
+    PyMOL here — this only guards the value flowing into ``IMDConfig`` and the
+    live ``imd_change`` / ``imd_drag_level`` commands.
+    """
+    if drag_level not in constants.SUPPORTED_DRAG_LEVELS:
+        raise ValueError(
+            f"Unknown drag_level {drag_level!r}. Choose from {constants.SUPPORTED_DRAG_LEVELS}."
+        )
+    return drag_level
 
 
 def _apply_imd_representation(cmd, obj: str, backend_name: str) -> None:
@@ -262,6 +281,7 @@ def imd_setup_aa(
     box_padding_nm: object | None = None,
     ph: object | None = None,
     gaff_version: str | None = None,
+    drag_level: str = constants.DEFAULT_DRAG_LEVEL,
     work_dir: str | None = None,
 ) -> None:
     """Set up an all-atom IMD simulation in vacuo (NVT) by default.
@@ -308,6 +328,7 @@ def imd_setup_aa(
         max_force_kj=max_force_kj,
         energy_cutoff_kj=energy_cutoff_kj,
         frame_interval_ms=frame_interval_ms,
+        drag_level=drag_level,
     )
     _imd_system = _make_imd(bundle, obj_name, **imd_kwargs)
     _timer = _make_qtimer()
@@ -334,6 +355,7 @@ def imd_setup_cg(
     nonbonded_cutoff_nm: object | None = None,
     box_padding_nm: object | None = None,
     maxwarn: object | None = None,
+    drag_level: str = constants.DEFAULT_DRAG_LEVEL,
     work_dir: str | None = None,
 ) -> None:
     """Set up a Martini CG IMD simulation via vermouth + martini_openmm.
@@ -382,6 +404,7 @@ def imd_setup_cg(
         max_force_kj=max_force_kj,
         energy_cutoff_kj=energy_cutoff_kj,
         frame_interval_ms=frame_interval_ms,
+        drag_level=drag_level,
     )
     _imd_system = _make_imd(bundle, obj_name, **imd_kwargs)
     _timer = _make_qtimer()
@@ -415,6 +438,7 @@ def imd_setup_mlmm(
     timestep_ps: object = None,
     ml_compile: object = False,
     enable_cueq: object = False,
+    drag_level: str = constants.DEFAULT_DRAG_LEVEL,
     work_dir: str | None = None,
 ) -> None:
     """Set up an ONIOM-style ML/MM IMD simulation.
@@ -508,6 +532,7 @@ def imd_setup_mlmm(
         max_force_kj=max_force_kj,
         energy_cutoff_kj=energy_cutoff_kj,
         frame_interval_ms=frame_interval_ms,
+        drag_level=drag_level,
     )
     _imd_system = _make_imd(bundle, obj_name, **imd_kwargs)
     _timer = _make_qtimer()
@@ -726,12 +751,14 @@ def imd_change(
     temperature: object | None = None,
     max_force_kj: object | None = None,
     energy_cutoff_kj: object | None = None,
+    drag_level: object | None = None,
 ) -> None:
     """Hot-patch IMD parameters without rebuilding the system.
 
     Updatable in place: ``const_k``, ``mouse_force``, ``nsteps_per_frame``,
     ``temperature`` (live Langevin integrator update), ``max_force_kj``,
-    ``energy_cutoff_kj``. Other ``IMDConfig`` fields (``friction``,
+    ``energy_cutoff_kj``, ``drag_level`` (atom / residue / chain, applied live).
+    Other ``IMDConfig`` fields (``friction``,
     ``timestep_ps``, ``pressure``, ``integrator``) need a fresh ``setup_*``
     because they require rebuilding the integrator or the barostat;
     ``frame_interval_ms`` needs a stop/run cycle (it is read at timer start).
@@ -760,7 +787,45 @@ def imd_change(
         cfg.max_force_kj = _as_float(max_force_kj)
     if energy_cutoff_kj is not None:
         cfg.energy_cutoff_kj = _as_float(energy_cutoff_kj)
+    if drag_level is not None:
+        # Applied live: IMDSystem reads cfg.drag_level each frame and expands the
+        # pull to the whole residue / chain. No PyMOL call needed — its editing
+        # drag ignores mouse_selection_mode.
+        level = str(drag_level)
+        if level not in constants.SUPPORTED_DRAG_LEVELS:
+            print(
+                f"imd_change: unknown drag_level {level!r}; "
+                f"choose from {constants.SUPPORTED_DRAG_LEVELS}"
+            )
+        else:
+            cfg.drag_level = level
     print(f"imd_change: {cfg}")
+
+
+def imd_drag_level(level: str = constants.DEFAULT_DRAG_LEVEL) -> None:
+    """Switch the mouse-drag granularity live: atom | residue | chain.
+
+    Takes effect on the next frame: ``IMDSystem`` (or the socket client) expands
+    each pull to the whole residue / chain of the dragged atoms. PyMOL's editing
+    drag only moves a covalent fragment and ignores ``mouse_selection_mode``, so
+    the expansion is done plugin-side rather than via a PyMOL setting.
+    """
+    try:
+        level = _validate_drag_level(level)
+    except ValueError as exc:
+        print(f"imd_drag_level: {exc}")
+        return
+    applied = False
+    if _imd_system is not None:
+        _imd_system.config.drag_level = level
+        applied = True
+    if _imd_client is not None:
+        _imd_client.drag_level = level
+        applied = True
+    if not applied:
+        print("imd_drag_level: no system loaded — call imd_setup_* or imd_connect first")
+        return
+    print(f"imd_drag_level: drag granularity set to {level} (applies next frame)")
 
 
 # ------------------------------------------------------------- socket client
@@ -789,6 +854,7 @@ def imd_connect(
     const_k: object | None = None,
     max_force_kj: object | None = None,
     frame_interval_ms: object | None = None,
+    drag_level: str = constants.DEFAULT_DRAG_LEVEL,
 ) -> None:
     """Connect this PyMOL to a running IMDv3 server and stream interactively.
 
@@ -869,7 +935,9 @@ def imd_connect(
         if frame_interval_ms is not None
         else constants.IMD_CLIENT_FRAME_INTERVAL_MS
     )
-    pclient = PyMOLIMDClient(client, obj, const_k=ck, max_force_kj=mf, frame_interval_ms=fi)
+    pclient = PyMOLIMDClient(
+        client, obj, const_k=ck, max_force_kj=mf, frame_interval_ms=fi, drag_level=drag_level
+    )
     # Show the first frame right away, then start the streaming timer.
     pclient._display(frame.positions_ang)
     pclient._last_server_ang = frame.positions_ang
@@ -906,6 +974,7 @@ def _register() -> None:
     cmd.extend("imd_run", imd_run)
     cmd.extend("imd_stop", imd_stop)
     cmd.extend("imd_change", imd_change)
+    cmd.extend("imd_drag_level", imd_drag_level)
     cmd.extend("imd_connect", imd_connect)
     cmd.extend("imd_disconnect", imd_disconnect)
 

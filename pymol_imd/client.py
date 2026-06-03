@@ -191,6 +191,7 @@ class PyMOLIMDClient:
         max_force_kj: float,
         delta_noise_nm: float = constants.DELTA_NOISE_NM,
         frame_interval_ms: int = constants.IMD_CLIENT_FRAME_INTERVAL_MS,
+        drag_level: str = constants.DEFAULT_DRAG_LEVEL,
     ) -> None:
         self.client = client
         self.pymol_object = pymol_object
@@ -199,9 +200,15 @@ class PyMOLIMDClient:
         self.max_force_kj = max_force_kj
         self.delta_noise_nm = delta_noise_nm
         self.frame_interval_ms = frame_interval_ms
+        self.drag_level = drag_level
         self._timer = None
         self._last_server_ang: np.ndarray | None = None
         self._active_prev: set[int] = set()
+        # Per-atom residue / chain group ids read from the PyMOL object (lazily,
+        # cached per level), used to expand a per-atom pull to the whole residue
+        # / chain. Mirrors IMDSystem's in-process expansion so socket dragging
+        # feels the same. The client has no OpenMM topology, hence the readout.
+        self._group_ids: dict[str, np.ndarray] = {}
 
     def start(self) -> None:
         from pymol.Qt import QtCore
@@ -270,6 +277,10 @@ class PyMOLIMDClient:
         active_idx, forces_nm = compute_pull_forces(
             delta_nm, self.const_k, self.max_force_kj, self.delta_noise_nm
         )
+        # Expand to the whole residue / chain (same behavior as the in-process
+        # IMDSystem); no-op for the default atom level.
+        if self.drag_level != "atom" and active_idx.size:
+            active_idx, forces_nm = self._expand_drag_groups(active_idx, forces_nm, len(coords))
         active_set = set(active_idx.tolist())
         if active_idx.size or self._active_prev:
             # n=0 MDComm (no active atoms) tells the server to release: it
@@ -281,3 +292,51 @@ class PyMOLIMDClient:
                 self.stop()
                 return
         self._active_prev = active_set
+
+    def _group_of(self, level: str, n_atoms: int) -> np.ndarray | None:
+        """Per-atom integer group id for residue / chain, read from PyMOL once.
+
+        Residues are keyed by ``(chain, resi)`` so identically-numbered residues
+        in different chains don't merge; chains by chain id. Cached per level.
+        Returns ``None`` if the readout count doesn't match (object mismatch),
+        in which case the caller falls back to the unexpanded per-atom pull.
+        """
+        cached = self._group_ids.get(level)
+        if cached is not None:
+            return cached
+        from pymol import cmd
+
+        rows: list[tuple[str, str]] = []
+        cmd.iterate(self.selector, "rows.append((chain, resi))", space={"rows": rows})
+        if len(rows) != n_atoms:
+            return None
+        keys = [c for c, _r in rows] if level == "chain" else [f"{c}/{r}" for c, r in rows]
+        lookup: dict[str, int] = {}
+        ids = np.empty(n_atoms, dtype=np.int64)
+        for i, key in enumerate(keys):
+            ids[i] = lookup.setdefault(key, len(lookup))
+        self._group_ids[level] = ids
+        return ids
+
+    def _expand_drag_groups(
+        self, active_idx: np.ndarray, forces_nm: np.ndarray, n_atoms: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Expand a per-atom pull to whole residues / chains (client side).
+
+        Mirrors :meth:`pymol_imd.imd.IMDSystem._expand_drag_groups` but reads
+        group membership from the PyMOL object (the client has no OpenMM
+        topology). Every atom of a touched residue / chain gets the mean pull
+        force of that group's dragged atoms. Falls back to the unexpanded pull
+        when the group readout is unavailable.
+        """
+        group_of = self._group_of(self.drag_level, n_atoms)
+        if group_of is None:
+            return active_idx, forces_nm
+        touched = np.unique(group_of[active_idx])
+        expanded = np.where(np.isin(group_of, touched))[0]
+        new_forces = forces_nm.copy()
+        for g in touched:
+            members = expanded[group_of[expanded] == g]
+            dragged = active_idx[group_of[active_idx] == g]
+            new_forces[members] = forces_nm[dragged].mean(axis=0)
+        return expanded, new_forces
