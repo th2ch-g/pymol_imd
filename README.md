@@ -36,8 +36,6 @@ Requires [pixi](https://pixi.sh). Native support: `linux-64`, `osx-arm64`.
 Intel Mac (`osx-64`) and Windows users should run via a Linux VM / WSL2.
 
 ```bash
-git clone <this-repo>
-cd pymol_imd
 pixi install   # covers AA + CG + ML-MM (AIMNet2 default + MACE) in one step
 ```
 
