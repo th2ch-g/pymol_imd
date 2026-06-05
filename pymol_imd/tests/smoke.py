@@ -95,6 +95,7 @@ def _run_backend(
     integrator: str = "langevin",
     check_force_limit: bool = False,
     build_kwargs: dict | None = None,
+    platform: str = "auto",
 ) -> None:
     from pymol_imd.imd import IMDConfig, IMDSystem
 
@@ -104,8 +105,18 @@ def _run_backend(
         "[%s] System built: %d atoms (pbc=%s)", label, bundle.topology.getNumAtoms(), bundle.pbc
     )
 
-    cfg = IMDConfig(nsteps_per_frame=1, mouse_force=False, integrator=integrator)
+    cfg = IMDConfig(nsteps_per_frame=1, mouse_force=False, integrator=integrator, platform=platform)
     imd = IMDSystem(bundle, cfg)
+    actual_platform = imd.simulation.context.getPlatform().getName()
+    log.info("[%s] OpenMM platform: %s", label, actual_platform)
+    if platform != "auto":
+        from pymol_imd import constants as C
+
+        expected = C.OPENMM_PLATFORM_NAMES[platform]
+        if actual_platform != expected:
+            raise AssertionError(
+                f"[{label}] platform={platform!r} but OpenMM used {actual_platform!r}"
+            )
     log.info("[%s] Integrator: %s", label, integrator)
     log.info("[%s] Minimizing...", label)
     imd.simulation.minimizeEnergy(maxIterations=200)
@@ -186,12 +197,37 @@ def _check_implicit_solvent_resolver() -> None:
     log.info("implicit-solvent resolver OK (auto/none/explicit/conflict)")
 
 
+def _check_platform_resolver() -> None:
+    """Headless unit check of the platform knob resolution (no OpenMM)."""
+    from pymol_imd import constants as C
+
+    cases = {
+        "auto": None,
+        "cpu": "CPU",
+        "cuda": "CUDA",
+        "opencl": "OpenCL",
+        "reference": "Reference",
+    }
+    for val, expected in cases.items():
+        got = C.resolve_platform_name(val)
+        if got != expected:
+            raise AssertionError(f"resolve_platform_name({val!r}) = {got!r}, expected {expected!r}")
+    try:
+        C.resolve_platform_name("bogus")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("resolve_platform_name('bogus') should have raised")
+    log.info("platform resolver OK (auto/cpu/cuda/opencl/reference/unknown)")
+
+
 def main(pdb_id: str = "1aki", n_steps: int = 10) -> int:
     from pymol_imd.backends.aa import AABackend
     from pymol_imd.backends.cg import CGBackend
     from pymol_imd.prep import fetch_pdb
 
     _check_implicit_solvent_resolver()
+    _check_platform_resolver()
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         pdb_path = fetch_pdb(pdb_id, out_dir=tmp_path)
@@ -205,6 +241,7 @@ def main(pdb_id: str = "1aki", n_steps: int = 10) -> int:
             n_steps=n_steps,
             integrator="langevin_middle",
             check_force_limit=True,
+            platform="cpu",  # also verifies the explicit-platform path resolves
         )
         # Vacuo opt-out: implicit_solvent="none" restores the old NoCutoff path.
         _run_backend(

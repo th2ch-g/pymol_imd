@@ -109,6 +109,7 @@ def _build_imd_kwargs(
     energy_cutoff_kj: object = None,
     frame_interval_ms: object = None,
     drag_level: object = None,
+    platform: object = None,
 ) -> dict:
     """Coerce the common IMD knobs into an ``IMDConfig`` kwargs dict.
 
@@ -145,6 +146,12 @@ def _build_imd_kwargs(
         # chain/residue dragging inside IMDSystem (only "atom" is special-cased
         # there, so any other string expands groups).
         kwargs["drag_level"] = _validate_drag_level(str(drag_level))
+    if platform is not None:
+        # Validate at the confluence (like drag_level) so a typo fails at setup,
+        # not mid-run in IMDSystem. Store the lowercase knob; IMDSystem maps it
+        # to OpenMM's Platform name via constants.resolve_platform_name.
+        constants.resolve_platform_name(str(platform))
+        kwargs["platform"] = str(platform)
     return kwargs
 
 
@@ -287,6 +294,7 @@ def imd_setup_aa(
     gaff_version: str | None = None,
     implicit_solvent: str | None = None,
     drag_level: str = constants.DEFAULT_DRAG_LEVEL,
+    platform: str = constants.DEFAULT_PLATFORM,
     work_dir: str | None = None,
 ) -> None:
     """Set up an all-atom IMD simulation with GBn2 implicit solvent (NVT) by default.
@@ -340,6 +348,7 @@ def imd_setup_aa(
         energy_cutoff_kj=energy_cutoff_kj,
         frame_interval_ms=frame_interval_ms,
         drag_level=drag_level,
+        platform=platform,
     )
     _imd_system = _make_imd(bundle, obj_name, **imd_kwargs)
     _timer = _make_qtimer()
@@ -367,6 +376,7 @@ def imd_setup_cg(
     box_padding_nm: object | None = None,
     maxwarn: object | None = None,
     drag_level: str = constants.DEFAULT_DRAG_LEVEL,
+    platform: str = constants.DEFAULT_PLATFORM,
     work_dir: str | None = None,
 ) -> None:
     """Set up a Martini CG IMD simulation via vermouth + martini_openmm.
@@ -416,6 +426,7 @@ def imd_setup_cg(
         energy_cutoff_kj=energy_cutoff_kj,
         frame_interval_ms=frame_interval_ms,
         drag_level=drag_level,
+        platform=platform,
     )
     _imd_system = _make_imd(bundle, obj_name, **imd_kwargs)
     _timer = _make_qtimer()
@@ -452,6 +463,7 @@ def imd_setup_mlmm(
     enable_cueq: object = False,
     implicit_solvent: str | None = None,
     drag_level: str = constants.DEFAULT_DRAG_LEVEL,
+    platform: str = constants.DEFAULT_PLATFORM,
     work_dir: str | None = None,
 ) -> None:
     """Set up an ONIOM-style ML/MM IMD simulation (GBn2 implicit solvent by default).
@@ -555,6 +567,7 @@ def imd_setup_mlmm(
         energy_cutoff_kj=energy_cutoff_kj,
         frame_interval_ms=frame_interval_ms,
         drag_level=drag_level,
+        platform=platform,
     )
     _imd_system = _make_imd(bundle, obj_name, **imd_kwargs)
     _timer = _make_qtimer()

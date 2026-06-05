@@ -21,7 +21,13 @@ from pathlib import Path
 
 import numpy as np
 import openmm
-from openmm import LangevinIntegrator, LangevinMiddleIntegrator, MonteCarloBarostat, unit
+from openmm import (
+    LangevinIntegrator,
+    LangevinMiddleIntegrator,
+    MonteCarloBarostat,
+    Platform,
+    unit,
+)
 from openmm.app import DCDReporter, PDBReporter, Simulation, XTCReporter
 
 from . import constants
@@ -121,6 +127,12 @@ class IMDConfig:
     # path is unaffected — PyMOL moves the whole residue/chain at once and the
     # existing per-atom delta turns that into a pull force on all those atoms.
     drag_level: str = constants.DEFAULT_DRAG_LEVEL
+    # OpenMM compute platform for the MM engine (all backends: AA / CG / ML-MM):
+    # "auto" lets OpenMM pick the fastest available (CUDA > OpenCL > CPU), or an
+    # explicit "cuda" / "opencl" / "cpu" / "reference". The ML/MM MLIP runs on a
+    # SEPARATE device (see ml_device / _auto_torch_device) — this knob does not
+    # affect it.
+    platform: str = constants.DEFAULT_PLATFORM
 
 
 class IMDSystem:
@@ -169,8 +181,13 @@ class IMDSystem:
             self.config.friction / unit.picosecond,
             self.config.timestep_ps * unit.picoseconds,
         )
-        self.simulation = Simulation(bundle.topology, bundle.system, integrator)
+        platform = self._resolve_platform()
+        if platform is not None:
+            self.simulation = Simulation(bundle.topology, bundle.system, integrator, platform)
+        else:
+            self.simulation = Simulation(bundle.topology, bundle.system, integrator)
         self.simulation.context.setPositions(bundle.positions)
+        logger.info("OpenMM platform: %s", self.simulation.context.getPlatform().getName())
         self.n_atoms = bundle.topology.getNumAtoms()
         self.running = False
         self._last_min_energy: float | None = None
@@ -303,6 +320,28 @@ class IMDSystem:
             if isinstance(system.getForce(i), MonteCarloBarostat):
                 return True
         return False
+
+    def _resolve_platform(self) -> openmm.Platform | None:
+        """Resolve the configured platform to an OpenMM ``Platform``, or None.
+
+        None means "let OpenMM auto-select the fastest available platform" (the
+        historical behavior). An explicit name OpenMM cannot provide raises a
+        clear error (listing what IS available) rather than silently falling
+        back, so a user's GPU request is never honored as CPU without notice.
+        """
+        name = constants.resolve_platform_name(self.config.platform)
+        if name is None:
+            return None
+        try:
+            return Platform.getPlatformByName(name)
+        except Exception as exc:
+            available = ", ".join(
+                Platform.getPlatform(i).getName() for i in range(Platform.getNumPlatforms())
+            )
+            raise RuntimeError(
+                f"OpenMM platform {name!r} is not available (have: {available}). "
+                f"Install a {name}-enabled OpenMM or use platform='auto'/'cpu'."
+            ) from exc
 
     # ----------------------------------------------------------------- stepping
     def step(self) -> None:

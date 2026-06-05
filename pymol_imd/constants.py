@@ -35,6 +35,9 @@ SUPPORTED_DRAG_LEVELS = ("atom", "residue", "chain")
 # in-vacuo; the rest pick a specific OpenMM GB model. CG (Martini) has its own
 # solvent treatment and does not expose this.
 SUPPORTED_IMPLICIT_SOLVENT_MODELS = ("auto", "none", "gbn2", "obc2", "obc1", "gbn", "hct")
+SUPPORTED_PLATFORMS = ("auto", "cuda", "opencl", "cpu", "reference")
+# Map the lowercase platform knob to OpenMM's case-sensitive Platform name.
+OPENMM_PLATFORM_NAMES = {"cuda": "CUDA", "opencl": "OpenCL", "cpu": "CPU", "reference": "Reference"}
 
 # ---------------------------------------------------------------------------
 # Physical constants (FIXED — never user-tunable)
@@ -109,6 +112,7 @@ DEFAULT_MAX_FORCE_KJ = 5000.0  # per-atom hard cap on pull-force magnitude (kJ/m
 DEFAULT_ENERGY_CUTOFF_KJ = 1e9  # |U| above this halts the loop as diverged (kJ/mol)
 DEFAULT_FRAME_INTERVAL_MS = 1  # QTimer tick interval for the IMD / minimize loops (ms)
 DEFAULT_DRAG_LEVEL = "atom"  # mouse-drag granularity: atom | residue | chain
+DEFAULT_PLATFORM = "auto"  # OpenMM platform: auto (fastest) | cuda | opencl | cpu | reference
 
 # ---------------------------------------------------------------------------
 # Per-backend defaults
@@ -173,6 +177,22 @@ IMPLICIT_SOLVENT_XML: dict[str, str] = {
     "gbn": "implicit/gbn.xml",
     "hct": "implicit/hct.xml",
 }
+
+
+def resolve_platform_name(value: str) -> str | None:
+    """Validate the platform knob; return OpenMM's case-sensitive Platform name.
+
+    ``None`` means "let OpenMM pick the fastest available platform" (the
+    historical default). ``value`` is case-insensitive. Kept here (not in
+    imd.py) so the import-light ``cli.py`` can validate it pre-launch without
+    importing OpenMM. Raises ``ValueError`` on an unknown name.
+    """
+    key = str(value).strip().lower()
+    if key == "auto":
+        return None
+    if key not in OPENMM_PLATFORM_NAMES:
+        raise ValueError(f"Unknown platform {value!r}. Choose from {SUPPORTED_PLATFORMS}.")
+    return OPENMM_PLATFORM_NAMES[key]
 
 
 def resolve_implicit_solvent(value: str, *, pbc: bool) -> str | None:

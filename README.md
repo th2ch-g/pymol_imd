@@ -112,6 +112,7 @@ default in `pymol_imd/constants.py` (per-backend where noted).
 | `--const-k K` | all | Pull-force scale (kJ/mol/nm); default per backend (AA/MLMM 50000, CG 10000) |
 | `--max-force-kj F` | all | Per-atom \|F\| cap on the pull force (kJ/mol/nm, default 5000) |
 | `--integrator {langevin,langevin_middle}` | all | Langevin scheme; default per backend (AA `langevin_middle`, CG/MLMM `langevin`) |
+| `--platform {auto,cuda,opencl,cpu,reference}` | all | OpenMM compute platform for the MM engine; `auto` (default) picks the fastest available (CUDA > OpenCL > CPU). Separate from ML/MM `--ml-device` |
 | `--timestep-ps PS` | all | MD timestep; default per backend (AA 0.002 / CG 0.020 / MLMM 0.0005) |
 | `--friction PER_PS` | all | Langevin friction 1/ps (default 1.0) |
 | `--pressure BAR` | all | Barostat pressure with `--pbc` (default 1.0) |

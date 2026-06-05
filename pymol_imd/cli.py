@@ -83,6 +83,17 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     common.add_argument(
+        "--platform",
+        choices=constants.SUPPORTED_PLATFORMS,
+        metavar="P",
+        help=(
+            f"OpenMM compute platform for the MM engine (all levels): "
+            f"{' / '.join(constants.SUPPORTED_PLATFORMS)}. Default auto (fastest "
+            "available; CUDA > OpenCL > CPU). The ML/MM MLIP device is separate "
+            "(--ml-device)."
+        ),
+    )
+    common.add_argument(
         "--timestep-ps",
         type=float,
         metavar="PS",
@@ -418,6 +429,7 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
         "nonbonded_cutoff_nm",
         "box_padding_nm",
         "drag_level",
+        "platform",
     ):
         val = getattr(args, src)
         if val is not None:
@@ -552,6 +564,7 @@ _IMD_KNOB_KEYS = frozenset(
         "energy_cutoff_kj",
         "frame_interval_ms",
         "drag_level",
+        "platform",
     }
 )
 
@@ -692,6 +705,7 @@ def _build_imd_system_headless(args: argparse.Namespace, pdb_path: Path):
         max_force_kj=args.max_force_kj,
         energy_cutoff_kj=args.energy_cutoff_kj,
         frame_interval_ms=args.frame_interval_ms,
+        platform=args.platform,
     )
     return IMDSystem(bundle, IMDConfig(**imd_knobs)), bundle
 
