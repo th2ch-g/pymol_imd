@@ -8,6 +8,8 @@ that expansion WITHOUT a PyMOL window, on a tiny synthetic topology
 
   * the drag-level constants are consistent and ``IMDConfig`` defaults to atom,
   * ``commands._validate_drag_level`` rejects unknown levels,
+  * ``compute_pull_forces`` applies sub-limit pulls and skips the WHOLE frame
+    (no force) when any dragged atom exceeds ``max_force_kj``,
   * ``IMDSystem._build_group_indices`` maps atoms to residue / chain correctly,
   * ``IMDSystem._expand_drag_groups`` expands a dragged atom to its whole
     residue / chain and copies the group's mean pull force to every member,
@@ -89,6 +91,43 @@ def _check_validate() -> None:
         raise AssertionError("expected ValueError for an invalid drag_level")
 
 
+def _check_force_limit() -> None:
+    """compute_pull_forces: sub-limit applies; any over-limit skips the frame."""
+    from pymol_imd.imd import compute_pull_forces
+
+    const_k = 10000.0
+    max_force_kj = 5000.0
+    noise = 1e-3
+
+    # (a) sub-limit drag applies normally: 0.1 nm * 10000 = 1000 < 5000.
+    delta = np.zeros((3, 3))
+    delta[1] = [0.1, 0.0, 0.0]
+    idx, forces, n_exceeded = compute_pull_forces(delta, const_k, max_force_kj, noise)
+    assert n_exceeded == 0, n_exceeded
+    assert idx.tolist() == [1], idx
+    assert np.allclose(forces[1], [1000.0, 0.0, 0.0]), forces[1]
+
+    # (b) one over-limit atom zeroes the WHOLE frame (whole-frame, not per-atom):
+    # 1.0 nm * 10000 = 10000 > 5000; the co-dragged sub-limit atom is dropped too.
+    delta2 = np.zeros((3, 3))
+    delta2[0] = [0.05, 0.0, 0.0]  # sub-limit (500), would normally be active
+    delta2[2] = [1.0, 0.0, 0.0]  # over-limit (10000)
+    idx2, forces2, n_exceeded2 = compute_pull_forces(delta2, const_k, max_force_kj, noise)
+    assert n_exceeded2 == 1, n_exceeded2
+    assert idx2.size == 0, idx2
+    assert np.allclose(forces2, 0.0), forces2
+
+    # (c) exactly at the limit is NOT over (strict >): 0.5 nm * 10000 = 5000.
+    delta3 = np.zeros((2, 3))
+    delta3[1] = [0.5, 0.0, 0.0]
+    idx3, forces3, n_exceeded3 = compute_pull_forces(delta3, const_k, max_force_kj, noise)
+    assert n_exceeded3 == 0, n_exceeded3
+    assert idx3.tolist() == [1], idx3
+    assert np.allclose(forces3[1], [5000.0, 0.0, 0.0]), forces3[1]
+
+    log.info("force-limit OK: sub-limit applies; over-limit skips whole frame; boundary ok")
+
+
 def _check_group_indices() -> None:
     imd = _toy_imd_system("atom")
     assert imd._atom_residue_idx.tolist() == [0, 0, 1, 1, 2, 2, 3, 3], imd._atom_residue_idx
@@ -149,6 +188,7 @@ def _check_expand_mean() -> None:
 def main() -> int:
     _check_constants()
     _check_validate()
+    _check_force_limit()
     _check_group_indices()
     _check_expand_single()
     _check_expand_multi()

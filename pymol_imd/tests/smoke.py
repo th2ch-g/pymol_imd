@@ -24,42 +24,66 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger("smoke")
 
 
-def _verify_force_cap(imd, *, label: str) -> None:
-    """Inject a fake 1 nm delta on atom 0 and confirm |F| is capped at max_force_kj.
+def _verify_force_limit(imd, *, label: str) -> None:
+    """Confirm an over-limit drag skips the whole frame; a sub-limit one applies.
 
-    With const_k=10000 and max_force_kj=5000 (defaults), nominal |F| = 10000
-    kJ/mol/nm and the cap should clamp it to 5000.
+    With const_k=10000 and max_force_kj=5000 (defaults), a 1 nm shove gives a
+    nominal |F| = 10000 kJ/mol/nm > the 5000 limit, so the whole frame's pull is
+    skipped and atom 0's force must be exactly 0 (the skip-and-warn behavior that
+    replaced the old clamp). A sub-limit shove is then applied to confirm a
+    within-limit pull still goes through, unclamped.
     """
-    nominal_fmag = 1.0 * imd.config.const_k  # delta=1 nm * const_k
     cap = imd.config.max_force_kj
-    if nominal_fmag <= cap:
+    over_fmag = 1.0 * imd.config.const_k  # delta=1 nm * const_k
+    if over_fmag <= cap:
         log.info(
-            "[%s] const_k=%.0f below cap=%.0f; cap check would be vacuous, skipping",
+            "[%s] const_k=%.0f keeps a 1 nm drag within limit=%.0f; skip check vacuous",
             label,
             imd.config.const_k,
             cap,
         )
         return
 
-    def _fake_pymol_positions() -> np.ndarray:
-        pos = imd._read_openmm_positions_nm().copy()
-        pos[0] = pos[0] + np.array([1.0, 0.0, 0.0])  # 1 nm shove on atom 0
-        return pos
+    def _shoved_positions(atom: int, dist_nm: float):
+        def _fake() -> np.ndarray:
+            pos = imd._read_openmm_positions_nm().copy()
+            pos[atom] = pos[atom] + np.array([dist_nm, 0.0, 0.0])
+            return pos
+
+        return _fake
+
+    def _atom0_fmag() -> float:
+        _, params = imd._pull_force.getParticleParameters(0)
+        return math.sqrt(sum(float(p) ** 2 for p in params))
 
     original = imd._read_pymol_positions_nm
-    imd._read_pymol_positions_nm = _fake_pymol_positions
     try:
+        # (1) Over-limit 1 nm shove -> whole frame skipped -> atom 0 force == 0.
+        imd._read_pymol_positions_nm = _shoved_positions(0, 1.0)
         imd._apply_pull_force_from_pymol()
+        fmag = _atom0_fmag()
+        if fmag > 1e-6:
+            raise AssertionError(
+                f"[{label}] over-limit drag not skipped: |F|={fmag:.2f} kJ/mol/nm, expected 0"
+            )
+
+        # (2) Sub-limit shove -> applied unclamped (no magnitude cap anymore).
+        sub_dist = 0.25 * cap / imd.config.const_k
+        expected = sub_dist * imd.config.const_k
+        imd._read_pymol_positions_nm = _shoved_positions(0, sub_dist)
+        imd._apply_pull_force_from_pymol()
+        fmag = _atom0_fmag()
+        if abs(fmag - expected) > 1.0:
+            raise AssertionError(
+                f"[{label}] sub-limit drag not applied: |F|={fmag:.2f}, expected {expected:.2f}"
+            )
     finally:
         imd._read_pymol_positions_nm = original
-
-    _, params = imd._pull_force.getParticleParameters(0)
-    fmag = math.sqrt(sum(float(p) ** 2 for p in params))
-    if abs(fmag - cap) > 1.0:
-        raise AssertionError(
-            f"[{label}] |F| cap not enforced: got {fmag:.2f} kJ/mol/nm, expected {cap:.2f}"
-        )
-    log.info("[%s] |F| cap OK: nominal=%.0f -> capped=%.1f kJ/mol/nm", label, nominal_fmag, fmag)
+    log.info(
+        "[%s] force-limit OK: over-limit (1 nm) skipped -> 0; sub-limit applied -> %.1f kJ/mol/nm",
+        label,
+        fmag,
+    )
 
 
 def _run_backend(
@@ -69,7 +93,7 @@ def _run_backend(
     label: str,
     n_steps: int,
     integrator: str = "langevin",
-    check_force_cap: bool = False,
+    check_force_limit: bool = False,
     build_kwargs: dict | None = None,
 ) -> None:
     from pymol_imd.imd import IMDConfig, IMDSystem
@@ -86,8 +110,8 @@ def _run_backend(
     log.info("[%s] Minimizing...", label)
     imd.simulation.minimizeEnergy(maxIterations=200)
 
-    if check_force_cap:
-        _verify_force_cap(imd, label=label)
+    if check_force_limit:
+        _verify_force_limit(imd, label=label)
 
     log.info("[%s] Stepping %d frames...", label, n_steps)
     for _ in range(n_steps):
@@ -172,15 +196,15 @@ def main(pdb_id: str = "1aki", n_steps: int = 10) -> int:
         tmp_path = Path(tmp)
         pdb_path = fetch_pdb(pdb_id, out_dir=tmp_path)
         # AA runs with LangevinMiddleIntegrator (matches imd_setup_aa default) and
-        # also exercises the |F| cap path under a synthetic large delta. The
-        # default now carries GBn2 implicit solvent (the new AA / ML-MM default).
+        # also exercises the force-limit skip path under a synthetic over-limit
+        # delta. The default carries GBn2 implicit solvent (the AA / ML-MM default).
         _run_backend(
             AABackend(),
             pdb_path,
             label="AA(GBn2-default)",
             n_steps=n_steps,
             integrator="langevin_middle",
-            check_force_cap=True,
+            check_force_limit=True,
         )
         # Vacuo opt-out: implicit_solvent="none" restores the old NoCutoff path.
         _run_backend(

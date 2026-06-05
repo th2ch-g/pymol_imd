@@ -129,7 +129,9 @@ default in `pymol_imd/constants.py` (per-backend where noted).
 | `--traj-interval N` | all | Trajectory: write every N GUI frames (default 1) |
 | `--force-csv PATH` | all | Record user pull forces to CSV (`frame,step,time_ps,atom_index,fx,fy,fz,fmag`, atom_index 0-based); needs `--run` |
 | `--force-csv-interval N` | all | Force CSV: write every N GUI frames (default 1) |
-| `--no-record` | all | Disable the default trajectory + force-CSV recording |
+| `--state-csv PATH` | all | Record thermodynamic state CSV (energies + `temperature_k`; `+volume_nm3,density_g_cm3` under `--pbc`); needs `--run` |
+| `--state-csv-interval N` | all | State CSV: write every N GUI frames (default 1) |
+| `--no-record` | all | Disable the default trajectory + force-CSV + state-CSV recording |
 | `--topology-dir DIR` | all | Output dir for intermediate / topology files (default `./<stem>_topology`) |
 | `--ligand-sdf PATH` | `aa` | Ligand SDF for GAFF + AM1-BCC parameterisation |
 | `--ph PH` | `aa` | `Modeller.addHydrogens` protonation pH (default 7.4) |
@@ -226,7 +228,7 @@ After `setup_*`:
 
 ---
 
-## Recording trajectories and forces
+## Recording trajectories, forces and state
 
 `imd_record` arms output for the **next** `imd_run`. Recording starts when
 `imd_run` is called and stops — files flushed + closed — on `imd_stop` (or on
@@ -234,27 +236,33 @@ an automatic divergence / error halt). Minimization is never recorded.
 
 ```
 PyMOL> imd_setup_aa input.pdb
-PyMOL> imd_record traj=run.xtc, force_csv=pull.csv
+PyMOL> imd_record traj=run.xtc, force_csv=pull.csv, state_csv=state.csv
 PyMOL> imd_run                  # recording begins
 PyMOL> imd_stop                 # files finalized
 PyMOL> imd_record off           # disarm (optional)
 ```
 
 - **Trajectory** format is chosen by file extension: `.xtc`, `.dcd`, `.pdb`.
-- **Force CSV** logs only the user pull force, one row per dragged atom per
+- **Force CSV** logs the applied user pull force, one row per pulled atom per
   recorded frame, columns `frame,step,time_ps,atom_index,fx,fy,fz,fmag`
-  (forces in kJ/mol/nm, after the `max_force_kj` cap). `atom_index` is
-  **0-based** (OpenMM / trajectory convention) — add 1 to match a PyMOL
-  `index` selection.
-- `traj_interval` / `force_csv_interval` are in **GUI frames** (default 1):
-  `traj_interval=5` writes every 5th frame.
+  (forces in kJ/mol/nm). `atom_index` is **0-based** (OpenMM / trajectory
+  convention) — add 1 to match a PyMOL `index` selection. Frames where a drag
+  exceeds `max_force_kj` are skipped (no row), so no row exceeds the limit.
+- **State CSV** logs GROMACS-style thermodynamics, one row per recorded frame,
+  columns `frame,step,time_ps,potential_energy_kj,kinetic_energy_kj,total_energy_kj,temperature_k`,
+  plus `volume_nm3,density_g_cm3` under PBC. **Pressure is omitted**: OpenMM
+  reports no instantaneous pressure and the IMD pull force contaminates the virial.
+- All three default **on** — the CLI writes `<stem>.xtc` / `<stem>_forces.csv` /
+  `<stem>_state.csv`; `--no-record` disables them together.
+- `traj_interval` / `force_csv_interval` / `state_csv_interval` are in **GUI
+  frames** (default 1): `traj_interval=5` writes every 5th frame.
 
 From the CLI the same is available via flags (recording requires `--run`):
 
 ```bash
 pixi run pymol_imd input.pdb --level aa --run \
     --traj-out run.xtc --traj-interval 5 \
-    --force-csv pull.csv
+    --force-csv pull.csv --state-csv state.csv
 ```
 
 > Changing `nsteps_per_frame` with `imd_change` mid-run does **not** retune an

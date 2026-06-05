@@ -204,6 +204,10 @@ class PyMOLIMDClient:
         self._timer = None
         self._last_server_ang: np.ndarray | None = None
         self._active_prev: set[int] = set()
+        # Edge-triggered guard for the pull-force limit warning (mirrors
+        # IMDSystem._force_exceeded_prev): warn once when the drag goes over
+        # max_force_kj, reset when it clears, so the Qt tick can't flood logs.
+        self._force_exceeded_prev: bool = False
         # Per-atom residue / chain group ids read from the PyMOL object (lazily,
         # cached per level), used to expand a per-atom pull to the whole residue
         # / chain. Mirrors IMDSystem's in-process expansion so socket dragging
@@ -274,11 +278,22 @@ class PyMOLIMDClient:
             return  # atom-count mismatch (wrong object loaded); skip silently
         pymol_ang = np.asarray(coords)
         delta_nm = (pymol_ang - self._last_server_ang) * constants.ANGSTROM_TO_NM
-        active_idx, forces_nm = compute_pull_forces(
+        active_idx, forces_nm, n_exceeded = compute_pull_forces(
             delta_nm, self.const_k, self.max_force_kj, self.delta_noise_nm
         )
+        # Over-limit drag: the whole frame's pull was skipped. Warn once on the
+        # rising edge (not every tick) and keep streaming.
+        if n_exceeded and not self._force_exceeded_prev:
+            logger.warning(
+                "Pull force on %d atom(s) exceeded max_force_kj=%.1f kJ/mol/nm; "
+                "this frame's pull was skipped (no force sent), MD continues. "
+                "Drag a shorter distance or raise max_force_kj to pull harder.",
+                n_exceeded,
+                self.max_force_kj,
+            )
+        self._force_exceeded_prev = bool(n_exceeded)
         # Expand to the whole residue / chain (same behavior as the in-process
-        # IMDSystem); no-op for the default atom level.
+        # IMDSystem); no-op for the default atom level / a skipped frame.
         if self.drag_level != "atom" and active_idx.size:
             active_idx, forces_nm = self._expand_drag_groups(active_idx, forces_nm, len(coords))
         active_set = set(active_idx.tolist())

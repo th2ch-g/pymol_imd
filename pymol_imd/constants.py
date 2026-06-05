@@ -56,6 +56,16 @@ ANGSTROM_TO_NM = 0.1  # angstrom -> nm (positions in / drag delta, client side)
 KJ_PER_NM_TO_KJ_PER_ANGSTROM = 0.1  # kJ/mol/nm -> kJ/mol/angstrom (forces out)
 KJ_PER_ANGSTROM_TO_KJ_PER_NM = 10.0  # kJ/mol/angstrom -> kJ/mol/nm (MDComm in)
 
+# Molar gas constant (kJ/mol/K) for the instantaneous-temperature estimate
+# (T = 2*KE / (ndof * R)). Single source shared by the IMDSystem state-CSV
+# recorder and the socket server's energies packet.
+GAS_CONSTANT_KJ_PER_MOL_K = 0.00831446261815324
+
+# Mass-density unit bridge (FIXED). 1 amu = 1.66053906660e-24 g and
+# 1 nm^3 = 1e-21 cm^3, so (amu/nm^3) * 1.6605390666e-3 = g/cm^3. Used for the
+# state-CSV density column (total system mass / periodic box volume).
+AMU_PER_NM3_TO_G_PER_CM3 = 1.6605390666e-3
+
 # Covalent radii in Angstrom for the Morokuma/Dapprich link-atom g-factor.
 # Source: standard chemistry references (Cordero 2008, condensed). Only the
 # elements seen at QM/MM boundaries in biomolecules are listed; unusual
@@ -216,6 +226,7 @@ DEFAULT_MIN_ENERGY_TOL_KJ = 1e-3  # consecutive-chunk |ΔU| convergence toleranc
 # ---------------------------------------------------------------------------
 DEFAULT_TRAJ_INTERVAL = 1  # write every N GUI frames to the trajectory
 DEFAULT_FORCE_CSV_INTERVAL = 1  # write pull forces every N GUI frames
+DEFAULT_STATE_CSV_INTERVAL = 1  # write the thermodynamic state CSV every N GUI frames
 
 # ---------------------------------------------------------------------------
 # Fixed numerical guard / viewer cosmetics (centralized; not user-tunable)

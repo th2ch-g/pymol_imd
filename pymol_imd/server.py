@@ -30,9 +30,6 @@ from .protocol import IMDHeaderType, SessionInfo
 
 logger = logging.getLogger(__name__)
 
-# Molar gas constant (kJ/mol/K) for the instantaneous-temperature estimate.
-_GAS_CONSTANT_KJ = 0.00831446261815324
-
 
 class IMDServer:
     """Serve one :class:`IMDSystem` to IMDv3 clients over TCP."""
@@ -301,7 +298,7 @@ class IMDServer:
             pe = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
             # (T, Etot, Epot, Evdw, Ecoul, Ebond, Eangle, Edihe, Eimpr); per-term
             # decomposition is a future enhancement (needs force groups).
-            e9 = (self._instantaneous_temperature(ke), pe + ke, pe, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            e9 = (self.imd.instantaneous_temperature(ke), pe + ke, pe, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
             conn.send_bytes(protocol.pack_energies(step, e9, e))
         if si.box:
             vecs = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer)
@@ -329,14 +326,3 @@ class IMDServer:
                     IMDHeaderType.FORCES, frc * constants.KJ_PER_NM_TO_KJ_PER_ANGSTROM, e
                 )
             )
-
-    def _instantaneous_temperature(self, ke_kj: float) -> float:
-        """Estimate T (K) from kinetic energy.
-
-        Approximate: ``ndof = 3N - n_constraints`` (ignores the COM-motion
-        remover's 3 dof). Good enough for a display value in the energies packet.
-        """
-        ndof = 3 * self.imd.n_atoms - self.imd.bundle.system.getNumConstraints()
-        if ndof <= 0:
-            return 0.0
-        return 2.0 * ke_kj / (ndof * _GAS_CONSTANT_KJ)

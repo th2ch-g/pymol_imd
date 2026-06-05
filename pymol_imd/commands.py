@@ -577,8 +577,10 @@ def imd_record(
     traj_interval: object = constants.DEFAULT_TRAJ_INTERVAL,
     force_csv: object | None = None,
     force_csv_interval: object = constants.DEFAULT_FORCE_CSV_INTERVAL,
+    state_csv: object | None = None,
+    state_csv_interval: object = constants.DEFAULT_STATE_CSV_INTERVAL,
 ) -> None:
-    """Arm trajectory / pull-force recording for the next ``imd_run``.
+    """Arm trajectory / pull-force / state recording for the next ``imd_run``.
 
     Recording does not start immediately: it is configured here and begins
     when ``imd_run`` is called, stopping (files flushed + closed) on
@@ -601,10 +603,19 @@ def imd_record(
         0-based (OpenMM / trajectory convention); add 1 for a PyMOL selection.
     force_csv_interval:
         Write forces every N GUI frames (default 1).
+    state_csv:
+        Output CSV path for thermodynamic state. Columns:
+        ``frame,step,time_ps,potential_energy_kj,kinetic_energy_kj,
+        total_energy_kj,temperature_k`` plus ``volume_nm3,density_g_cm3`` under
+        PBC. One row per recorded frame. Pressure is intentionally omitted
+        (OpenMM has no instantaneous pressure; IMD pull forces contaminate the
+        virial).
+    state_csv_interval:
+        Write the state CSV every N GUI frames (default 1).
 
     Examples::
 
-        imd_record traj=traj.xtc, force_csv=forces.csv
+        imd_record traj=traj.xtc, force_csv=forces.csv, state_csv=state.csv
         imd_record traj=run.pdb, traj_interval=10
         imd_record off                       # disable recording
     """
@@ -612,7 +623,7 @@ def imd_record(
         print("imd: no system loaded — call imd_setup_aa / imd_setup_cg / imd_setup_mlmm first")
         return
     # "off" (or no paths at all) clears recording.
-    if traj == "off" or (traj is None and force_csv is None):
+    if traj == "off" or (traj is None and force_csv is None and state_csv is None):
         _imd_system.set_recording()
         print("imd_record: recording disabled")
         return
@@ -621,12 +632,16 @@ def imd_record(
         traj_interval=_as_int(traj_interval),
         force_csv=str(force_csv) if force_csv is not None else None,
         force_csv_interval=_as_int(force_csv_interval),
+        state_csv=str(state_csv) if state_csv is not None else None,
+        state_csv_interval=_as_int(state_csv_interval),
     )
     parts = []
     if traj is not None:
         parts.append(f"traj={traj} (every {_as_int(traj_interval)} frame[s])")
     if force_csv is not None:
         parts.append(f"force_csv={force_csv} (every {_as_int(force_csv_interval)} frame[s])")
+    if state_csv is not None:
+        parts.append(f"state_csv={state_csv} (every {_as_int(state_csv_interval)} frame[s])")
     print(f"imd_record: armed — {', '.join(parts)}. Starts on imd_run, stops on imd_stop.")
 
 

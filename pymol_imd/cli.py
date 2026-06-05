@@ -224,12 +224,30 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Write forces every N GUI frames (default 1).",
     )
     common.add_argument(
+        "--state-csv",
+        metavar="PATH",
+        help=(
+            "Record thermodynamic state to CSV during imd_run (columns: "
+            "frame,step,time_ps,potential_energy_kj,kinetic_energy_kj,"
+            "total_energy_kj,temperature_k; under --pbc also volume_nm3,"
+            "density_g_cm3). Pressure is omitted (no instantaneous virial "
+            "under IMD pulling). Default: ./<pdb-stem>_state.csv in the launch "
+            "cwd (on by default; disable with --no-record). Starts on --run."
+        ),
+    )
+    common.add_argument(
+        "--state-csv-interval",
+        type=int,
+        metavar="N",
+        help="Write the state CSV every N GUI frames (default 1).",
+    )
+    common.add_argument(
         "--no-record",
         action="store_true",
         help=(
             "Disable default recording. Without this a trajectory + force CSV "
-            "are written by default. Conflicts with an explicit "
-            "--traj-out / --force-csv."
+            "+ state CSV are written by default. Conflicts with an explicit "
+            "--traj-out / --force-csv / --state-csv."
         ),
     )
     common.add_argument(
@@ -445,13 +463,15 @@ def _collect_setup_kwargs(args: argparse.Namespace) -> dict:
 def _collect_record_kwargs(args: argparse.Namespace) -> dict:
     """Pull recording flags into an ``imd_record(...)``-compatible dict.
 
-    ``main`` fills ``traj_out`` / ``force_csv`` with cwd defaults before this
-    runs, so both are normally set. Returns an empty dict only when both are
-    None (the ``--no-record`` path), which reads as "disable recording".
+    ``main`` fills ``traj_out`` / ``force_csv`` / ``state_csv`` with cwd
+    defaults before this runs, so all are normally set. Returns an empty dict
+    only when all are None (the ``--no-record`` path), which reads as "disable
+    recording".
     """
     traj_out = _resolve_path(args.traj_out)
     force_csv = _resolve_path(args.force_csv)
-    if traj_out is None and force_csv is None:
+    state_csv = _resolve_path(args.state_csv)
+    if traj_out is None and force_csv is None and state_csv is None:
         return {}
     kwargs: dict = {}
     if traj_out is not None:
@@ -462,6 +482,10 @@ def _collect_record_kwargs(args: argparse.Namespace) -> dict:
         kwargs["force_csv"] = force_csv
         if args.force_csv_interval is not None:
             kwargs["force_csv_interval"] = args.force_csv_interval
+    if state_csv is not None:
+        kwargs["state_csv"] = state_csv
+        if args.state_csv_interval is not None:
+            kwargs["state_csv_interval"] = args.state_csv_interval
     return kwargs
 
 
@@ -825,11 +849,12 @@ def _main_launch(argv: list[str] | None) -> int:
     stem = pdb_path.stem
     traj_explicit = args.traj_out is not None
     force_explicit = args.force_csv is not None
+    state_explicit = args.state_csv is not None
     if args.no_record:
-        if traj_explicit or force_explicit:
+        if traj_explicit or force_explicit or state_explicit:
             print(
                 "pymol_imd: --no-record conflicts with an explicit "
-                "--traj-out / --force-csv. Drop one.",
+                "--traj-out / --force-csv / --state-csv. Drop one.",
                 file=sys.stderr,
             )
             return 2
@@ -838,15 +863,17 @@ def _main_launch(argv: list[str] | None) -> int:
             args.traj_out = str(Path.cwd() / f"{stem}.xtc")
         if args.force_csv is None:
             args.force_csv = str(Path.cwd() / f"{stem}_forces.csv")
+        if args.state_csv is None:
+            args.state_csv = str(Path.cwd() / f"{stem}_state.csv")
     if args.topology_dir is None:
         args.topology_dir = str(Path.cwd() / f"{stem}_topology")
 
     kwargs = _collect_setup_kwargs(args)
     record_kwargs = _collect_record_kwargs(args)
     minimize_kwargs = _collect_minimize_kwargs(args)
-    if (traj_explicit or force_explicit) and not args.run:
+    if (traj_explicit or force_explicit or state_explicit) and not args.run:
         print(
-            "pymol_imd: --traj-out / --force-csv given without --run; "
+            "pymol_imd: --traj-out / --force-csv / --state-csv given without --run; "
             "recording is armed but only starts on imd_run.",
             file=sys.stderr,
         )

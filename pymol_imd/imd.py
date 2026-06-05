@@ -39,39 +39,52 @@ def compute_pull_forces(
     const_k: float,
     max_force_kj: float,
     noise_nm: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Turn a per-atom position delta (nm) into capped pull forces (kJ/mol/nm).
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Turn a per-atom position delta (nm) into pull forces (kJ/mol/nm).
 
     Shared by the in-process IMD path
     (:meth:`IMDSystem._apply_pull_force_from_pymol`) and the socket client
     (:mod:`pymol_imd.client`) so dragging feels numerically identical in both.
     Pure / side-effect free.
 
+    The per-atom force magnitude is checked against ``max_force_kj``. If ANY
+    dragged atom would exceed the cap, the WHOLE frame's pull is skipped
+    (no force applied) instead of being clamped, so a too-hard drag simply does
+    nothing that frame rather than injecting a runaway force. The caller is
+    expected to warn and keep the MD running when ``n_exceeded > 0``.
+
     Parameters
     ----------
     delta_nm:
         ``(n_atoms, 3)`` array of ``target - current`` positions in nm.
     const_k, max_force_kj, noise_nm:
-        Pull-force scale (kJ/mol/nm), per-atom |F| cap (kJ/mol/nm), and the
+        Pull-force scale (kJ/mol/nm), per-atom |F| limit (kJ/mol/nm), and the
         drag noise floor (nm) below which an atom counts as not dragged.
 
     Returns
     -------
-    (active_idx, forces):
-        ``active_idx`` are the atom indices whose |delta| crossed ``noise_nm``;
-        ``forces`` is the full ``(n_atoms, 3)`` array (kJ/mol/nm) with inactive
-        atoms zeroed and active ones scaled by ``const_k`` and magnitude-capped.
+    (active_idx, forces, n_exceeded):
+        ``active_idx`` are the dragged atom indices (|delta| >= ``noise_nm``),
+        EMPTY when the frame is skipped; ``forces`` is the full ``(n_atoms, 3)``
+        array (kJ/mol/nm) — inactive atoms zeroed and active ones scaled by
+        ``const_k`` (no clamp), or ALL-ZERO when the frame is skipped;
+        ``n_exceeded`` is the number of dragged atoms whose |F| exceeded
+        ``max_force_kj`` — nonzero means the whole frame's pull was skipped.
     """
     delta = np.array(delta_nm, dtype=float, copy=True)
     atom_max = np.max(np.abs(delta), axis=1)
     active_mask = atom_max >= noise_nm
     delta[~active_mask] = 0.0
     forces = delta * const_k
-    fmag = np.linalg.norm(forces, axis=1, keepdims=True)
-    safe_fmag = np.where(fmag > 0.0, fmag, 1.0)
-    forces = forces * (np.minimum(fmag, max_force_kj) / safe_fmag)
+    fmag = np.linalg.norm(forces, axis=1)
+    # Whole-frame skip: if ANY dragged atom's |F| exceeds the limit, drop the
+    # entire frame's pull (empty active set, zero forces) so the MD keeps
+    # running without a runaway force. Replaces the old per-atom magnitude clamp.
+    n_exceeded = int(np.count_nonzero(fmag[active_mask] > max_force_kj))
+    if n_exceeded:
+        return np.empty(0, dtype=int), np.zeros_like(forces), n_exceeded
     active_idx = np.where(active_mask)[0]
-    return active_idx, forces
+    return active_idx, forces, 0
 
 
 @dataclass
@@ -90,10 +103,11 @@ class IMDConfig:
     # configurational sampling and a wider stability window under external
     # forcing, so AA backends default to it; CG/MLMM keep "langevin" for now.
     integrator: str = constants.DEFAULT_INTEGRATOR
-    # Per-atom hard cap on the pulling force magnitude (kJ/mol/nm). Replaces
-    # the old |delta| cap: a |F| cap is unit-meaningful (force) and prevents
-    # runaway accelerations directly, regardless of how far the user drags
-    # an atom or what const_k is set to.
+    # Per-atom |F| limit (kJ/mol/nm) on the pulling force. If ANY dragged atom
+    # would exceed it, that whole frame's pull is skipped (no force applied) and
+    # a throttled warning is logged — the MD keeps running. This prevents runaway
+    # accelerations from a too-hard drag without stopping the simulation. (The
+    # separate _diverged guard halts the loop on energy blow-up.)
     max_force_kj: float = constants.DEFAULT_MAX_FORCE_KJ
     # If |potential energy| exceeds this (kJ/mol), the simulation is treated
     # as diverged and the IMD loop halts. NaN energies trip the same guard.
@@ -163,6 +177,11 @@ class IMDSystem:
         # Tracks atoms whose pull force was non-zero on the previous frame
         # so we can zero them on release without scanning all n_atoms.
         self._active_pull_idx_prev: set[int] = set()
+        # Edge-triggered guard for the pull-force limit warning: True while the
+        # current drag exceeds max_force_kj (its frame pull is skipped). Warn
+        # once on the rising edge, reset on the falling edge, so a sustained
+        # over-limit drag doesn't flood the console (the QTimer ticks every few ms).
+        self._force_exceeded_prev: bool = False
 
         # --- recording state (production run only; never during minimize) ---
         # set_recording() (imd_record) stores the pending config here;
@@ -176,6 +195,14 @@ class IMDSystem:
         self._force_csv_file = None
         self._force_csv_writer = None
         self._force_csv_interval: int = 1
+        # Thermodynamic state CSV (energies / temperature, + volume/density under
+        # PBC). Mirrors the force-CSV machinery; opened in start_recording.
+        self._state_csv_path: Path | None = None
+        self._state_csv_file = None
+        self._state_csv_writer = None
+        self._state_csv_interval: int = 1
+        self._state_csv_pbc: bool = False
+        self._total_mass_amu: float | None = None  # cached lazily for density
         self._frame_index: int = 0  # per-run GUI-frame counter
         # Pull force cached each frame by _apply_pull_force_from_pymol so the
         # CSV writer reads it without recomputing.
@@ -295,6 +322,7 @@ class IMDSystem:
             return
         if self._recording:
             self._record_force_csv()
+            self._record_state_csv()
         self._frame_index += 1
         self._sync_positions_to_pymol()
 
@@ -324,6 +352,7 @@ class IMDSystem:
             return False
         if self._recording:
             self._record_force_csv()
+            self._record_state_csv()
         self._frame_index += 1
         return self.running
 
@@ -586,6 +615,22 @@ class IMDSystem:
         self._last_min_energy = energy_kj
         return converged
 
+    def instantaneous_temperature(self, ke_kj: float | None = None) -> float:
+        """Estimate T (K) from kinetic energy.
+
+        Approximate: ``ndof = 3N - n_constraints`` (ignores the COM-motion
+        remover's 3 dof). Shared by the state-CSV recorder and the socket
+        server's energies packet so there is a single temperature formula.
+        Reads KE from the context when ``ke_kj`` is None.
+        """
+        if ke_kj is None:
+            state = self.simulation.context.getState(getEnergy=True)
+            ke_kj = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
+        ndof = 3 * self.n_atoms - self.bundle.system.getNumConstraints()
+        if ndof <= 0:
+            return 0.0
+        return 2.0 * ke_kj / (ndof * constants.GAS_CONSTANT_KJ_PER_MOL_K)
+
     # --------------------------------------------------------------- recording
     def set_recording(
         self,
@@ -593,6 +638,8 @@ class IMDSystem:
         traj_interval: int = constants.DEFAULT_TRAJ_INTERVAL,
         force_csv: str | None = None,
         force_csv_interval: int = constants.DEFAULT_FORCE_CSV_INTERVAL,
+        state_csv: str | None = None,
+        state_csv_interval: int = constants.DEFAULT_STATE_CSV_INTERVAL,
     ) -> None:
         """Store the pending recording config (does NOT open any file).
 
@@ -601,9 +648,10 @@ class IMDSystem:
         so that re-running (``imd_stop`` -> ``imd_run``) re-attaches cleanly
         and the reporter interval picks up the current ``nsteps_per_frame``.
 
-        Passing both ``traj`` and ``force_csv`` as None clears recording.
+        Passing ``traj``, ``force_csv`` and ``state_csv`` all as None clears
+        recording.
         """
-        if traj is None and force_csv is None:
+        if traj is None and force_csv is None and state_csv is None:
             self._record_settings = None
             return
         self._record_settings = {
@@ -611,6 +659,8 @@ class IMDSystem:
             "traj_interval": max(1, int(traj_interval)),
             "force_csv": force_csv,
             "force_csv_interval": max(1, int(force_csv_interval)),
+            "state_csv": state_csv,
+            "state_csv_interval": max(1, int(state_csv_interval)),
         }
 
     def start_recording(self) -> None:
@@ -628,6 +678,7 @@ class IMDSystem:
         settings = self._record_settings
         traj = settings["traj"]
         force_csv = settings["force_csv"]
+        state_csv = settings["state_csv"]
 
         try:
             if traj is not None:
@@ -644,6 +695,29 @@ class IMDSystem:
                     ["frame", "step", "time_ps", "atom_index", "fx", "fy", "fz", "fmag"]
                 )
                 self._force_csv_file.flush()
+            if state_csv is not None:
+                self._state_csv_interval = settings["state_csv_interval"]
+                self._state_csv_pbc = bool(self.bundle.pbc)
+                if self._total_mass_amu is None:
+                    self._total_mass_amu = self._compute_total_mass_amu()
+                path = Path(state_csv)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                self._state_csv_path = path
+                self._state_csv_file = open(path, "w", newline="")  # noqa: SIM115
+                self._state_csv_writer = csv.writer(self._state_csv_file)
+                header = [
+                    "frame",
+                    "step",
+                    "time_ps",
+                    "potential_energy_kj",
+                    "kinetic_energy_kj",
+                    "total_energy_kj",
+                    "temperature_k",
+                ]
+                if self._state_csv_pbc:
+                    header += ["volume_nm3", "density_g_cm3"]
+                self._state_csv_writer.writerow(header)
+                self._state_csv_file.flush()
         except Exception:
             # Roll back any partially-opened output (e.g. traj attached but
             # the CSV open failed) so we never leave a dangling reporter.
@@ -652,11 +726,14 @@ class IMDSystem:
 
         self._recording = True
         logger.info(
-            "recording: traj=%s (every %d frame[s]), force_csv=%s (every %d frame[s])",
+            "recording: traj=%s (every %d frame[s]), force_csv=%s (every %d frame[s]), "
+            "state_csv=%s (every %d frame[s])",
             traj,
             settings["traj_interval"],
             force_csv,
             settings["force_csv_interval"],
+            state_csv,
+            settings["state_csv_interval"],
         )
 
     def _make_traj_reporter(self, traj_path: str, traj_interval: int):
@@ -716,16 +793,27 @@ class IMDSystem:
                 self._force_csv_file = None
                 self._force_csv_writer = None
                 self._force_csv_path = None
+        if self._state_csv_file is not None:
+            try:
+                self._state_csv_file.flush()
+                self._state_csv_file.close()
+            finally:
+                self._state_csv_file = None
+                self._state_csv_writer = None
+                self._state_csv_path = None
         self._recording = False
 
     def _record_force_csv(self) -> None:
         """Append the current frame's user pull forces to the CSV.
 
-        One row per dragged atom: frame index, absolute MD step, time, the
-        OpenMM 0-based atom index, the post-cap force vector (kJ/mol/nm) and
-        its magnitude. Frames with no dragged atoms emit no rows. atom_index
-        is 0-based (OpenMM / trajectory convention); add 1 for a PyMOL
-        selection.
+        One row per atom a pull force was applied to this frame: frame index,
+        absolute MD step, time, the OpenMM 0-based atom index, the applied pull
+        force vector (kJ/mol/nm) and its magnitude. With drag_level
+        residue / chain this is the whole expanded group, every atom carrying the
+        group's mean force (not just the grabbed atom). Frames with no applied
+        force emit no rows (including over-limit frames whose pull was skipped).
+        atom_index is 0-based (OpenMM / trajectory convention); add 1 for a
+        PyMOL selection.
         """
         if self._force_csv_writer is None:
             return
@@ -764,6 +852,58 @@ class IMDSystem:
         self._force_csv_writer.writerows(rows)
         self._force_csv_file.flush()
 
+    def _record_state_csv(self) -> None:
+        """Append the current frame's thermodynamic quantities to the state CSV.
+
+        GROMACS-style per-frame physical quantities: energies (kJ/mol),
+        temperature (K), and — only under PBC — volume (nm^3) and density
+        (g/cm^3). Gated on the cumulative MD step exactly like the force CSV /
+        trajectory reporter, so equal intervals sample identical frames. Unlike
+        the force CSV, EVERY gated frame is written (no dragged-atom dependency).
+        Pressure is intentionally omitted: OpenMM reports no instantaneous
+        pressure and IMD pull forces contaminate the virial.
+        """
+        if self._state_csv_writer is None:
+            return
+        report_interval = max(1, self._state_csv_interval * self.config.nsteps_per_frame)
+        step = self.simulation.currentStep
+        if step % report_interval != 0:
+            return
+        state = self.simulation.context.getState(getEnergy=True)
+        pe = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+        ke = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
+        total = pe + ke
+        temp = self.instantaneous_temperature(ke)
+        time_ps = step * self.config.timestep_ps
+        row = [
+            self._frame_index,
+            step,
+            f"{time_ps:.6f}",
+            f"{pe:.6f}",
+            f"{ke:.6f}",
+            f"{total:.6f}",
+            f"{temp:.6f}",
+        ]
+        if self._state_csv_pbc:
+            volume_nm3 = state.getPeriodicBoxVolume().value_in_unit(unit.nanometer**3)
+            density = self._total_mass_amu / volume_nm3 * constants.AMU_PER_NM3_TO_G_PER_CM3
+            row.append(f"{volume_nm3:.6f}")
+            row.append(f"{density:.6f}")
+        self._state_csv_writer.writerow(row)
+        self._state_csv_file.flush()
+
+    def _compute_total_mass_amu(self) -> float:
+        """Total system mass (amu) for the density column.
+
+        Computed once and cached: particle masses are fixed after setup
+        (``dalton`` == amu in OpenMM).
+        """
+        system = self.bundle.system
+        return sum(
+            system.getParticleMass(i).value_in_unit(unit.dalton)
+            for i in range(system.getNumParticles())
+        )
+
     # ------------------------------------------------------------- pulling logic
     # Drag noise floor (nm). Rationale (PDB %8.3f precision + float32) lives
     # with the constant in constants.py.
@@ -774,29 +914,42 @@ class IMDSystem:
             pymol_xyz = self._read_pymol_positions_nm()
         except ImportError:
             # No PyMOL → no user pull. Keep the cache honest so the CSV writer
-            # doesn't re-emit a stale frame's active set.
+            # doesn't re-emit a stale frame's active set, and re-arm the
+            # over-limit warning so re-entering a live session warns cleanly.
             self._last_pull_active_idx = np.empty(0, dtype=int)
+            self._force_exceeded_prev = False
             return
         # RuntimeError from atom-count mismatch etc. is intentionally NOT
         # caught here; that's a real fault and the user must hear about it.
 
         openmm_xyz = self._read_openmm_positions_nm()
         delta = pymol_xyz - openmm_xyz
-        active_idx, forces = compute_pull_forces(
+        active_idx, forces, n_exceeded = compute_pull_forces(
             delta, self.config.const_k, self.config.max_force_kj, self._DELTA_NOISE_NM
         )
+        # Over-limit drag: the whole frame's pull was skipped. Warn once on the
+        # rising edge (not every tick) and keep the MD running.
+        if n_exceeded and not self._force_exceeded_prev:
+            logger.warning(
+                "Pull force on %d atom(s) exceeded max_force_kj=%.1f kJ/mol/nm; "
+                "this frame's pull was skipped (no force applied), MD continues. "
+                "Drag a shorter distance or raise max_force_kj to pull harder.",
+                n_exceeded,
+                self.config.max_force_kj,
+            )
+        self._force_exceeded_prev = bool(n_exceeded)
         # Drag a whole residue / chain when requested: PyMOL only moves a
-        # covalent fragment under the mouse, so we propagate that pull to the
-        # rest of the group here (no-op for the default atom level).
+        # covalent fragment under the mouse, so we propagate that pull to the rest
+        # of the group here (no-op for the default atom level / a skipped frame).
         if self.config.drag_level != "atom" and active_idx.size:
             active_idx, forces = self._expand_drag_groups(active_idx, forces)
         self.set_pull_forces(active_idx, forces)
 
         if active_idx.size:
-            # cap-free |F| the user requested — for the debug log only.
+            # |F| the user requested — for the debug log only.
             requested = np.linalg.norm(delta[active_idx] * self.config.const_k, axis=1)
             logger.debug(
-                "pull: %d atoms dragged, |F|max requested=%.1f / cap=%.1f kJ/mol/nm",
+                "pull: %d atoms dragged, |F|max requested=%.1f / limit=%.1f kJ/mol/nm",
                 int(active_idx.size),
                 float(np.max(requested)),
                 self.config.max_force_kj,
@@ -851,8 +1004,9 @@ class IMDSystem:
         chain (its ``mouse_selection_mode`` does not affect editing drag), so
         ``drag_level`` is realized here: every atom of a touched residue / chain
         receives the mean pull force of that group's dragged atoms, dragging the
-        whole group along. The per-atom |F| cap is already applied upstream in
-        :func:`compute_pull_forces`, so each member force stays bounded.
+        whole group along. Any over-limit frame is already skipped upstream in
+        :func:`compute_pull_forces` (empty ``active_idx``), so this only runs on
+        within-limit pulls; the group mean of within-limit vectors stays bounded.
         """
         group_of = (
             self._atom_residue_idx if self.config.drag_level == "residue" else self._atom_chain_idx
