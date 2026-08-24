@@ -16,6 +16,7 @@ import contextlib
 import csv
 import gc
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -121,11 +122,9 @@ class IMDConfig:
     # QTimer tick interval (ms) for both the production and minimize loops.
     # Read at timer start(); changing it mid-run needs a stop/run cycle.
     frame_interval_ms: int = constants.DEFAULT_FRAME_INTERVAL_MS
-    # Mouse-drag granularity for 3-Button Editing (atom | residue | chain),
-    # applied by the PyMOL command layer via cmd.set("mouse_selection_mode", N).
-    # Stored here so imd_change / imd_drag_level can re-apply it live; the force
-    # path is unaffected — PyMOL moves the whole residue/chain at once and the
-    # existing per-atom delta turns that into a pull force on all those atoms.
+    # Mouse-drag granularity for 3-Button Editing (atom | residue | chain).
+    # PyMOL moves only a covalent fragment, so the force path expands a dragged
+    # atom's pull to its whole topology residue or chain when requested.
     drag_level: str = constants.DEFAULT_DRAG_LEVEL
     # OpenMM compute platform for the MM engine (all backends: AA / CG / ML-MM):
     # "auto" lets OpenMM pick the fastest available (CUDA > OpenCL > CPU), or an
@@ -133,6 +132,65 @@ class IMDConfig:
     # SEPARATE device (see ml_device / _auto_torch_device) — this knob does not
     # affect it.
     platform: str = constants.DEFAULT_PLATFORM
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate and normalize all runtime controls."""
+        self.integrator = str(self.integrator).strip().lower()
+        self.drag_level = str(self.drag_level).strip().lower()
+        self.platform = str(self.platform).strip().lower()
+        if self.integrator not in constants.SUPPORTED_INTEGRATORS:
+            raise ValueError(
+                f"Unknown integrator {self.integrator!r}. "
+                f"Choose from {constants.SUPPORTED_INTEGRATORS}."
+            )
+        if self.drag_level not in constants.SUPPORTED_DRAG_LEVELS:
+            raise ValueError(
+                f"Unknown drag_level {self.drag_level!r}. "
+                f"Choose from {constants.SUPPORTED_DRAG_LEVELS}."
+            )
+        constants.resolve_platform_name(self.platform)
+        positive_float_fields = (
+            "temperature",
+            "pressure",
+            "timestep_ps",
+            "max_force_kj",
+            "energy_cutoff_kj",
+        )
+        nonnegative_float_fields = ("friction", "const_k")
+        for name in (*positive_float_fields, *nonnegative_float_fields):
+            value = getattr(self, name)
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be a number, got boolean {value!r}")
+            try:
+                normalized = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be a finite number, got {value!r}") from exc
+            if not math.isfinite(normalized):
+                raise ValueError(f"{name} must be finite, got {value!r}")
+            setattr(self, name, normalized)
+        for name in positive_float_fields:
+            if getattr(self, name) <= 0.0:
+                raise ValueError(f"{name} must be > 0, got {getattr(self, name)!r}")
+        for name in nonnegative_float_fields:
+            if getattr(self, name) < 0.0:
+                raise ValueError(f"{name} must be >= 0, got {getattr(self, name)!r}")
+        for name in ("nsteps_per_frame", "frame_interval_ms"):
+            value = getattr(self, name)
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer > 0, got boolean {value!r}")
+            try:
+                numeric = float(value)
+                normalized = int(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{name} must be an integer > 0, got {value!r}") from exc
+            if not math.isfinite(numeric) or normalized != numeric or normalized <= 0:
+                raise ValueError(f"{name} must be an integer > 0, got {value!r}")
+            setattr(self, name, normalized)
+        if not isinstance(self.mouse_force, bool):
+            raise ValueError(f"mouse_force must be a boolean, got {self.mouse_force!r}")
 
 
 class IMDSystem:
@@ -188,6 +246,9 @@ class IMDSystem:
             self.simulation = Simulation(bundle.topology, bundle.system, integrator)
         self.simulation.context.setPositions(bundle.positions)
         logger.info("OpenMM platform: %s", self.simulation.context.getPlatform().getName())
+        self._ml_subset_integrator: openmm.Integrator | None = None
+        self._ml_subset_context: openmm.Context | None = None
+        self._init_ml_subset_context()
         self.n_atoms = bundle.topology.getNumAtoms()
         self.running = False
         self._last_min_energy: float | None = None
@@ -212,12 +273,14 @@ class IMDSystem:
         self._force_csv_file = None
         self._force_csv_writer = None
         self._force_csv_interval: int = 1
+        self._force_csv_rows_since_flush: int = 0
         # Thermodynamic state CSV (energies / temperature, + volume/density under
         # PBC). Mirrors the force-CSV machinery; opened in start_recording.
         self._state_csv_path: Path | None = None
         self._state_csv_file = None
         self._state_csv_writer = None
         self._state_csv_interval: int = 1
+        self._state_csv_rows_since_flush: int = 0
         self._state_csv_pbc: bool = False
         self._total_mass_amu: float | None = None  # cached lazily for density
         self._frame_index: int = 0  # per-run GUI-frame counter
@@ -343,10 +406,34 @@ class IMDSystem:
                 f"Install a {name}-enabled OpenMM or use platform='auto'/'cpu'."
             ) from exc
 
+    def _init_ml_subset_context(self) -> None:
+        """Create the ML-region MM Context on the main Context's platform."""
+        extra = self.bundle.extra
+        if extra is None or "ml_subset_system" not in extra:
+            return
+        self._ml_subset_integrator = openmm.VerletIntegrator(0.0 * unit.femtoseconds)
+        platform = self.simulation.context.getPlatform()
+        self._ml_subset_context = openmm.Context(
+            extra["ml_subset_system"], self._ml_subset_integrator, platform
+        )
+        # Kept in ``extra`` for diagnostics and existing integrations.
+        extra["ml_subset_context"] = self._ml_subset_context
+        logger.info("MLMM subset OpenMM platform: %s", platform.getName())
+
     # ----------------------------------------------------------------- stepping
     def step(self) -> None:
+        pre_state = None
+        full_positions = None
+        box_vectors = None
+        if self.config.mouse_force or self._mlmm_force is not None:
+            pre_state = self.simulation.context.getState(getPositions=True)
+            full_positions = np.asarray(
+                pre_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+            )
+            if self.bundle.pbc:
+                box_vectors = pre_state.getPeriodicBoxVectors(asNumpy=True)
         if self.config.mouse_force:
-            self._apply_pull_force_from_pymol()
+            self._apply_pull_force_from_pymol(full_positions)
         elif self._active_pull_idx_prev:
             # mouse_force was just disabled mid-drag: clear the latched pull
             # force so no phantom constant force lingers in the OpenMM context.
@@ -355,15 +442,16 @@ class IMDSystem:
             # runs only once per disable.
             self.set_pull_forces(np.empty(0, dtype=int), np.zeros((self.n_atoms, 3)))
         if self._mlmm_force is not None:
-            self._apply_mlmm_correction_force()
+            self._apply_mlmm_correction_force(full_positions, box_vectors)
         self.simulation.step(self.config.nsteps_per_frame)  # trajectory reporter fires here
-        if self._diverged():
+        state = self.simulation.context.getState(getPositions=True, getEnergy=True)
+        if self._diverged(state):
             return
         if self._recording:
             self._record_force_csv()
-            self._record_state_csv()
+            self._record_state_csv(state)
         self._frame_index += 1
-        self._sync_positions_to_pymol()
+        self._sync_positions_to_pymol(state)
 
     def apply_mlmm_if_present(self) -> None:
         """Apply the ONIOM ML/MM correction if this is an ML/MM bundle.
@@ -373,10 +461,19 @@ class IMDSystem:
         AA / CG backends (``_mlmm_force`` is ``None``).
         """
         if self._mlmm_force is not None:
-            self._apply_mlmm_correction_force()
+            state = self.simulation.context.getState(getPositions=True)
+            positions = np.asarray(state.getPositions(asNumpy=True).value_in_unit(unit.nanometer))
+            box_vectors = state.getPeriodicBoxVectors(asNumpy=True) if self.bundle.pbc else None
+            self._apply_mlmm_correction_force(positions, box_vectors)
 
-    def advance_openmm(self) -> bool:
-        """Advance one frame WITHOUT any PyMOL interaction. Returns ``running``.
+    def advance_openmm(
+        self,
+        *,
+        get_positions: bool = False,
+        get_velocities: bool = False,
+        get_forces: bool = False,
+    ) -> tuple[bool, object]:
+        """Advance one frame without PyMOL and return ``(running, State)``.
 
         Server-side core of :meth:`step`: it steps ``nsteps_per_frame``, runs
         the divergence guard, and writes the force CSV when recording. It does
@@ -387,13 +484,19 @@ class IMDSystem:
         the server controls the inject -> correct -> step ordering.
         """
         self.simulation.step(self.config.nsteps_per_frame)
-        if self._diverged():
-            return False
+        state = self.simulation.context.getState(
+            getPositions=get_positions,
+            getEnergy=True,
+            getVelocities=get_velocities,
+            getForces=get_forces,
+        )
+        if self._diverged(state):
+            return False, state
         if self._recording:
             self._record_force_csv()
-            self._record_state_csv()
+            self._record_state_csv(state)
         self._frame_index += 1
-        return self.running
+        return self.running, state
 
     def _init_mlmm_cache(self) -> None:
         """Precompute per-frame-invariant ML/MM data once (Tier-1 lossless).
@@ -453,7 +556,11 @@ class IMDSystem:
         except Exception as exc:
             logger.warning("MLMM warmup inference failed (non-fatal): %s", exc)
 
-    def _apply_mlmm_correction_force(self) -> None:
+    def _apply_mlmm_correction_force(
+        self,
+        full_positions: np.ndarray | None = None,
+        box_vectors=None,
+    ) -> None:
         """Compute ``F_ML - F_MM_subset`` on the ML region and push to OpenMM.
 
         Runs once per frame, before the MD step. The correction adds the MLIP
@@ -479,9 +586,17 @@ class IMDSystem:
         link_atoms: tuple[tuple[int, int, float], ...] = extra.get("link_atoms", ())
         boundary_mm: tuple[int, ...] = extra.get("_mlmm_boundary_mm_indices", ())
         method: str = extra.get("link_atom_method", "scaled")
-        sub_context: openmm.Context = extra["ml_subset_context"]
+        sub_context = self._ml_subset_context
+        if sub_context is None:
+            raise RuntimeError("MLMM subset Context is not initialized")
 
-        full_positions = self._read_openmm_positions_nm()
+        if full_positions is None:
+            state = self.simulation.context.getState(getPositions=True)
+            full_positions = np.asarray(
+                state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+            )
+            if self.bundle.pbc:
+                box_vectors = state.getPeriodicBoxVectors(asNumpy=True)
         ml_positions_nm = full_positions[self._ml_indices_list]
         ml_positions_ang = ml_positions_nm * 10.0
 
@@ -522,6 +637,10 @@ class IMDSystem:
                     F_ml_eV_per_A[ml_local[int(m_idx)]] += f_m
 
         # 3) MM force on the ML-region subset (kJ/mol/nm).
+        if self.bundle.pbc:
+            if box_vectors is None:
+                raise RuntimeError("Periodic MLMM correction requires box vectors")
+            sub_context.setPeriodicBoxVectors(*box_vectors)
         sub_context.setPositions(ml_positions_nm * unit.nanometer)
         sub_state = sub_context.getState(getForces=True)
         F_mm_kj_per_nm = sub_state.getForces(asNumpy=True).value_in_unit(
@@ -611,7 +730,7 @@ class IMDSystem:
         f_m = d_over_R * proj_f
         return f_q, f_m
 
-    def _diverged(self) -> bool:
+    def _diverged(self, state=None) -> bool:
         """Return True (and mark the system stopped) if energy went insane.
 
         Reads the potential energy after a step; NaN/inf or |U| > cutoff
@@ -619,7 +738,9 @@ class IMDSystem:
         forces or a too-large timestep). Stopping here keeps PyMOL from
         receiving garbage coordinates that would push atoms off-screen.
         """
-        energy = self.simulation.context.getState(getEnergy=True).getPotentialEnergy()
+        if state is None:
+            state = self.simulation.context.getState(getEnergy=True)
+        energy = state.getPotentialEnergy()
         u_kj = energy.value_in_unit(unit.kilojoule_per_mole)
         if np.isfinite(u_kj) and abs(u_kj) <= self.config.energy_cutoff_kj:
             return False
@@ -653,6 +774,10 @@ class IMDSystem:
         logger.info("minimize: U = %.4f kJ/mol%s", energy_kj, " (converged)" if converged else "")
         self._last_min_energy = energy_kj
         return converged
+
+    def reset_minimization(self) -> None:
+        """Clear cross-run convergence state before a new minimization."""
+        self._last_min_energy = None
 
     def instantaneous_temperature(self, ke_kj: float | None = None) -> float:
         """Estimate T (K) from kinetic energy.
@@ -693,13 +818,26 @@ class IMDSystem:
         if traj is None and force_csv is None and state_csv is None:
             self._record_settings = None
             return
+        outputs = [
+            Path(path).expanduser().resolve() for path in (traj, force_csv, state_csv) if path
+        ]
+        if len(outputs) != len(set(outputs)):
+            raise ValueError("traj, force_csv, and state_csv must use different output paths")
+        intervals = {
+            "traj_interval": traj_interval,
+            "force_csv_interval": force_csv_interval,
+            "state_csv_interval": state_csv_interval,
+        }
+        for name, value in intervals.items():
+            if isinstance(value, bool) or int(value) != float(value) or int(value) < 1:
+                raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
         self._record_settings = {
             "traj": traj,
-            "traj_interval": max(1, int(traj_interval)),
+            "traj_interval": int(traj_interval),
             "force_csv": force_csv,
-            "force_csv_interval": max(1, int(force_csv_interval)),
+            "force_csv_interval": int(force_csv_interval),
             "state_csv": state_csv,
-            "state_csv_interval": max(1, int(state_csv_interval)),
+            "state_csv_interval": int(state_csv_interval),
         }
 
     def start_recording(self) -> None:
@@ -734,9 +872,10 @@ class IMDSystem:
                     ["frame", "step", "time_ps", "atom_index", "fx", "fy", "fz", "fmag"]
                 )
                 self._force_csv_file.flush()
+                self._force_csv_rows_since_flush = 0
             if state_csv is not None:
                 self._state_csv_interval = settings["state_csv_interval"]
-                self._state_csv_pbc = bool(self.bundle.pbc)
+                self._state_csv_pbc = bool(self.bundle.system.usesPeriodicBoundaryConditions())
                 if self._total_mass_amu is None:
                     self._total_mass_amu = self._compute_total_mass_amu()
                 path = Path(state_csv)
@@ -757,6 +896,7 @@ class IMDSystem:
                     header += ["volume_nm3", "density_g_cm3"]
                 self._state_csv_writer.writerow(header)
                 self._state_csv_file.flush()
+                self._state_csv_rows_since_flush = 0
         except Exception:
             # Roll back any partially-opened output (e.g. traj attached but
             # the CSV open failed) so we never leave a dangling reporter.
@@ -789,6 +929,17 @@ class IMDSystem:
         resync the trajectory cadence.
         """
         ext = Path(traj_path).suffix.lower()
+        reporter_classes = {
+            ".xtc": XTCReporter,
+            ".dcd": DCDReporter,
+            ".pdb": PDBReporter,
+        }
+        reporter_class = reporter_classes.get(ext)
+        if reporter_class is None:
+            raise ValueError(
+                f"Unsupported trajectory extension '{ext}' for {traj_path!r}. "
+                "Use .xtc, .dcd, or .pdb."
+            )
         report_interval = max(1, traj_interval * self.config.nsteps_per_frame)
         # Overwrite any existing file so a second imd_run to the same path is
         # consistent across formats (XTCReporter raises on a non-empty file).
@@ -800,15 +951,7 @@ class IMDSystem:
         if out.exists():
             logger.warning("recording: overwriting existing trajectory %s", traj_path)
             out.unlink()
-        if ext == ".xtc":
-            return XTCReporter(traj_path, report_interval)
-        if ext == ".dcd":
-            return DCDReporter(traj_path, report_interval)
-        if ext == ".pdb":
-            return PDBReporter(traj_path, report_interval)
-        raise ValueError(
-            f"Unsupported trajectory extension '{ext}' for {traj_path!r}. Use .xtc, .dcd, or .pdb."
-        )
+        return reporter_class(traj_path, report_interval)
 
     def stop_recording(self) -> None:
         """Flush + close any active trajectory / CSV outputs. Idempotent.
@@ -832,6 +975,7 @@ class IMDSystem:
                 self._force_csv_file = None
                 self._force_csv_writer = None
                 self._force_csv_path = None
+                self._force_csv_rows_since_flush = 0
         if self._state_csv_file is not None:
             try:
                 self._state_csv_file.flush()
@@ -840,6 +984,7 @@ class IMDSystem:
                 self._state_csv_file = None
                 self._state_csv_writer = None
                 self._state_csv_path = None
+                self._state_csv_rows_since_flush = 0
         self._recording = False
 
     def _record_force_csv(self) -> None:
@@ -889,9 +1034,12 @@ class IMDSystem:
                 )
             )
         self._force_csv_writer.writerows(rows)
-        self._force_csv_file.flush()
+        self._force_csv_rows_since_flush += len(rows)
+        if self._force_csv_rows_since_flush >= constants.CSV_FLUSH_ROWS:
+            self._force_csv_file.flush()
+            self._force_csv_rows_since_flush = 0
 
-    def _record_state_csv(self) -> None:
+    def _record_state_csv(self, state=None) -> None:
         """Append the current frame's thermodynamic quantities to the state CSV.
 
         GROMACS-style per-frame physical quantities: energies (kJ/mol),
@@ -908,7 +1056,8 @@ class IMDSystem:
         step = self.simulation.currentStep
         if step % report_interval != 0:
             return
-        state = self.simulation.context.getState(getEnergy=True)
+        if state is None:
+            state = self.simulation.context.getState(getEnergy=True)
         pe = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
         ke = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
         total = pe + ke
@@ -929,7 +1078,10 @@ class IMDSystem:
             row.append(f"{volume_nm3:.6f}")
             row.append(f"{density:.6f}")
         self._state_csv_writer.writerow(row)
-        self._state_csv_file.flush()
+        self._state_csv_rows_since_flush += 1
+        if self._state_csv_rows_since_flush >= constants.CSV_FLUSH_ROWS:
+            self._state_csv_file.flush()
+            self._state_csv_rows_since_flush = 0
 
     def _compute_total_mass_amu(self) -> float:
         """Total system mass (amu) for the density column.
@@ -948,7 +1100,7 @@ class IMDSystem:
     # with the constant in constants.py.
     _DELTA_NOISE_NM = constants.DELTA_NOISE_NM
 
-    def _apply_pull_force_from_pymol(self) -> None:
+    def _apply_pull_force_from_pymol(self, openmm_xyz: np.ndarray | None = None) -> None:
         try:
             pymol_xyz = self._read_pymol_positions_nm()
         except ImportError:
@@ -961,7 +1113,8 @@ class IMDSystem:
         # RuntimeError from atom-count mismatch etc. is intentionally NOT
         # caught here; that's a real fault and the user must hear about it.
 
-        openmm_xyz = self._read_openmm_positions_nm()
+        if openmm_xyz is None:
+            openmm_xyz = self._read_openmm_positions_nm()
         delta = pymol_xyz - openmm_xyz
         active_idx, forces, n_exceeded = compute_pull_forces(
             delta, self.config.const_k, self.config.max_force_kj, self._DELTA_NOISE_NM
@@ -1017,6 +1170,11 @@ class IMDSystem:
         # Cache for the force CSV writer (consumed by _record_force_csv).
         self._last_pull_active_idx = active_idx
         self._last_pull_forces = forces
+
+    def clear_pull_forces(self) -> None:
+        """Release all active pull forces and clear their recording cache."""
+        self.set_pull_forces(np.empty(0, dtype=int), np.zeros((self.n_atoms, 3), dtype=float))
+        self._force_exceeded_prev = False
 
     # --------------------------------------------------------- drag-level groups
     def _build_group_indices(self) -> tuple[np.ndarray, np.ndarray]:
@@ -1083,7 +1241,7 @@ class IMDSystem:
         # PyMOL stores coordinates in angstrom; OpenMM IMD logic works in nm.
         return np.asarray(coords) * 0.1
 
-    def _sync_positions_to_pymol(self) -> None:
+    def _sync_positions_to_pymol(self, state=None) -> None:
         try:
             from pymol import cmd
         except ImportError:  # pragma: no cover - headless smoke test
@@ -1100,7 +1258,13 @@ class IMDSystem:
                 f"'{self.pymol_selector}' has {pymol_atom_count} atoms but "
                 f"OpenMM has {self.n_atoms}. Re-run setup_*."
             )
-        positions_ang = self._read_openmm_positions_nm() * 10.0
+        if state is None:
+            positions_nm = self._read_openmm_positions_nm()
+        else:
+            positions_nm = np.asarray(
+                state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+            )
+        positions_ang = positions_nm * 10.0
         space = {"positions": positions_ang}
         cmd.alter_state(
             1,

@@ -221,4 +221,4 @@ __marimo__/
 *.cif
 *.xtc
 *.csv
-1ubq_topology/
+*_topology/

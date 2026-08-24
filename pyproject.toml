@@ -1,6 +1,6 @@
 [project]
 name = "pymol_imd"
-version = "0.1.0"
+version = "0.2.0"
 description = "Multiscale Interactive Molecular Dynamics in PyMOL (CG / AA / ML-MM)"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
@@ -28,7 +28,11 @@ channels = ["conda-forge"]
 # Intel Mac (osx-64) is excluded: the AIMNet2 default backend pulls
 # `warp-lang`, which has no osx-64 wheels. Windows / Intel-Mac users
 # should run via WSL2 / a Linux VM respectively.
-platforms = ["linux-64", "osx-arm64"]
+platforms = [
+  "linux-64",
+  "osx-arm64",
+  { name = "linux-64-cuda", platform = "linux-64", cuda = "12" },
+]
 
 # ---------------------------------------------------------------------------
 # Default feature: AA + CG (works on Linux & macOS)
@@ -48,7 +52,7 @@ vermouth = "*"
 # MDTraj provides DSSP without the CLI version skew that breaks vermouth's
 # external DSSP integration (DSSP 4 vs the 2.x/3.x vermouth was tested on).
 mdtraj = "*"
-# ML/MM stack (works on linux-64, osx-arm64, osx-64; MPS used on Apple Silicon)
+# ML/MM stack (works on linux-64 and osx-arm64; MPS falls back per backend)
 pytorch = ">=2.6"
 pytorch_scatter = "*"
 pytorch_geometric = "*"
@@ -63,7 +67,7 @@ requests = "*"
 pymol_imd = { path = ".", editable = true }
 # Martini reader for OpenMM (no conda-forge build available). Pinned to upstream main.
 martini-openmm = { git = "https://github.com/maccallumlab/martini_openmm.git" }
-# MACE MLIP backend (default for setup_mlmm). MACE-OMOL-0 is a public,
+# MACE MLIP backend. MACE-OMOL-0 is a public,
 # login-free model so `pixi install` → `setup_mlmm` works out of the box;
 # UMA stays available via `--ml-backend uma` but needs HF auth.
 # Default MLIP backends: pixi install brings MACE (mace-torch) and the
@@ -87,10 +91,9 @@ ruff = "*"
 # macOS / CPU users are unaffected. CUDA inference is the single biggest ML/MM
 # speedup (10-100x vs CPU). Build + run on linux-64 only:
 #     pixi install -e gpu
-#     pixi run -e gpu pymol_imd input.pdb --level mlmm --ml-selection "resi 30-50" --run
+#     pixi run -e gpu pymol_imd local input.pdb --level mlmm --ml-selection "resi 30-50"
 [tool.pixi.feature.cuda]
-platforms = ["linux-64"]
-system-requirements = { cuda = "12" }
+platforms = ["linux-64-cuda"]
 
 [tool.pixi.feature.cuda.dependencies]
 pytorch-gpu = "*"
@@ -111,6 +114,7 @@ smoke-mlmm = { cmd = "python -m pymol_imd.tests.smoke_mlmm", env = { PYTHONUTF8 
 record-smoke = "python -m pymol_imd.tests.smoke_record"
 smoke-socket = "python -m pymol_imd.tests.smoke_socket"
 smoke-drag = "python -m pymol_imd.tests.smoke_drag"
+smoke-cli = "python -m pymol_imd.tests.smoke_cli"
 install-uma = "pip install --no-build-isolation 'fairchem-core>=2.20.0'"
 install-orb = "pip install --no-build-isolation orb-models"
 # cuEquivariance acceleration for MACE. CUDA 12 + linux-64 only — run inside

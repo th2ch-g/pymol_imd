@@ -18,10 +18,10 @@ API works for all four backends, no external dispatcher needed.
 from __future__ import annotations
 
 import logging
+import math
 import tempfile
 from pathlib import Path
 
-import openmm
 from openmm import unit
 from openmm.app import PME, HBonds, NoCutoff
 
@@ -115,6 +115,11 @@ def _auto_torch_device(prefer: str = "auto", cuda_idx: int = 0):
     """
     import torch
 
+    prefer = str(prefer).strip().lower()
+    if prefer not in constants.SUPPORTED_ML_DEVICES:
+        raise ValueError(
+            f"Unknown ml_device {prefer!r}. Choose from {constants.SUPPORTED_ML_DEVICES}."
+        )
     if prefer == "auto":
         if torch.cuda.is_available():
             return "cuda", torch.device(f"cuda:{cuda_idx}")
@@ -123,10 +128,29 @@ def _auto_torch_device(prefer: str = "auto", cuda_idx: int = 0):
             return "mps", torch.device("mps")
         return "cpu", torch.device("cpu")
     if prefer == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "ml_device='cuda' requested, but CUDA is unavailable. Use the Pixi GPU "
+                "environment or choose ml_device='cpu'."
+            )
         return "cuda", torch.device(f"cuda:{cuda_idx}")
     if prefer == "mps":
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is None or not mps_backend.is_available():
+            raise RuntimeError(
+                "ml_device='mps' requested, but MPS is unavailable. Choose ml_device='cpu'."
+            )
         return "mps", torch.device("mps")
     return "cpu", torch.device("cpu")
+
+
+def _resolve_torch_device(prefer: str, backend: str) -> str:
+    """Resolve availability and backend-specific MPS support once."""
+    device_str, _device = _auto_torch_device(prefer)
+    labels = {"aimnet2": "AIMNet2", "mace": "MACE", "orb": "ORB"}
+    if device_str == "mps" and backend in labels:
+        device_str = _mps_to_cpu_fallback(device_str, labels[backend])
+    return device_str
 
 
 def _configure_torch_threads(device_str: str, n_ml: int) -> None:
@@ -362,7 +386,7 @@ def _build_aimnet2_calculator(
         from aimnet.calculators.calculator import AIMNet2Calculator
     except ImportError as exc:
         raise RuntimeError(
-            "aimnet is required for --ml-backend aimnet2. Install with `pixi run install-aimnet2`."
+            "aimnet is required for --ml-backend aimnet2. Run `pixi install` to install it."
         ) from exc
     device_str = _mps_to_cpu_fallback(device_str, "AIMNet2")
     base = AIMNet2Calculator(model=model, device=device_str, compile_model=compile_model)
@@ -527,16 +551,36 @@ def _resolve_ml_indices(
     """
     sel = ml_selection.strip()
     if sel == "all":
-        return tuple(range(topology.getNumAtoms()))
+        result = tuple(range(topology.getNumAtoms()))
+        return _canonicalize_ml_indices(topology, result)
 
     try:
         from pymol import cmd  # noqa: F401
     except ImportError:
-        return _resolve_ml_indices_fallback(topology, sel)
+        result = _resolve_ml_indices_fallback(topology, sel)
+        return _canonicalize_ml_indices(topology, result)
 
     if prepared_pdb_path is None:
-        return _resolve_ml_indices_fallback(topology, sel)
-    return _resolve_ml_indices_via_pymol(prepared_pdb_path, sel)
+        result = _resolve_ml_indices_fallback(topology, sel)
+    else:
+        result = _resolve_ml_indices_via_pymol(prepared_pdb_path, sel)
+    return _canonicalize_ml_indices(topology, result)
+
+
+def _canonicalize_ml_indices(topology, indices) -> tuple[int, ...]:
+    """Return sorted unique valid indices in topology order."""
+    values = tuple(int(index) for index in indices)
+    n_atoms = topology.getNumAtoms()
+    invalid = sorted({index for index in values if index < 0 or index >= n_atoms})
+    if invalid:
+        raise ValueError(
+            f"ML atom indices outside [0, {n_atoms}): {invalid[:12]}"
+            + (" ..." if len(invalid) > 12 else "")
+        )
+    canonical = tuple(sorted(set(values)))
+    if len(canonical) != len(values):
+        logger.warning("ML selection contained duplicate atom indices; duplicates were removed")
+    return canonical
 
 
 # ----------------------------------------------------------------------------
@@ -665,6 +709,17 @@ class MLMMBackend:
                 f"Unknown link_atom_method {link_atom_method!r}. "
                 f"Choose from {SUPPORTED_LINK_ATOM_METHODS}."
             )
+        if not str(ml_selection).strip():
+            raise ValueError("ml_selection must not be empty")
+        for name, value in (("ml_charge", ml_charge), ("ml_mult", ml_mult)):
+            if isinstance(value, bool) or int(value) != float(value):
+                raise ValueError(f"{name} must be an integer")
+        if int(ml_mult) < 1:
+            raise ValueError("ml_mult must be >= 1")
+        if not math.isfinite(nonbonded_cutoff_nm) or nonbonded_cutoff_nm <= 0.0:
+            raise ValueError("nonbonded_cutoff_nm must be finite and > 0")
+        if not math.isfinite(box_padding_nm) or box_padding_nm < 0.0:
+            raise ValueError("box_padding_nm must be finite and >= 0")
 
         from openmm.app import ForceField
 
@@ -689,7 +744,11 @@ class MLMMBackend:
             # Switch NVT(vacuo) -> NPT under PBC: enclose the molecule in a
             # bounding box so PME has periodic vectors (mirrors the AA backend).
             # The IMD driver adds a MonteCarloBarostat when bundle.pbc is set.
-            _set_bounding_box(modeller, padding_nm=box_padding_nm)
+            _set_bounding_box(
+                modeller,
+                padding_nm=box_padding_nm,
+                nonbonded_cutoff_nm=nonbonded_cutoff_nm,
+            )
         system = forcefield.createSystem(
             modeller.topology,
             nonbondedMethod=nonbonded_method,
@@ -723,7 +782,7 @@ class MLMMBackend:
             ml_backend,
         )
 
-        device_str, _ = _auto_torch_device(ml_device)
+        device_str = _resolve_torch_device(ml_device, ml_backend)
         _log_torch_build(device_str)
         _configure_torch_threads(device_str, len(ml_indices))
         # MPS (Apple Silicon GPU) doesn't support float64; the MACE default
@@ -760,9 +819,6 @@ class MLMMBackend:
             box_vectors=box_vectors,
             nonbonded_cutoff_nm=nonbonded_cutoff_nm,
         )
-        sub_integrator = openmm.VerletIntegrator(0.0 * unit.femtoseconds)
-        sub_context = openmm.Context(sub_system, sub_integrator)
-
         ml_symbols = _atoms_from_topology(modeller.topology, ml_indices)
 
         # Resolve QM/MM boundary bonds into link-atom records. Empty when the
@@ -790,7 +846,7 @@ class MLMMBackend:
                 "ml_calculator": ml_calc,
                 "ml_calc_info": ml_calc_info,
                 "ml_backend_name": ml_backend,
-                "ml_subset_context": sub_context,
+                "ml_subset_system": sub_system,
                 "ml_subset_n_atoms": sub_system.getNumParticles(),
                 "link_atoms": link_atoms,
                 "link_atom_method": link_atom_method,

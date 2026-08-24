@@ -14,7 +14,7 @@ too.
 
 Usage::
 
-    pixi run smoke-mlmm                       # compare vs saved ref (or create it)
+    pixi run smoke-mlmm                       # compare vs saved reference
     pixi run smoke-mlmm 1ubq                  # override pdb id
     pixi run smoke-mlmm 1aki aimnet2 "resi 1-3"   # pdb / backend / selection
     SMOKE_MLMM_SAVE_REF=1 pixi run smoke-mlmm     # (re)write the reference
@@ -94,9 +94,13 @@ def _run_pbc_build(pdb_path: Path, *, backend: str, ml_selection: str) -> None:
     if not Path(bundle.prepared_pdb_path).exists():
         raise AssertionError("prepared PDB not written under pbc=True")
 
+    cfg = IMDConfig(nsteps_per_frame=1, mouse_force=False, timestep_ps=0.0005, platform="reference")
+    imd = IMDSystem(bundle, cfg)
+
     # ONIOM-under-PBC core: the MM subset (the E_MM(region) term) MUST run PME
-    # with the same box as the full system, or the subtraction is inconsistent.
-    sub_system = bundle.extra["ml_subset_context"].getSystem()
+    # with the same box and platform as the full system.
+    sub_context = imd._ml_subset_context
+    sub_system = sub_context.getSystem()
     sub_nb = next(
         sub_system.getForce(i)
         for i in range(sub_system.getNumForces())
@@ -107,14 +111,24 @@ def _run_pbc_build(pdb_path: Path, *, backend: str, ml_selection: str) -> None:
             f"pbc=True but ONIOM MM subset uses method {sub_nb.getNonbondedMethod()}, not PME"
         )
 
-    cfg = IMDConfig(nsteps_per_frame=1, mouse_force=False, timestep_ps=0.0005)
-    imd = IMDSystem(bundle, cfg)
+    if sub_context.getPlatform().getName() != imd.simulation.context.getPlatform().getName():
+        raise AssertionError("main and ML subset Context platforms differ")
     has_barostat = any(
         isinstance(bundle.system.getForce(i), MonteCarloBarostat)
         for i in range(bundle.system.getNumForces())
     )
     if not has_barostat:
         raise AssertionError("pbc=True but no MonteCarloBarostat (NPT) added")
+
+    main_box = imd.simulation.context.getState().getPeriodicBoxVectors(asNumpy=True)
+    scaled_box = main_box * 1.01
+    imd.simulation.context.setPeriodicBoxVectors(*scaled_box)
+    imd._apply_mlmm_correction_force()
+    subset_box = sub_context.getState().getPeriodicBoxVectors(asNumpy=True)
+    main_nm = np.asarray(scaled_box.value_in_unit(unit.nanometer))
+    subset_nm = np.asarray(subset_box.value_in_unit(unit.nanometer))
+    if not np.allclose(main_nm, subset_nm, atol=1e-12):
+        raise AssertionError("ML subset periodic box did not follow the main Context")
 
     imd.simulation.minimizeEnergy(maxIterations=50)
     imd.running = True
@@ -166,15 +180,15 @@ def _run_gb_build(pdb_path: Path, *, backend: str, ml_selection: str) -> None:
 
     if not _has_gb(bundle.system):
         raise AssertionError("GBn2 requested but the full system carries no GB force")
-    sub_system = bundle.extra["ml_subset_context"].getSystem()
+    cfg = IMDConfig(nsteps_per_frame=1, mouse_force=False, timestep_ps=0.0005)
+    imd = IMDSystem(bundle, cfg)
+    sub_system = imd._ml_subset_context.getSystem()
     if not _has_gb(sub_system):
         raise AssertionError(
             "GBn2 requested but the ONIOM MM subset carries no GB force "
             "(E_MM(full) - E_MM(subset) would be inconsistent)"
         )
 
-    cfg = IMDConfig(nsteps_per_frame=1, mouse_force=False, timestep_ps=0.0005)
-    imd = IMDSystem(bundle, cfg)
     imd.simulation.minimizeEnergy(maxIterations=50)
     imd.running = True
     for i in range(3):
@@ -225,14 +239,14 @@ def main(pdb_id: str = "1aki", backend: str = "aimnet2", ml_selection: str = "re
         # the topology (atom count + order) is deterministic. Pin coordinates to
         # a saved reference so the delta-force regression is reproducible —
         # AIMNet2 is bitwise-deterministic at fixed coordinates (verified).
-        REF_DIR.mkdir(parents=True, exist_ok=True)
         pos_ref = REF_DIR / "mlmm_init_positions.npy"
         delta_ref = REF_DIR / f"mlmm_{backend}_delta.npy"
-        save_ref = (
-            bool(os.environ.get("SMOKE_MLMM_SAVE_REF"))
-            or not pos_ref.exists()
-            or not delta_ref.exists()
-        )
+        save_ref = bool(os.environ.get("SMOKE_MLMM_SAVE_REF"))
+        if not save_ref and (not pos_ref.exists() or not delta_ref.exists()):
+            raise AssertionError(
+                f"ML/MM reference missing: {pos_ref} or {delta_ref}. "
+                "Set SMOKE_MLMM_SAVE_REF=1 only for an intentional baseline update."
+            )
         if not save_ref:
             fixed = np.load(pos_ref)
             if fixed.shape[0] != imd.n_atoms:
@@ -251,6 +265,7 @@ def main(pdb_id: str = "1aki", backend: str = "aimnet2", ml_selection: str = "re
 
         # --- numerical-regression check against the saved reference ----------
         if save_ref:
+            REF_DIR.mkdir(parents=True, exist_ok=True)
             np.save(pos_ref, imd._read_openmm_positions_nm())
             np.save(delta_ref, delta)
             log.info("baseline saved: init positions + delta (shape=%s)", delta.shape)

@@ -25,7 +25,9 @@ from enum import Enum, IntEnum
 
 import numpy as np
 
-from .constants import IMD_VERSION
+from . import constants
+
+IMD_VERSION = constants.IMD_VERSION
 
 
 class IMDHeaderType(IntEnum):
@@ -66,7 +68,7 @@ _HEADER_FMT = "!ii"
 # Fixed body byte sizes for the constant-width packets.
 _SESSIONINFO_BODY = 7  # 7 int8 flags
 _ENERGIES_BODY = 40  # int32 step + 9 float32
-_TIME_BODY = 20  # float64 dt + float64 time + int32 step
+_TIME_BODY = 24  # float64 dt + float64 time + int64 step
 _BOX_BODY = 36  # 9 float32
 
 
@@ -106,18 +108,28 @@ def body_size(htype: IMDHeaderType, dataslot: int) -> int:
     loop can do ``recv_body(body_size(t, slot))`` for every packet uniformly.
     """
     if htype is IMDHeaderType.SESSIONINFO:
-        return _SESSIONINFO_BODY
-    if htype is IMDHeaderType.ENERGIES:
-        return _ENERGIES_BODY
-    if htype is IMDHeaderType.TIME:
-        return _TIME_BODY
-    if htype is IMDHeaderType.BOX:
-        return _BOX_BODY
-    if htype in (IMDHeaderType.COORDS, IMDHeaderType.VELOCITIES, IMDHeaderType.FORCES):
-        return dataslot * 12  # n_atoms * 3 float32
-    if htype is IMDHeaderType.MDCOMM:
-        return dataslot * (4 + 12)  # n * (int32 index + 3 float32 force)
-    return 0
+        size = _SESSIONINFO_BODY
+    elif htype is IMDHeaderType.ENERGIES:
+        size = _ENERGIES_BODY
+    elif htype is IMDHeaderType.TIME:
+        size = _TIME_BODY
+    elif htype is IMDHeaderType.BOX:
+        size = _BOX_BODY
+    elif htype in (IMDHeaderType.COORDS, IMDHeaderType.VELOCITIES, IMDHeaderType.FORCES):
+        if dataslot < 0:
+            raise ProtocolError(f"negative atom count {dataslot} for {htype.name}")
+        size = dataslot * 12  # n_atoms * 3 float32
+    elif htype is IMDHeaderType.MDCOMM:
+        if dataslot < 0:
+            raise ProtocolError(f"negative atom count {dataslot} for {htype.name}")
+        size = dataslot * 16  # n * (int32 index + 3 float32 force)
+    else:
+        size = 0
+    if size > constants.IMD_MAX_PACKET_BODY_BYTES:
+        raise ProtocolError(
+            f"{htype.name} body size {size} exceeds limit {constants.IMD_MAX_PACKET_BODY_BYTES}"
+        )
+    return size
 
 
 # ------------------------------------------------------------------ handshake
@@ -198,19 +210,21 @@ def parse_sessioninfo(body: bytes) -> SessionInfo:
 
 # ----------------------------------------------------------------------- time
 def pack_time(dt_ps: float, time_ps: float, step: int, endian: Endian) -> bytes:
+    if not np.isfinite((dt_ps, time_ps)).all():
+        raise ProtocolError("time packet contains non-finite values")
+    if not np.iinfo(np.int64).min <= int(step) <= np.iinfo(np.int64).max:
+        raise ProtocolError("time step is outside the int64 wire range")
     header = pack_header(IMDHeaderType.TIME, 1)
-    # NOTE: step packed as int32 -> 20-byte body, matching the IMDv3 spec's
-    # stated body length. If interop with a GROMACS/LAMMPS build that uses an
-    # int64 step is ever needed, widen this one format string ("ddq" = 24 B);
-    # nothing else depends on the step width.
-    body = struct.pack(f"{endian.value}ddi", float(dt_ps), float(time_ps), int(step))
+    body = struct.pack(f"{endian.value}ddq", float(dt_ps), float(time_ps), int(step))
     return header + body
 
 
 def parse_time(body: bytes, endian: Endian) -> tuple[float, float, int]:
     if len(body) < _TIME_BODY:
         raise ProtocolError(f"time needs {_TIME_BODY} bytes, got {len(body)}")
-    dt_ps, time_ps, step = struct.unpack(f"{endian.value}ddi", body[:_TIME_BODY])
+    dt_ps, time_ps, step = struct.unpack(f"{endian.value}ddq", body[:_TIME_BODY])
+    if not np.isfinite((dt_ps, time_ps)).all():
+        raise ProtocolError("time packet contains non-finite values")
     return dt_ps, time_ps, step
 
 
@@ -221,6 +235,8 @@ def pack_energies(step: int, energies9, endian: Endian) -> bytes:
     e9 = [float(x) for x in energies9]
     if len(e9) != 9:
         raise ProtocolError(f"energies needs 9 values, got {len(e9)}")
+    if not np.isfinite(e9).all():
+        raise ProtocolError("energies packet contains non-finite values")
     header = pack_header(IMDHeaderType.ENERGIES, 1)
     body = struct.pack(f"{endian.value}i9f", int(step), *e9)
     return header + body
@@ -230,7 +246,10 @@ def parse_energies(body: bytes, endian: Endian) -> tuple[int, np.ndarray]:
     if len(body) < _ENERGIES_BODY:
         raise ProtocolError(f"energies needs {_ENERGIES_BODY} bytes, got {len(body)}")
     vals = struct.unpack(f"{endian.value}i9f", body[:_ENERGIES_BODY])
-    return int(vals[0]), np.asarray(vals[1:], dtype=np.float64)
+    energies = np.asarray(vals[1:], dtype=np.float64)
+    if not np.isfinite(energies).all():
+        raise ProtocolError("energies packet contains non-finite values")
+    return int(vals[0]), energies
 
 
 # ------------------------------------------------------------------------ box
@@ -239,6 +258,8 @@ def pack_box(vectors, endian: Endian) -> bytes:
     arr = np.asarray(vectors, dtype=np.float64).reshape(-1)
     if arr.size != 9:
         raise ProtocolError(f"box needs 9 values, got {arr.size}")
+    if not np.isfinite(arr).all():
+        raise ProtocolError("box contains non-finite values")
     header = pack_header(IMDHeaderType.BOX, 1)
     return header + arr.astype(_f4(endian)).tobytes()
 
@@ -247,6 +268,8 @@ def parse_box(body: bytes, endian: Endian) -> np.ndarray:
     if len(body) < _BOX_BODY:
         raise ProtocolError(f"box needs {_BOX_BODY} bytes, got {len(body)}")
     arr = np.frombuffer(body[:_BOX_BODY], dtype=_f4(endian)).astype(np.float64)
+    if not np.isfinite(arr).all():
+        raise ProtocolError("box contains non-finite values")
     return arr.reshape(3, 3)
 
 
@@ -259,6 +282,8 @@ def pack_array(htype: IMDHeaderType, arr_n3, endian: Endian) -> bytes:
     if htype not in _ARRAY_TYPES:
         raise ProtocolError(f"{htype!r} is not an (N,3) array packet")
     arr = np.asarray(arr_n3, dtype=np.float64).reshape(-1, 3)
+    if not np.isfinite(arr).all():
+        raise ProtocolError(f"{htype.name} contains non-finite values")
     header = pack_header(htype, arr.shape[0])
     return header + arr.reshape(-1).astype(_f4(endian)).tobytes()
 
@@ -268,6 +293,8 @@ def parse_array(body: bytes, n_atoms: int, endian: Endian) -> np.ndarray:
     if len(body) < expected:
         raise ProtocolError(f"array needs {expected} bytes for {n_atoms} atoms, got {len(body)}")
     arr = np.frombuffer(body[:expected], dtype=_f4(endian)).astype(np.float64)
+    if not np.isfinite(arr).all():
+        raise ProtocolError("array contains non-finite values")
     return arr.reshape(n_atoms, 3)
 
 
@@ -283,6 +310,12 @@ def pack_mdcomm(indices, forces_n3, endian: Endian) -> bytes:
     frc = np.asarray(forces_n3, dtype=np.float64).reshape(-1, 3)
     if idx.shape[0] != frc.shape[0]:
         raise ProtocolError(f"mdcomm index/force mismatch: {idx.shape[0]} != {frc.shape[0]}")
+    if np.unique(idx).size != idx.size:
+        raise ProtocolError("mdcomm atom indices must not contain duplicates")
+    if idx.size and (idx.min() < np.iinfo(np.int32).min or idx.max() > np.iinfo(np.int32).max):
+        raise ProtocolError("mdcomm atom index is outside the int32 wire range")
+    if not np.isfinite(frc).all():
+        raise ProtocolError("mdcomm forces contain non-finite values")
     n = idx.shape[0]
     header = pack_header(IMDHeaderType.MDCOMM, n)
     idx_bytes = idx.astype(_i4(endian)).tobytes()
@@ -296,6 +329,10 @@ def parse_mdcomm(body: bytes, n: int, endian: Endian) -> tuple[np.ndarray, np.nd
         raise ProtocolError(f"mdcomm needs {expected} bytes for n={n}, got {len(body)}")
     idx = np.frombuffer(body[: n * 4], dtype=_i4(endian)).astype(np.int64)
     frc = np.frombuffer(body[n * 4 : expected], dtype=_f4(endian)).astype(np.float64)
+    if np.unique(idx).size != idx.size:
+        raise ProtocolError("mdcomm atom indices must not contain duplicates")
+    if not np.isfinite(frc).all():
+        raise ProtocolError("mdcomm forces contain non-finite values")
     return idx, frc.reshape(n, 3)
 
 

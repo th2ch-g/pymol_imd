@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -60,6 +61,10 @@ class IMDClient:
         self.session: SessionInfo | None = None
         self._plan: list[IMDHeaderType] = []
         self._closed = False
+        self._rx_buffer = bytearray()
+        self._partial_frame: Frame | None = None
+        self._frame_packet_index = 0
+        self._n_atoms: int | None = None
 
     @property
     def closed(self) -> bool:
@@ -68,19 +73,33 @@ class IMDClient:
     def connect(self) -> SessionInfo:
         """Open the connection, parse handshake + session info, send Go."""
         self.conn = transport.connect(self.host, self.port, timeout=self.connect_timeout)
-        # The handshake reveals the server's body endianness.
-        self.endian = protocol.parse_handshake(
-            transport.recv_exact(self.conn.sock, protocol.HEADER_SIZE)
-        )
-        self.conn.endian = self.endian
-        # Session info packet.
-        htype, slot = self.conn.recv_header()
-        if htype is not IMDHeaderType.SESSIONINFO:
-            raise protocol.ProtocolError(f"expected SESSIONINFO, got {htype.name}")
-        self.session = protocol.parse_sessioninfo(self.conn.recv_body(slot))
-        self._plan = self._frame_plan(self.session)
-        # Go: tell the engine to start streaming frames.
-        self.conn.send_bytes(protocol.pack_control(IMDHeaderType.GO))
+        try:
+            # The handshake reveals the server's body endianness.
+            self.endian = protocol.parse_handshake(
+                transport.recv_exact(self.conn.sock, protocol.HEADER_SIZE)
+            )
+            self.conn.endian = self.endian
+            htype, slot = self.conn.recv_header()
+            if htype is not IMDHeaderType.SESSIONINFO:
+                raise protocol.ProtocolError(f"expected SESSIONINFO, got {htype.name}")
+            if slot != 7:
+                raise protocol.ProtocolError(f"SESSIONINFO dataslot must be 7, got {slot}")
+            self.session = protocol.parse_sessioninfo(self.conn.recv_body(slot))
+            self._plan = self._frame_plan(self.session)
+            if not self._plan:
+                raise protocol.ProtocolError("SESSIONINFO enables no frame packets")
+            self._rx_buffer.clear()
+            self._partial_frame = None
+            self._frame_packet_index = 0
+            self._n_atoms = None
+            self._closed = False
+            # Go: tell the engine to start streaming frames.
+            self.conn.send_bytes(protocol.pack_control(IMDHeaderType.GO))
+        except Exception:
+            self.conn.close()
+            self.conn = None
+            self._closed = True
+            raise
         logger.info("connected to %s:%d; session=%s", self.host, self.port, self.session)
         return self.session
 
@@ -105,44 +124,81 @@ class IMDClient:
     def poll_frame(self) -> Frame | None:
         """Return the next full frame, or None if none is ready this tick.
 
-        Only the first header is read under a short timeout; once it arrives the
-        rest of the frame is read blocking (frames stream contiguously, so an
-        8-byte header splitting across the poll window is not a concern on a
-        localhost / LAN socket).
+        Bytes are accumulated in a persistent buffer. A timeout can therefore
+        split either a header or body without discarding data or desynchronizing
+        the next call. No part of a frame is read with an unbounded timeout.
         """
-        if self._closed or not self._plan:
+        if self._closed or not self._plan or self.conn is None:
             return None
-        self.conn.settimeout(self._poll_timeout)
-        try:
-            htype, slot = self.conn.recv_header()
-        except (TimeoutError, BlockingIOError):
-            return None
-        except transport.ConnectionClosed:
-            self._closed = True
-            return None
-        self.conn.settimeout(None)
-        try:
-            return self._assemble_frame(htype, slot)
-        except transport.ConnectionClosed:
-            self._closed = True
-            return None
+        deadline = time.monotonic() + self._poll_timeout
+        while True:
+            frame = self._pop_buffered_frame()
+            if frame is not None:
+                return frame
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return None
+            self.conn.settimeout(remaining)
+            try:
+                chunk = self.conn.sock.recv(constants.IMD_RECV_BUFSIZE)
+            except (TimeoutError, BlockingIOError):
+                return None
+            except OSError:
+                self._closed = True
+                return None
+            if not chunk:
+                self._closed = True
+                if self._rx_buffer or self._partial_frame is not None:
+                    raise protocol.ProtocolError("connection closed in the middle of an IMD frame")
+                return None
+            self._rx_buffer.extend(chunk)
 
-    def _assemble_frame(self, first_htype: IMDHeaderType, first_slot: int) -> Frame:
-        frame = Frame()
-        htype, slot = first_htype, first_slot
-        for i, expected in enumerate(self._plan):
-            if i > 0:
-                htype, slot = self.conn.recv_header()
+    def _pop_buffered_frame(self) -> Frame | None:
+        """Decode complete packets from ``_rx_buffer`` without reading."""
+        while True:
+            if len(self._rx_buffer) < protocol.HEADER_SIZE:
+                return None
+            htype, slot = protocol.unpack_header(self._rx_buffer)
+            expected = self._plan[self._frame_packet_index]
             if htype is not expected:
                 raise protocol.ProtocolError(
                     f"frame desync: expected {expected.name}, got {htype.name}"
                 )
-            body = self.conn.recv_body(protocol.body_size(htype, slot))
-            self._store(frame, htype, slot, body)
-        return frame
+            self._validate_frame_slot(htype, slot)
+            body_nbytes = protocol.body_size(htype, slot)
+            packet_nbytes = protocol.HEADER_SIZE + body_nbytes
+            if len(self._rx_buffer) < packet_nbytes:
+                return None
+            body = bytes(self._rx_buffer[protocol.HEADER_SIZE : packet_nbytes])
+            del self._rx_buffer[:packet_nbytes]
+            if self._partial_frame is None:
+                self._partial_frame = Frame()
+            self._store(self._partial_frame, htype, slot, body)
+            self._frame_packet_index += 1
+            if self._frame_packet_index == len(self._plan):
+                frame = self._partial_frame
+                self._partial_frame = None
+                self._frame_packet_index = 0
+                return frame
+
+    def _validate_frame_slot(self, htype: IMDHeaderType, slot: int) -> None:
+        if htype in (IMDHeaderType.TIME, IMDHeaderType.ENERGIES, IMDHeaderType.BOX):
+            if slot != 1:
+                raise protocol.ProtocolError(f"{htype.name} dataslot must be 1, got {slot}")
+            return
+        if slot <= 0:
+            raise protocol.ProtocolError(f"{htype.name} atom count must be positive, got {slot}")
+        if self._n_atoms is None:
+            self._n_atoms = slot
+        elif slot != self._n_atoms:
+            raise protocol.ProtocolError(
+                f"{htype.name} atom count changed from {self._n_atoms} to {slot}"
+            )
 
     def _store(self, frame: Frame, htype: IMDHeaderType, slot: int, body: bytes) -> None:
         e = self.endian
+        if e is None:
+            raise protocol.ProtocolError("body endianness is not negotiated")
         if htype is IMDHeaderType.TIME:
             frame.dt_ps, frame.time_ps, frame.step = protocol.parse_time(body, e)
         elif htype is IMDHeaderType.ENERGIES:
@@ -158,9 +214,13 @@ class IMDClient:
 
     def send_forces(self, indices: np.ndarray, forces_kj_per_ang: np.ndarray) -> None:
         """Send an MDComm force packet (forces already in kJ/mol/angstrom)."""
+        if self.conn is None or self.endian is None or self._closed:
+            raise transport.ConnectionClosed("IMD client is not connected")
         self.conn.send_bytes(protocol.pack_mdcomm(indices, forces_kj_per_ang, self.endian))
 
     def send_control(self, htype: IMDHeaderType, slot: int = 0) -> None:
+        if self.conn is None or self._closed:
+            raise transport.ConnectionClosed("IMD client is not connected")
         self.conn.send_bytes(protocol.pack_control(htype, slot))
 
     def disconnect(self) -> None:
@@ -169,6 +229,7 @@ class IMDClient:
         with contextlib.suppress(OSError):
             self.conn.send_bytes(protocol.pack_control(IMDHeaderType.DISCONNECT))
         self.conn.close()
+        self.conn = None
         self._closed = True
 
 
@@ -236,7 +297,12 @@ class PyMOLIMDClient:
         #    so the display overwrite below never wipes an in-progress pull.
         self._send_drag_forces()
         # 2) Drain to the newest available frame, then show it.
-        latest = self._drain_to_latest()
+        try:
+            latest = self._drain_to_latest()
+        except (protocol.ProtocolError, OSError) as exc:
+            logger.error("IMD client stream stopped: %s", exc)
+            self.stop()
+            return
         if latest is not None and latest.positions_ang is not None:
             self._display(latest.positions_ang)
             self._last_server_ang = latest.positions_ang
@@ -303,7 +369,7 @@ class PyMOLIMDClient:
             forces_ang = forces_nm[active_idx] * constants.KJ_PER_NM_TO_KJ_PER_ANGSTROM
             try:
                 self.client.send_forces(active_idx, forces_ang)
-            except OSError:
+            except (transport.ConnectionClosed, OSError):
                 self.stop()
                 return
         self._active_prev = active_set

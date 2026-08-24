@@ -45,7 +45,7 @@ def _make_dragging_imd(bundle, *, n_drag_atoms: int = 2):
         pos[:n_drag_atoms] += np.array([0.05, 0.0, 0.0])
         return pos
 
-    def _no_sync() -> None:
+    def _no_sync(_state=None) -> None:
         # Headless: no PyMOL window to write back to. The recording path is
         # what we exercise here, so skip the coordinate sync entirely.
         return None
@@ -179,7 +179,29 @@ def main(pdb_id: str = "1aki", n_steps: int = 6) -> int:
         _check_csv(csv_path, max_force_kj=imd.config.max_force_kj)
         _check_state_csv(state_path, pbc=False, expected_rows=n_steps)
 
+        # Invalid trajectory formats must fail before touching an existing
+        # path, and two recorders must never share one output file.
+        invalid_traj = tmp_path / "preserve.invalid"
+        invalid_traj.write_text("sentinel")
+        imd.set_recording(traj=str(invalid_traj))
+        try:
+            imd.start_recording()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid trajectory extension was accepted")
+        assert invalid_traj.read_text() == "sentinel"
+        try:
+            imd.set_recording(traj=str(xtc), force_csv=str(xtc))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("duplicate recording output paths were accepted")
+
         # --- re-run safety: same paths again, frame count must not double ---
+        imd.set_recording(
+            traj=str(xtc), traj_interval=1, force_csv=str(csv_path), state_csv=str(state_path)
+        )
         imd.start_recording()
         for _ in range(n_steps):
             imd.step()

@@ -66,8 +66,8 @@ ML/MM speedup (10-100x vs CPU). The default env stays CPU-only and unaffected.
 
 ```bash
 pixi install -e gpu
-pixi run -e gpu pymol_imd input.pdb --level mlmm \
-    --ml-selection "resi 30-50" --ml-charge 0 --ml-mult 1 --run
+pixi run -e gpu pymol_imd local input.pdb --level mlmm \
+    --ml-selection "resi 30-50" --ml-charge 0 --ml-mult 1
 ```
 
 ---
@@ -76,14 +76,14 @@ pixi run -e gpu pymol_imd input.pdb --level mlmm \
 
 ```bash
 # Atomistic IMD on ubiquitin
-pixi run pymol_imd 1ubq.pdb --level aa --minimize --run
+pixi run pymol_imd local 1ubq.pdb --level aa --minimize
 
 # CG (Martini 3, 20 fs timestep)
-pixi run pymol_imd 1ubq.pdb --level cg --minimize --run
+pixi run pymol_imd local 1ubq.pdb --level cg --minimize
 
 # ONIOM ML/MM with AIMNet2 (default) on residue 1
-pixi run pymol_imd 1ubq.pdb --level mlmm \
-    --ml-selection "resi 1 and resn MET" --ml-charge 0 --ml-mult 1 --run
+pixi run pymol_imd local 1ubq.pdb --level mlmm \
+    --ml-selection "resi 1 and resn MET" --ml-charge 0 --ml-mult 1
 ```
 
 PyMOL opens with Editing mode preselected, so **Ctrl + left-drag** on an
@@ -93,62 +93,73 @@ OpenMM each frame.
 Show the generated PyMOL command without launching:
 
 ```bash
-pixi run pymol_imd 1ubq.pdb --level aa --print-only
+pixi run pymol_imd launch 1ubq.pdb --level aa --print-only
 ```
+
+The CLI requires one of four subcommands:
+
+- `launch`: configure and open PyMOL; add `--run` to start production.
+- `local`: configure, open PyMOL, and start production automatically.
+- `serve`: run the headless IMDv3 engine.
+- `connect`: open PyMOL as an IMDv3 client.
+
+The former implicit form `pymol_imd <PDB>` was removed in 0.2.0; use
+`pymol_imd launch <PDB>` or `pymol_imd local <PDB>`.
 
 ### CLI flags
 
 All numeric / string knobs are optional; each falls back to its single-source
 default in `pymol_imd/constants.py` (per-backend where noted).
+`setup` below means the `launch`, `local`, and `serve` subcommands.
 
-| Flag | Levels | Description |
+| Flag | Scope | Description |
 |---|---|---|
-| `--level {aa,cg,mlmm}` | all | Simulation backend (default: `aa`) |
-| `--pbc` | all | Enable periodic box / NPT. Without it (default): AA/MLMM use GBn2 implicit solvent, CG auto-boxes — all NVT |
-| `--implicit-solvent {auto,none,gbn2,obc2,obc1,gbn,hct}` | `aa`, `mlmm` | GB implicit-solvent model. Default `auto` = GBn2 (off under `--pbc`); `none` = in-vacuo |
-| `--temperature K` | all | Langevin thermostat temperature (default 300) |
-| `--nsteps-per-frame N` | all | MD steps per GUI frame (default 1) |
-| `--drag-level {atom,residue,chain}` | all | Mouse-drag granularity; `residue`/`chain` grab and pull a whole residue/chain (default `atom`) |
-| `--const-k K` | all | Pull-force scale (kJ/mol/nm); default per backend (AA/MLMM 50000, CG 10000) |
-| `--max-force-kj F` | all | Per-atom \|F\| cap on the pull force (kJ/mol/nm, default 5000) |
-| `--integrator {langevin,langevin_middle}` | all | Langevin scheme; default per backend (AA `langevin_middle`, CG/MLMM `langevin`) |
-| `--platform {auto,cuda,opencl,cpu,reference}` | all | OpenMM compute platform for the MM engine; `auto` (default) picks the fastest available (CUDA > OpenCL > CPU). Separate from ML/MM `--ml-device` |
-| `--timestep-ps PS` | all | MD timestep; default per backend (AA 0.002 / CG 0.020 / MLMM 0.0005) |
-| `--friction PER_PS` | all | Langevin friction 1/ps (default 1.0) |
-| `--pressure BAR` | all | Barostat pressure with `--pbc` (default 1.0) |
-| `--energy-cutoff-kj E` | all | \|U\| above this halts the loop as diverged (default 1e9) |
-| `--frame-interval-ms MS` | all | Qt timer tick interval for the IMD / minimize loops (default 1) |
-| `--nonbonded-cutoff-nm NM` | all | Nonbonded cutoff; default per backend (AA/MLMM 1.0, CG 1.1) |
-| `--box-padding-nm NM` | `aa`, `cg` | Bounding-box padding when a box is built (default 1.0) |
-| `--no-mouse-force` | all | Disable user-pull |
-| `--minimize` | all | Run `imd_minimize` after setup |
-| `--min-max-iter N` | all | Minimizer iterations per chunk, with `--minimize` (default 50) |
-| `--min-max-chunks N` | all | Max minimize chunks, with `--minimize` (default 200) |
-| `--min-tol-kj E` | all | Minimize convergence tolerance kJ/mol, with `--minimize` (default 1e-3) |
-| `--run` | all | Run `imd_run` after setup |
-| `--traj-out PATH` | all | Record a trajectory during `imd_run` (`.xtc`/`.dcd`/`.pdb` by extension); needs `--run` |
-| `--traj-interval N` | all | Trajectory: write every N GUI frames (default 1) |
-| `--force-csv PATH` | all | Record user pull forces to CSV (`frame,step,time_ps,atom_index,fx,fy,fz,fmag`, atom_index 0-based); needs `--run` |
-| `--force-csv-interval N` | all | Force CSV: write every N GUI frames (default 1) |
-| `--state-csv PATH` | all | Record thermodynamic state CSV (energies + `temperature_k`; `+volume_nm3,density_g_cm3` under `--pbc`); needs `--run` |
-| `--state-csv-interval N` | all | State CSV: write every N GUI frames (default 1) |
-| `--no-record` | all | Disable the default trajectory + force-CSV + state-CSV recording |
-| `--topology-dir DIR` | all | Output dir for intermediate / topology files (default `./<stem>_topology`) |
-| `--ligand-sdf PATH` | `aa` | Ligand SDF for GAFF + AM1-BCC parameterisation |
-| `--ph PH` | `aa` | `Modeller.addHydrogens` protonation pH (default 7.4) |
-| `--gaff-version VER` | `aa` | GAFF version for ligand templates (default `gaff-2.2.20`) |
-| `--ff NAME` | `cg`  | Martini forcefield label (default: `martini3001`) |
-| `--no-elastic-network` | `cg` | Skip martinize2 `-elastic` |
-| `--martinize-maxwarn N` | `cg` | martinize2 `-maxwarn` value (default 99999) |
-| `--ml-selection SEL` | `mlmm` | **Required.** PyMOL selection language (`resi 1 and resn MET`, `chain A and not resn HOH`, …) |
-| `--ml-backend {uma,orb,mace,aimnet2}` | `mlmm` | MLIP backend (default: `aimnet2`) |
-| `--ml-device {auto,cuda,mps,cpu}` | `mlmm` | Torch device; `auto` prefers cuda → mps → cpu |
-| `--ml-charge Z`, `--ml-mult M` | `mlmm` | **Required.** ML region net charge / spin multiplicity |
-| `--link-atom-method {scaled,fixed,none}` | `mlmm` | QM/MM boundary link-atom placement (default `scaled`) |
-| `--ml-compile` | `mlmm` | Opt-in `torch.compile` for the MLIP (numerically ~identical) |
-| `--enable-cueq` | `mlmm` | Opt-in cuEquivariance for MACE (CUDA; `pixi run install-cueq`) |
-| `--pymol PATH` | all | Override PyMOL executable |
-| `--print-only` | all | Show the underlying `pymol -d ...` and exit |
+| `--level {aa,cg,mlmm}` | setup | Simulation backend (default: `aa`) |
+| `--pbc` | setup | Enable periodic box / NPT. Without it (default): AA/MLMM use GBn2 implicit solvent, CG auto-boxes — all NVT |
+| `--implicit-solvent {auto,none,gbn2,obc2,obc1,gbn,hct}` | setup: `aa`, `mlmm` | GB implicit-solvent model. Default `auto` = GBn2 (off under `--pbc`); `none` = in-vacuo |
+| `--temperature K` | setup | Langevin thermostat temperature (default 300) |
+| `--nsteps-per-frame N` | launch/local | MD steps per GUI frame (default 1); `serve` uses `--rate` |
+| `--drag-level {atom,residue,chain}` | launch/local | Mouse-drag granularity; `residue`/`chain` grab and pull a whole residue/chain (default `atom`) |
+| `--const-k K` | launch/local | Pull-force scale (kJ/mol/nm); default per backend (AA/MLMM 50000, CG 10000) |
+| `--max-force-kj F` | setup/connect | Per-atom \|F\| safety limit (kJ/mol/nm, default 5000); over-limit pulls are skipped, not clamped |
+| `--integrator {langevin,langevin_middle}` | setup | Langevin scheme; default per backend (AA `langevin_middle`, CG/MLMM `langevin`) |
+| `--platform {auto,cuda,opencl,cpu,reference}` | setup | OpenMM compute platform for the MM engine; `auto` (default) picks the fastest available (CUDA > OpenCL > CPU). Separate from ML/MM `--ml-device` |
+| `--timestep-ps PS` | setup | MD timestep; default per backend (AA 0.002 / CG 0.020 / MLMM 0.0005) |
+| `--friction PER_PS` | setup | Langevin friction 1/ps (default 1.0) |
+| `--pressure BAR` | setup | Barostat pressure with `--pbc` (default 1.0) |
+| `--energy-cutoff-kj E` | setup | \|U\| above this halts the loop as diverged (default 1e9) |
+| `--frame-interval-ms MS` | launch/local/connect | Qt/client timer interval |
+| `--nonbonded-cutoff-nm NM` | setup | Nonbonded cutoff; default per backend (AA/MLMM 1.0, CG 1.1) |
+| `--box-padding-nm NM` | setup | Bounding-box padding when a box is built (default 1.0) |
+| `--no-mouse-force` | launch/local | Disable user-pull |
+| `--minimize` | setup | Minimize after setup |
+| `--min-max-iter N` | setup | Minimizer iterations per chunk, with `--minimize` (default 50) |
+| `--min-max-chunks N` | setup | Max minimize chunks, with `--minimize` (default 200) |
+| `--min-tol-kj E` | setup | Minimize convergence tolerance kJ/mol, with `--minimize` (default 1e-3) |
+| `--run` | launch | Run `imd_run` after setup; `local` implies it and `serve` starts after GO |
+| `--traj-out PATH` | launch/local/serve | Record a trajectory (`.xtc`/`.dcd`/`.pdb` by extension) |
+| `--traj-interval N` | setup | Trajectory: write every N GUI/server frames (default 1) |
+| `--force-csv PATH` | setup | Record user pull forces to CSV (`frame,step,time_ps,atom_index,fx,fy,fz,fmag`, atom index 0-based) |
+| `--force-csv-interval N` | setup | Force CSV: write every N GUI/server frames (default 1) |
+| `--state-csv PATH` | setup | Record thermodynamic state CSV (energies + `temperature_k`; `+volume_nm3,density_g_cm3` under `--pbc`) |
+| `--state-csv-interval N` | setup | State CSV: write every N GUI/server frames (default 1) |
+| `--no-record` | setup | Disable the default trajectory + force-CSV + state-CSV recording |
+| `--topology-dir DIR` | setup | Output dir for intermediate / topology files (default `./<stem>_topology`) |
+| `--ligand-sdf PATH` | setup: `aa` | Ligand SDF for GAFF + AM1-BCC parameterisation |
+| `--ph PH` | setup: `aa` | `Modeller.addHydrogens` protonation pH (default 7.4) |
+| `--gaff-version VER` | setup: `aa` | GAFF version for ligand templates (default `gaff-2.2.20`) |
+| `--ff NAME` | setup: `cg`  | Martini forcefield label (default: `martini3001`) |
+| `--no-elastic-network` | setup: `cg` | Skip martinize2 `-elastic` |
+| `--martinize-maxwarn N` | setup: `cg` | martinize2 `-maxwarn` value (default 99999) |
+| `--ml-selection SEL` | setup: `mlmm` | **Required.** PyMOL selection language (`resi 1 and resn MET`, `chain A and not resn HOH`, …) |
+| `--ml-backend {uma,orb,mace,aimnet2}` | setup: `mlmm` | MLIP backend (default: `aimnet2`) |
+| `--ml-device {auto,cuda,mps,cpu}` | setup: `mlmm` | Torch device; `auto` prefers cuda → mps → cpu |
+| `--ml-charge Z`, `--ml-mult M` | setup: `mlmm` | **Required.** ML region net charge / spin multiplicity |
+| `--link-atom-method {scaled,fixed,none}` | setup: `mlmm` | QM/MM boundary link-atom placement (default `scaled`) |
+| `--ml-compile` | setup: `mlmm` | Opt-in `torch.compile` for the MLIP (numerically ~identical) |
+| `--enable-cueq` | setup: `mlmm` | Opt-in cuEquivariance for MACE (CUDA; `pixi run install-cueq`) |
+| `--pymol PATH` | launch/local/connect | Override PyMOL executable |
+| `--print-only` | launch/local/connect | Show the underlying `pymol -d ...` and exit |
 
 ---
 
@@ -179,10 +190,11 @@ The `connect` client must load the server's **prepared** PDB (the
 topology. Inside PyMOL the same is available as `imd_connect host, port` /
 `imd_disconnect`.
 
-`serve` accepts every `--level` / backend / IMD flag from the table above
+`serve` accepts system/backend, minimization, safety, and recording flags
 (e.g. `--ml-selection` for `--level mlmm`, `--minimize`) plus server flags:
 `--host`, `--port`, `--rate` (MD steps per streamed frame), `--send-velocities`,
-`--send-forces`. `local` takes only the launch flags (it is **not** a socket
+`--send-forces`. GUI-only flags such as `--const-k`, `--drag-level`,
+`--frame-interval-ms`, and `--pymol` are rejected. `local` takes only launch flags (it is **not** a socket
 server, so it has no `--host/--port/--rate`). `connect` shares the setup view
 (cartoon for AA/ML-MM, colored spheres for CG — auto-detected) and 3-Button
 Editing, so Ctrl+left-drag pulls atoms just like in-process.
@@ -255,13 +267,18 @@ PyMOL> imd_record off           # disarm (optional)
   reports no instantaneous pressure and the IMD pull force contaminates the virial.
 - All three default **on** — the CLI writes `<stem>.xtc` / `<stem>_forces.csv` /
   `<stem>_state.csv`; `--no-record` disables them together.
+- `serve` creates collision-free files per successful client connection, for
+  example `<stem>.session-0001.xtc`, and prints their paths in `IMD_SESSION`.
+- CSV streams flush every 100 rows and always flush remaining rows on normal
+  stop, disconnect, divergence, or error.
 - `traj_interval` / `force_csv_interval` / `state_csv_interval` are in **GUI
   frames** (default 1): `traj_interval=5` writes every 5th frame.
 
-From the CLI the same is available via flags (recording requires `--run`):
+From the CLI the same is available via flags; `local` runs immediately,
+`launch` requires `--run`, and `serve` starts recording after each client's GO:
 
 ```bash
-pixi run pymol_imd input.pdb --level aa --run \
+pixi run pymol_imd local input.pdb --level aa \
     --traj-out run.xtc --traj-interval 5 \
     --force-csv pull.csv --state-csv state.csv
 ```
@@ -331,8 +348,8 @@ through the placement Jacobian.
    `F_ML - F_MM_subset`.
 4. **Loop**: a Qt timer steps the simulation, reads PyMOL atom positions,
    computes `delta = pymol_xyz - openmm_xyz` for each atom, multiplies by
-   `const_k`, then caps the resulting force magnitude at `max_force_kj` (a
-   |F| cap) and pushes it into the pull `CustomExternalForce`. Then OpenMM
+   `const_k`. If any requested force exceeds `max_force_kj`, the whole frame's
+   pull is skipped; otherwise it is pushed into the pull `CustomExternalForce`. Then OpenMM
    integrates one frame's worth of steps and the new coordinates are
    written back into PyMOL via `cmd.alter_state`.
 5. **Safety**: every step potential energy is checked; NaN / |U| above
@@ -343,11 +360,11 @@ through the placement Jacobian.
 ## Troubleshooting
 
 ### MLIP / Apple Silicon (MPS)
-MPS cannot allocate float64 storage, which **MACE / ORB / AIMNet2 all
-need at model-load time** (their weight files are float64). The plugin
-detects this and silently falls back to CPU with a notice like
-`AIMNet2 weights are float64 but MPS cannot allocate float64 storage;
-running on CPU instead`. CPU MLIPs are usable for small ML regions
+The currently bundled AIMNet2, MACE, and ORB paths do not run reliably on
+MPS (for backend-specific Warp, dtype, or graph-operation reasons). The plugin
+resolves this before model logging/thread setup and falls back to CPU with an
+explicit notice. An explicitly requested unavailable MPS/CUDA device is an
+error. CPU MLIPs are usable for small ML regions
 (tens of atoms); pick a larger backend only if you have CUDA.
 
 ### UMA model gated
@@ -356,8 +373,9 @@ repo. After `pixi run install-uma`, run `pixi run huggingface-cli login`
 and request access at https://huggingface.co/facebook/UMA.
 
 ### CG initial Martini download
-First `imd_setup_cg` downloads `martini_v3.0.0.itp` (~2 MB) into
-`~/.cache/pymol_imd/martini3/`. Subsequent runs are offline.
+First `imd_setup_cg` downloads `martini_v3.0.0.itp` (~15.3 MB) into
+`~/.cache/pymol_imd/martini3/`. The download is atomic and SHA-256 checked;
+subsequent runs are offline.
 
 ### Diverging simulation
 If the structure flies apart, `imd_run` stops automatically with a hint:
@@ -393,6 +411,7 @@ pymol_imd/
     ├── smoke_record.py Headless trajectory + force-CSV recording smoke
     ├── smoke_drag.py   Headless drag-level (atom/residue/chain) group-expansion smoke
     ├── smoke_socket.py Headless IMDv3 server<->client round-trip + protocol regression
+    ├── smoke_cli.py    Headless CLI/subcommand/coercion regression
     └── refs/           Pinned coordinates + reference ML/MM delta arrays
 ```
 
@@ -400,7 +419,7 @@ pymol_imd/
 
 ## License
 
-GPLv3 (see [LICENSE](LICENSE)).
+MIT (see [LICENSE](LICENSE)).
 
 Acknowledgements: this project sits on top of OpenMM, PyMOL, vermouth /
 martini_openmm, and the MACE / UMA / ORB / AIMNet2 MLIPs. See their

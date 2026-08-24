@@ -21,7 +21,7 @@ import os
 # imd_setup_mlmm on a Mac. Set BEFORE importing torch (downstream of this).
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .commands import (  # noqa: F401
     imd_change,
@@ -48,5 +48,3 @@ __all__ = [
     "imd_connect",
     "imd_disconnect",
 ]
-
-print(f"pymol_imd {__version__} loaded")

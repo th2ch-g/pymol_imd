@@ -8,6 +8,7 @@ and AM1-BCC charges from OpenFF. Missing hydrogens are added with
 from __future__ import annotations
 
 import logging
+import math
 import tempfile
 from pathlib import Path
 
@@ -55,6 +56,12 @@ class AABackend:
         **_: object,
     ) -> SystemBundle:
         pdb_path = Path(pdb_path)
+        if not math.isfinite(nonbonded_cutoff_nm) or nonbonded_cutoff_nm <= 0.0:
+            raise ValueError("nonbonded_cutoff_nm must be finite and > 0")
+        if not math.isfinite(box_padding_nm) or box_padding_nm < 0.0:
+            raise ValueError("box_padding_nm must be finite and >= 0")
+        if not math.isfinite(ph) or not 0.0 <= ph <= 14.0:
+            raise ValueError("ph must be finite and between 0 and 14")
         # GB implicit solvent (default) is selected by appending its XML to the
         # ForceField file list; the resolver yields None for vacuo / under pbc.
         implicit_xml = constants.resolve_implicit_solvent(implicit_solvent, pbc=pbc)
@@ -78,7 +85,11 @@ class AABackend:
 
         nonbonded_method = PME if pbc else NoCutoff
         if pbc:
-            _set_bounding_box(modeller, padding_nm=box_padding_nm)
+            _set_bounding_box(
+                modeller,
+                padding_nm=box_padding_nm,
+                nonbonded_cutoff_nm=nonbonded_cutoff_nm,
+            )
 
         system = forcefield.createSystem(
             modeller.topology,
@@ -105,7 +116,12 @@ class AABackend:
         )
 
 
-def _set_bounding_box(modeller: Modeller, *, padding_nm: float) -> None:
+def _set_bounding_box(
+    modeller: Modeller,
+    *,
+    padding_nm: float,
+    nonbonded_cutoff_nm: float = constants.AA_NONBONDED_CUTOFF_NM,
+) -> None:
     """Set a cubic periodic box that encloses the molecule with ``padding_nm`` slack."""
     from openmm import Vec3
 
@@ -113,7 +129,9 @@ def _set_bounding_box(modeller: Modeller, *, padding_nm: float) -> None:
     xs = [p[0] for p in positions]
     ys = [p[1] for p in positions]
     zs = [p[2] for p in positions]
-    side = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) + 2.0 * padding_nm
+    requested_side = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) + 2.0 * padding_nm
+    minimum_side = 2.0 * nonbonded_cutoff_nm + constants.MINIMUM_BOX_MARGIN_NM
+    side = max(requested_side, minimum_side)
     # The unit must wrap the WHOLE triple: ``(Vec3, Vec3, Vec3) * nanometer``
     # yields one Quantity(list-of-Vec3), which is what getPeriodicBoxVectors
     # returns and what computeLengthsAndAngles strips on PDB write. Uniting each

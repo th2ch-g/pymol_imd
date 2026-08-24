@@ -13,6 +13,8 @@ heavier rebuilding (missing residues, side-chain repair) is out of scope.
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -25,6 +27,32 @@ from . import constants
 logger = logging.getLogger(__name__)
 
 RCSB_URL = "https://files.rcsb.org/download/{pdb_id}.pdb"
+
+
+def _download_atomic(url: str, dest: Path, *, validate=None) -> None:
+    """Download to a sibling temporary file, validate, then atomically replace."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".tmp", dir=dest.parent)
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        urllib.request.urlretrieve(url, tmp_path)
+        if validate is not None:
+            validate(tmp_path)
+        os.replace(tmp_path, dest)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _validate_pdb(path: Path) -> None:
+    if path.stat().st_size == 0:
+        raise ValueError("downloaded PDB is empty")
+    try:
+        pdb = PDBFile(str(path))
+    except Exception as exc:
+        raise ValueError(f"downloaded file is not a valid PDB: {exc}") from exc
+    if pdb.topology.getNumAtoms() == 0:
+        raise ValueError("downloaded PDB contains no atoms")
 
 
 def fetch_pdb(pdb_id: str, out_dir: Path | str = ".") -> Path:
@@ -40,15 +68,20 @@ def fetch_pdb(pdb_id: str, out_dir: Path | str = ".") -> Path:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     dest = out_dir / f"{pdb_id}.pdb"
-    if dest.exists() and dest.stat().st_size > 0:
-        logger.info("Using cached PDB %s", dest)
-        return dest
+    if dest.exists():
+        try:
+            _validate_pdb(dest)
+        except (OSError, ValueError) as exc:
+            logger.warning("Ignoring invalid cached PDB %s: %s", dest, exc)
+        else:
+            logger.info("Using cached PDB %s", dest)
+            return dest
 
     url = RCSB_URL.format(pdb_id=pdb_id.upper())
     logger.info("Downloading %s", url)
     try:
-        urllib.request.urlretrieve(url, dest)
-    except urllib.error.URLError as exc:
+        _download_atomic(url, dest, validate=_validate_pdb)
+    except (OSError, ValueError, urllib.error.URLError) as exc:
         raise RuntimeError(f"Failed to download {url}: {exc}") from exc
     return dest
 

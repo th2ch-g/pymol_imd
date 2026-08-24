@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import time
+from dataclasses import replace
 from pathlib import Path
 
-from . import constants
+from . import constants, protocol, transport
 from .backends.aa import AABackend
 from .backends.cg import CGBackend
 from .backends.mlmm import MLMMBackend
@@ -41,18 +43,41 @@ def _as_bool(value: object) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
-        return bool(value)
+        if value in (0, 1):
+            return bool(value)
+        raise ValueError(f"Boolean numeric value must be 0 or 1, got {value!r}")
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"Invalid boolean value {value!r}; use true/false, yes/no, on/off, or 1/0")
 
 
 def _as_int(value: object) -> int:
-    return int(value) if not isinstance(value, int) else value
+    if isinstance(value, bool):
+        raise ValueError(f"Expected an integer, got boolean {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"Expected an integer, got {value!r}")
+        return int(value)
+    text = str(value).strip()
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError(f"Expected an integer, got {value!r}") from exc
 
 
 def _as_float(value: object) -> float:
-    return float(value) if not isinstance(value, float) else value
+    if isinstance(value, bool):
+        raise ValueError(f"Expected a finite number, got boolean {value!r}")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"Expected a finite number, got {value!r}")
+    return result
 
 
 def _make_imd(bundle, pymol_object: str, **kwargs) -> IMDSystem:
@@ -78,9 +103,14 @@ def _resolve_integrator(backend, integrator: object) -> str:
     Mirrors :func:`_resolve_const_k`: AA recommends ``langevin_middle``,
     CG / MLMM recommend ``langevin`` — all sourced from constants.py.
     """
-    if integrator is None:
-        return str(backend.recommended_integrator)
-    return str(integrator)
+    value = (
+        str(backend.recommended_integrator if integrator is None else integrator).strip().lower()
+    )
+    if value not in constants.SUPPORTED_INTEGRATORS:
+        raise ValueError(
+            f"Unknown integrator {value!r}. Choose from {constants.SUPPORTED_INTEGRATORS}."
+        )
+    return value
 
 
 def _resolve_timestep_ps(backend, timestep_ps: object) -> float:
@@ -272,6 +302,20 @@ def _highlight_ml_region(obj_name: str, ml_indices: tuple[int, ...]) -> str:
     return sel_name
 
 
+def _prepare_new_setup() -> None:
+    """Stop all active loops and outputs before replacing global state."""
+    global _imd_client
+    _reset_timer(_timer)
+    _reset_timer(_timer_minimize)
+    if _imd_system is not None:
+        _imd_system.running = False
+        _imd_system.clear_pull_forces()
+        _imd_system.stop_recording()
+    if _imd_client is not None:
+        _imd_client.stop()
+        _imd_client = None
+
+
 # --------------------------------------------------------------- setup_* family
 def imd_setup_aa(
     pdb_file: str,
@@ -313,11 +357,15 @@ def imd_setup_aa(
     global _imd_system, _timer, _timer_minimize
     pdb_path = Path(pdb_file)
     ligand_path = Path(ligand_sdf) if ligand_sdf else None
+    pbc_enabled = _as_bool(pbc)
+    if pressure is not None and not pbc_enabled:
+        raise ValueError("pressure requires pbc=True")
+    _prepare_new_setup()
 
     backend = AABackend()
     aa_kwargs: dict = {
         "ligand_sdf": ligand_path,
-        "pbc": _as_bool(pbc),
+        "pbc": pbc_enabled,
         "work_dir": Path(work_dir) if work_dir else None,
     }
     if nonbonded_cutoff_nm is not None:
@@ -392,9 +440,13 @@ def imd_setup_cg(
     """
     global _imd_system, _timer, _timer_minimize
     pdb_path = Path(pdb_file)
+    pbc_enabled = _as_bool(pbc)
+    if pressure is not None and not pbc_enabled:
+        raise ValueError("pressure requires pbc=True")
+    _prepare_new_setup()
 
     cg_kwargs: dict = {
-        "pbc": _as_bool(pbc),
+        "pbc": pbc_enabled,
         "elastic_network": _as_bool(elastic_network),
     }
     if ff is not None:
@@ -527,10 +579,14 @@ def imd_setup_mlmm(
             "  imd_setup_mlmm input.pdb ml_selection='all'  # whole system (slow)"
         )
     pdb_path = Path(pdb_file)
+    pbc_enabled = _as_bool(pbc)
+    if pressure is not None and not pbc_enabled:
+        raise ValueError("pressure requires pbc=True")
+    _prepare_new_setup()
 
     backend = MLMMBackend()
     mlmm_kwargs: dict = {
-        "pbc": _as_bool(pbc),
+        "pbc": pbc_enabled,
         "ml_selection": ml_selection,
         "ml_backend": ml_backend,
         "ml_device": ml_device,
@@ -662,6 +718,7 @@ def imd_minimize(
     max_iter_per_chunk: object | None = None,
     max_chunks: object | None = None,
     tol_kj: object | None = None,
+    run_after: object = False,
 ) -> None:
     """Run energy minimization on the Qt event loop.
 
@@ -695,32 +752,49 @@ def imd_minimize(
     )
     chunk_cap = _as_int(max_chunks) if max_chunks is not None else constants.DEFAULT_MIN_MAX_CHUNKS
     tol = _as_float(tol_kj) if tol_kj is not None else constants.DEFAULT_MIN_ENERGY_TOL_KJ
-    _imd_system.running = True
+    start_run = _as_bool(run_after)
+    if max_iter < 0:
+        raise ValueError("max_iter_per_chunk must be >= 0")
+    if chunk_cap < 1:
+        raise ValueError("max_chunks must be >= 1")
+    if tol < 0.0:
+        raise ValueError("tol_kj must be >= 0")
+    system = _imd_system
+    system.reset_minimization()
+    system.running = True
 
     # Wrap counter in a list so the closure can rebind without `nonlocal`.
     chunks_done = [0]
 
+    def _finish(message: str, *, start_production: bool = True) -> None:
+        _timer_minimize.stop()
+        system.running = False
+        print(message)
+        if start_production and start_run and _imd_system is system:
+            imd_run()
+
     def _tick():
-        chunks_done[0] += 1
-        converged = _imd_system.minimize_step(max_iterations=max_iter, tol_kj=tol)
+        try:
+            chunks_done[0] += 1
+            converged = system.minimize_step(max_iterations=max_iter, tol_kj=tol)
+        except Exception as exc:
+            logger.exception("imd_minimize: minimization failed")
+            _finish(f"imd_minimize: stopped due to error — {exc}", start_production=False)
+            return
         if converged:
-            _timer_minimize.stop()
-            _imd_system.running = False
             total_iter = chunks_done[0] * max_iter
-            print(f"imd_minimize: converged at chunk {chunks_done[0]} ({total_iter} iter)")
+            _finish(f"imd_minimize: converged at chunk {chunks_done[0]} ({total_iter} iter)")
             return
         if chunks_done[0] >= chunk_cap:
-            _timer_minimize.stop()
-            _imd_system.running = False
             total_iter = chunks_done[0] * max_iter
-            print(
+            _finish(
                 f"imd_minimize: hit max_chunks={chunk_cap} ({total_iter} iter) "
                 "without convergence — raise max_chunks or relax tolerance if needed"
             )
 
     _reset_timer(_timer_minimize)
     _timer_minimize.timeout.connect(_tick)
-    _timer_minimize.start(_imd_system.config.frame_interval_ms)
+    _timer_minimize.start(system.config.frame_interval_ms)
     print(f"imd_minimize: started (max_chunks={chunk_cap}, iter_per_chunk={max_iter})")
 
 
@@ -789,6 +863,7 @@ def imd_stop() -> None:
         _timer.stop()
     if _timer_minimize is not None:
         _timer_minimize.stop()
+    _imd_system.clear_pull_forces()
     # Flush + close trajectory / CSV (idempotent; safe when not recording).
     _imd_system.stop_recording()
     print("imd_stop: stopped")
@@ -822,33 +897,33 @@ def imd_change(
         print("imd: no system loaded")
         return
     cfg = _imd_system.config
-    if const_k is not None:
-        cfg.const_k = _as_float(const_k)
-    if mouse_force is not None:
-        cfg.mouse_force = _as_bool(mouse_force)
-    if nsteps_per_frame is not None:
-        cfg.nsteps_per_frame = _as_int(nsteps_per_frame)
+    updates = {}
+    try:
+        if const_k is not None:
+            updates["const_k"] = _as_float(const_k)
+        if mouse_force is not None:
+            updates["mouse_force"] = _as_bool(mouse_force)
+        if nsteps_per_frame is not None:
+            updates["nsteps_per_frame"] = _as_int(nsteps_per_frame)
+        if temperature is not None:
+            updates["temperature"] = _as_float(temperature)
+        if max_force_kj is not None:
+            updates["max_force_kj"] = _as_float(max_force_kj)
+        if energy_cutoff_kj is not None:
+            updates["energy_cutoff_kj"] = _as_float(energy_cutoff_kj)
+        if drag_level is not None:
+            updates["drag_level"] = _validate_drag_level(str(drag_level))
+        candidate = replace(cfg, **updates)
+    except (TypeError, ValueError) as exc:
+        print(f"imd_change: {exc}")
+        return
+    for name in updates:
+        setattr(cfg, name, getattr(candidate, name))
     if temperature is not None:
-        cfg.temperature = _as_float(temperature)
-        # Langevin integrator temperature can be updated live (same API on
-        # both LangevinIntegrator and LangevinMiddleIntegrator).
+        # Langevin integrator temperature can be updated live.
         _imd_system.simulation.integrator.setTemperature(cfg.temperature)
-    if max_force_kj is not None:
-        cfg.max_force_kj = _as_float(max_force_kj)
-    if energy_cutoff_kj is not None:
-        cfg.energy_cutoff_kj = _as_float(energy_cutoff_kj)
-    if drag_level is not None:
-        # Applied live: IMDSystem reads cfg.drag_level each frame and expands the
-        # pull to the whole residue / chain. No PyMOL call needed — its editing
-        # drag ignores mouse_selection_mode.
-        level = str(drag_level)
-        if level not in constants.SUPPORTED_DRAG_LEVELS:
-            print(
-                f"imd_change: unknown drag_level {level!r}; "
-                f"choose from {constants.SUPPORTED_DRAG_LEVELS}"
-            )
-        else:
-            cfg.drag_level = level
+    if mouse_force is not None and not cfg.mouse_force:
+        _imd_system.clear_pull_forces()
     print(f"imd_change: {cfg}")
 
 
@@ -951,13 +1026,25 @@ def imd_connect(
         print("imd_connect: no object loaded — load the server's prepared PDB first")
         return
 
-    client = IMDClient(host, _as_int(port))
+    try:
+        port_number = _as_int(port)
+        if not 1 <= port_number <= 65535:
+            raise ValueError("port must be between 1 and 65535")
+    except ValueError as exc:
+        print(f"imd_connect: {exc}")
+        return
+    client = IMDClient(host, port_number)
     try:
         client.connect()
     except OSError as exc:
         print(f"imd_connect: cannot reach {host}:{port} — {exc}")
         return
-    frame = _await_first_frame(client)
+    try:
+        frame = _await_first_frame(client)
+    except (protocol.ProtocolError, transport.ConnectionClosed, OSError) as exc:
+        print(f"imd_connect: invalid or interrupted stream from {host}:{port} — {exc}")
+        client.disconnect()
+        return
     if frame is None:
         print(f"imd_connect: connected to {host}:{port} but no frame arrived")
         client.disconnect()
@@ -985,13 +1072,20 @@ def imd_connect(
         if backend_name == "cg"
         else constants.AA_RECOMMENDED_CONST_K
     )
-    ck = _as_float(const_k) if const_k is not None else default_const_k
-    mf = _as_float(max_force_kj) if max_force_kj is not None else constants.DEFAULT_MAX_FORCE_KJ
-    fi = (
-        _as_int(frame_interval_ms)
-        if frame_interval_ms is not None
-        else constants.IMD_CLIENT_FRAME_INTERVAL_MS
-    )
+    try:
+        ck = _as_float(const_k) if const_k is not None else default_const_k
+        mf = _as_float(max_force_kj) if max_force_kj is not None else constants.DEFAULT_MAX_FORCE_KJ
+        fi = (
+            _as_int(frame_interval_ms)
+            if frame_interval_ms is not None
+            else constants.IMD_CLIENT_FRAME_INTERVAL_MS
+        )
+        if ck < 0.0 or mf <= 0.0 or fi <= 0:
+            raise ValueError("const_k must be >= 0; max_force_kj and frame_interval_ms must be > 0")
+    except ValueError as exc:
+        print(f"imd_connect: {exc}")
+        client.disconnect()
+        return
     pclient = PyMOLIMDClient(
         client, obj, const_k=ck, max_force_kj=mf, frame_interval_ms=fi, drag_level=drag_level
     )

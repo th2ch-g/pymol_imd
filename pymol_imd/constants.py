@@ -36,6 +36,7 @@ SUPPORTED_DRAG_LEVELS = ("atom", "residue", "chain")
 # solvent treatment and does not expose this.
 SUPPORTED_IMPLICIT_SOLVENT_MODELS = ("auto", "none", "gbn2", "obc2", "obc1", "gbn", "hct")
 SUPPORTED_PLATFORMS = ("auto", "cuda", "opencl", "cpu", "reference")
+SUPPORTED_ML_DEVICES = ("auto", "cuda", "mps", "cpu")
 # Map the lowercase platform knob to OpenMM's case-sensitive Platform name.
 OPENMM_PLATFORM_NAMES = {"cuda": "CUDA", "opencl": "OpenCL", "cpu": "CPU", "reference": "Reference"}
 
@@ -68,6 +69,7 @@ GAS_CONSTANT_KJ_PER_MOL_K = 0.00831446261815324
 # 1 nm^3 = 1e-21 cm^3, so (amu/nm^3) * 1.6605390666e-3 = g/cm^3. Used for the
 # state-CSV density column (total system mass / periodic box volume).
 AMU_PER_NM3_TO_G_PER_CM3 = 1.6605390666e-3
+MINIMUM_BOX_MARGIN_NM = 0.01  # keep cutoff strictly below half the box length
 
 # Covalent radii in Angstrom for the Morokuma/Dapprich link-atom g-factor.
 # Source: standard chemistry references (Cordero 2008, condensed). Only the
@@ -247,6 +249,7 @@ DEFAULT_MIN_ENERGY_TOL_KJ = 1e-3  # consecutive-chunk |ΔU| convergence toleranc
 DEFAULT_TRAJ_INTERVAL = 1  # write every N GUI frames to the trajectory
 DEFAULT_FORCE_CSV_INTERVAL = 1  # write pull forces every N GUI frames
 DEFAULT_STATE_CSV_INTERVAL = 1  # write the thermodynamic state CSV every N GUI frames
+CSV_FLUSH_ROWS = 100  # stop/error paths always flush any remaining rows
 
 # ---------------------------------------------------------------------------
 # Fixed numerical guard / viewer cosmetics (centralized; not user-tunable)
@@ -278,6 +281,9 @@ IMD_DEFAULT_RATE = 1  # MD steps advanced per transmitted frame (>= 1)
 IMD_SEND_VELOCITIES = False  # include a velocities packet in each frame
 IMD_SEND_FORCES = False  # include a forces packet in each frame
 IMD_RECV_BUFSIZE = 65536  # transport recv() chunk size (bytes)
+# Defensive upper bound for one untrusted packet. The server additionally
+# constrains MDComm counts to the simulation atom count before reading a body.
+IMD_MAX_PACKET_BODY_BYTES = 256 * 1024 * 1024
 IMD_CLIENT_FRAME_INTERVAL_MS = 8  # PyMOL client QTimer tick (ms); lower = smoother streaming
 IMD_CLIENT_POLL_TIMEOUT_S = 0.01  # client per-tick wait for the first frame header
 IMD_CLIENT_MAX_FRAMES_PER_TICK = 64  # cap frames drained per tick so the Qt loop never wedges

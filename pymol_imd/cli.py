@@ -2,9 +2,9 @@
 
 Wraps ``pymol`` so a single shell command sets up a simulation::
 
-    pymol_imd input.pdb --level cg
-    pymol_imd input.pdb --level aa --ligand-sdf lig.sdf --minimize --run
-    pymol_imd input.pdb --level mlmm --ml-selection "resi 30-50" --ml-backend uma
+    pymol_imd local input.pdb --level cg
+    pymol_imd launch input.pdb --level aa --ligand-sdf lig.sdf --minimize --run
+    pymol_imd local input.pdb --level mlmm --ml-selection "resi 30-50"
 
 The CLI itself does not import ``pymol``; it builds a Python statement and
 hands it to PyMOL via the ``-d`` flag, so PyMOL evaluates exactly the same
@@ -14,6 +14,7 @@ hands it to PyMOL via the ``-d`` flag, so PyMOL evaluates exactly the same
 from __future__ import annotations
 
 import argparse
+import math
 import shlex
 import shutil
 import subprocess
@@ -32,14 +33,35 @@ DRAG_LEVELS = constants.SUPPORTED_DRAG_LEVELS
 IMPLICIT_SOLVENT_MODELS = constants.SUPPORTED_IMPLICIT_SOLVENT_MODELS
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser(mode: str = "launch") -> argparse.ArgumentParser:
+    if mode not in {"launch", "local", "serve"}:
+        raise ValueError(f"Unsupported parser mode {mode!r}")
+    frame_label = "server frame" if mode == "serve" else "GUI frame"
+    record_start = "after each client's GO" if mode == "serve" else "on imd_run"
     p = argparse.ArgumentParser(
-        prog="pymol_imd",
+        prog=f"pymol_imd {mode}",
         description=(
             "Launch PyMOL with a pymol_imd backend already configured. "
             "Equivalent to typing `from pymol_imd import *; imd_setup_<level>(<pdb>, ...)` "
             "inside PyMOL."
         ),
+    )
+    # Keep helper functions mode-agnostic. Arguments omitted from a mode still
+    # exist on the Namespace with a neutral value.
+    p.set_defaults(
+        nsteps_per_frame=None,
+        const_k=None,
+        frame_interval_ms=None,
+        no_mouse_force=False,
+        drag_level=None,
+        run=False,
+        pymol=None,
+        print_only=False,
+        host=constants.IMD_DEFAULT_HOST,
+        port=None,
+        rate=None,
+        send_velocities=False,
+        send_forces=False,
     )
     p.add_argument("pdb", help="Input PDB file (path is resolved to absolute).")
     p.add_argument(
@@ -54,21 +76,25 @@ def _build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--pbc",
         action="store_true",
-        help="Enable periodic box. Default: vacuum (AA/MLMM) / auto-box (CG).",
+        help="Enable periodic box. Default: GB implicit solvent (AA/MLMM) / auto-box (CG).",
     )
     common.add_argument(
         "--temperature", type=float, metavar="K", help="Langevin thermostat temperature (K)."
     )
-    common.add_argument(
-        "--nsteps-per-frame", type=int, metavar="N", help="MD steps executed per GUI frame."
-    )
-    common.add_argument("--const-k", type=float, metavar="K", help="Pull-force scale (kJ/mol/nm).")
+    if mode != "serve":
+        common.add_argument(
+            "--nsteps-per-frame", type=int, metavar="N", help="MD steps executed per GUI frame."
+        )
+        common.add_argument(
+            "--const-k", type=float, metavar="K", help="Pull-force scale (kJ/mol/nm)."
+        )
     common.add_argument(
         "--max-force-kj",
         type=float,
         metavar="F",
         help=(
-            "Per-atom hard cap on the pulling force magnitude (kJ/mol/nm). "
+            "Per-atom safety limit on the pulling force magnitude (kJ/mol/nm); "
+            "a frame exceeding it is skipped rather than clamped. "
             f"Default {constants.DEFAULT_MAX_FORCE_KJ:g}. "
             "Lower to make divergence-on-strong-drag harder."
         ),
@@ -120,15 +146,16 @@ def _build_parser() -> argparse.ArgumentParser:
             f"Default {constants.DEFAULT_ENERGY_CUTOFF_KJ:g}."
         ),
     )
-    common.add_argument(
-        "--frame-interval-ms",
-        type=int,
-        metavar="MS",
-        help=(
-            "QTimer tick interval for the IMD / minimize loops (ms). "
-            f"Default {constants.DEFAULT_FRAME_INTERVAL_MS}."
-        ),
-    )
+    if mode != "serve":
+        common.add_argument(
+            "--frame-interval-ms",
+            type=int,
+            metavar="MS",
+            help=(
+                "QTimer tick interval for the IMD / minimize loops (ms). "
+                f"Default {constants.DEFAULT_FRAME_INTERVAL_MS}."
+            ),
+        )
     common.add_argument(
         "--nonbonded-cutoff-nm",
         type=float,
@@ -158,19 +185,20 @@ def _build_parser() -> argparse.ArgumentParser:
             f"Default {constants.AA_BOX_PADDING_NM:g}."
         ),
     )
-    common.add_argument(
-        "--no-mouse-force", action="store_true", help="Disable the user-pull mechanism."
-    )
-    common.add_argument(
-        "--drag-level",
-        choices=DRAG_LEVELS,
-        default=None,
-        metavar="LEVEL",
-        help=(
-            f"Mouse-drag granularity for 3-Button Editing: {' / '.join(DRAG_LEVELS)}. "
-            "Default: atom. residue / chain grab and pull a whole residue / chain at once."
-        ),
-    )
+    if mode != "serve":
+        common.add_argument(
+            "--no-mouse-force", action="store_true", help="Disable the user-pull mechanism."
+        )
+        common.add_argument(
+            "--drag-level",
+            choices=DRAG_LEVELS,
+            default=None,
+            metavar="LEVEL",
+            help=(
+                f"Mouse-drag granularity for 3-Button Editing: {' / '.join(DRAG_LEVELS)}. "
+                "Default: atom. residue / chain grab and pull a whole residue / chain at once."
+            ),
+        )
     common.add_argument(
         "--minimize", action="store_true", help="Call imd_minimize() right after setup."
     )
@@ -198,59 +226,60 @@ def _build_parser() -> argparse.ArgumentParser:
             f"Default {constants.DEFAULT_MIN_ENERGY_TOL_KJ:g}."
         ),
     )
-    common.add_argument(
-        "--run", action="store_true", help="Call imd_run() after setup (and minimize, if set)."
-    )
+    if mode == "launch":
+        common.add_argument(
+            "--run", action="store_true", help="Call imd_run() after setup (and minimize, if set)."
+        )
     common.add_argument(
         "--traj-out",
         metavar="PATH",
         help=(
-            "Record a trajectory during imd_run. Format by extension: "
-            ".xtc / .dcd / .pdb. Default: ./<pdb-stem>.xtc in the launch cwd "
+            "Record a trajectory. Format by extension: "
+            ".xtc / .dcd / .pdb. Default: ./<pdb-stem>.xtc in the command cwd "
             "(recording is on by default; disable with --no-record). "
-            "Recording starts on --run."
+            f"Recording starts {record_start}."
         ),
     )
     common.add_argument(
         "--traj-interval",
         type=int,
         metavar="N",
-        help="Write every N GUI frames to the trajectory (default 1).",
+        help=f"Write every N {frame_label}s to the trajectory (default 1).",
     )
     common.add_argument(
         "--force-csv",
         metavar="PATH",
         help=(
-            "Record user pull forces to CSV during imd_run (columns: "
+            "Record user pull forces to CSV (columns: "
             "frame,step,time_ps,atom_index,fx,fy,fz,fmag). atom_index is "
             "0-based (add 1 for a PyMOL selection). Default: "
-            "./<pdb-stem>_forces.csv in the launch cwd (on by default; "
-            "disable with --no-record). Recording starts on --run."
+            "./<pdb-stem>_forces.csv in the command cwd (on by default; "
+            f"disable with --no-record). Recording starts {record_start}."
         ),
     )
     common.add_argument(
         "--force-csv-interval",
         type=int,
         metavar="N",
-        help="Write forces every N GUI frames (default 1).",
+        help=f"Write forces every N {frame_label}s (default 1).",
     )
     common.add_argument(
         "--state-csv",
         metavar="PATH",
         help=(
-            "Record thermodynamic state to CSV during imd_run (columns: "
+            "Record thermodynamic state to CSV (columns: "
             "frame,step,time_ps,potential_energy_kj,kinetic_energy_kj,"
             "total_energy_kj,temperature_k; under --pbc also volume_nm3,"
             "density_g_cm3). Pressure is omitted (no instantaneous virial "
-            "under IMD pulling). Default: ./<pdb-stem>_state.csv in the launch "
-            "cwd (on by default; disable with --no-record). Starts on --run."
+            "under IMD pulling). Default: ./<pdb-stem>_state.csv in the command "
+            f"cwd (on by default; disable with --no-record). Starts {record_start}."
         ),
     )
     common.add_argument(
         "--state-csv-interval",
         type=int,
         metavar="N",
-        help="Write the state CSV every N GUI frames (default 1).",
+        help=f"Write the state CSV every N {frame_label}s (default 1).",
     )
     common.add_argument(
         "--no-record",
@@ -330,7 +359,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "(~10 MB), fastest CPU inference, no login required."
         ),
     )
-    mlmm.add_argument("--ml-device", metavar="DEV", help="Torch device: auto / cuda / mps / cpu.")
+    mlmm.add_argument(
+        "--ml-device",
+        choices=constants.SUPPORTED_ML_DEVICES,
+        metavar="DEV",
+        help="Torch device: auto / cuda / mps / cpu.",
+    )
     mlmm.add_argument("--ml-charge", type=int, metavar="Z", help="ML region net charge.")
     mlmm.add_argument(
         "--ml-mult",
@@ -374,19 +408,34 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # ---- launcher controls
-    launcher = p.add_argument_group("launcher")
-    launcher.add_argument(
-        "--pymol",
-        metavar="PATH",
-        default=None,
-        help="Path to the pymol executable (auto-detected on PATH if omitted).",
-    )
-    launcher.add_argument(
-        "--print-only",
-        action="store_true",
-        help="Print the resolved PyMOL command and exit without launching.",
-    )
+    if mode in {"launch", "local"}:
+        launcher = p.add_argument_group("launcher")
+        launcher.add_argument(
+            "--pymol",
+            metavar="PATH",
+            default=None,
+            help="Path to the pymol executable (auto-detected on PATH if omitted).",
+        )
+        launcher.add_argument(
+            "--print-only",
+            action="store_true",
+            help="Print the resolved PyMOL command and exit without launching.",
+        )
+    else:
+        server = p.add_argument_group("server")
+        server.add_argument("--host", default=constants.IMD_DEFAULT_HOST, metavar="ADDR")
+        server.add_argument("--port", type=int, default=constants.IMD_DEFAULT_PORT, metavar="PORT")
+        server.add_argument(
+            "--rate",
+            type=int,
+            default=constants.IMD_DEFAULT_RATE,
+            metavar="N",
+            help="MD steps per transmitted frame.",
+        )
+        server.add_argument(
+            "--send-velocities", action="store_true", help="Include velocities each frame."
+        )
+        server.add_argument("--send-forces", action="store_true", help="Include forces each frame.")
     return p
 
 
@@ -539,9 +588,12 @@ def _build_pymol_statement(
         rec_parts = ", ".join(f"{k}={v!r}" for k, v in record_kwargs.items())
         stmts.append(f"imd_record({rec_parts})")
     if minimize:
-        min_parts = ", ".join(f"{k}={v!r}" for k, v in (minimize_kwargs or {}).items())
+        min_options = dict(minimize_kwargs or {})
+        if run:
+            min_options["run_after"] = True
+        min_parts = ", ".join(f"{k}={v!r}" for k, v in min_options.items())
         stmts.append(f"imd_minimize({min_parts})")
-    if run:
+    if run and not minimize:
         stmts.append("imd_run()")
     return "; ".join(stmts)
 
@@ -583,22 +635,6 @@ def _backend_for_level(level: str):
     return MLMMBackend()
 
 
-def _server_flag_parser() -> argparse.ArgumentParser:
-    """Server-only flags, split off (parse_known_args) before the shared setup
-    parser runs, so serve / local reuse every setup flag without redefining them."""
-    sp = argparse.ArgumentParser(add_help=False)
-    sp.add_argument("--host", default=constants.IMD_DEFAULT_HOST, metavar="ADDR")
-    # None here so each mode picks its own default: serve -> 8888 (fixed, so a
-    # remote client can target it), local -> 0 (ephemeral, avoids clashes).
-    sp.add_argument("--port", type=int, default=None, metavar="PORT")
-    sp.add_argument(
-        "--rate", type=int, default=None, metavar="N", help="MD steps per transmitted frame."
-    )
-    sp.add_argument("--send-velocities", action="store_true", help="Include velocities each frame.")
-    sp.add_argument("--send-forces", action="store_true", help="Include forces each frame.")
-    return sp
-
-
 def _build_connect_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="pymol_imd connect",
@@ -610,6 +646,13 @@ def _build_connect_parser() -> argparse.ArgumentParser:
     p.add_argument("--object", default=None, metavar="NAME", help="PyMOL object name.")
     p.add_argument("--const-k", type=float, default=None, metavar="K", help="Drag sensitivity.")
     p.add_argument("--max-force-kj", type=float, default=None, metavar="F", help="Pull |F| cap.")
+    p.add_argument(
+        "--frame-interval-ms",
+        type=int,
+        default=None,
+        metavar="MS",
+        help="PyMOL client timer interval.",
+    )
     p.add_argument(
         "--drag-level",
         choices=constants.SUPPORTED_DRAG_LEVELS,
@@ -666,6 +709,45 @@ def _validate_implicit_solvent_args(args: argparse.Namespace) -> int | None:
     return None
 
 
+def _validate_level_args(args: argparse.Namespace) -> int | None:
+    groups = {
+        "aa": {
+            "--ligand-sdf": args.ligand_sdf,
+            "--ph": args.ph,
+            "--gaff-version": args.gaff_version,
+        },
+        "cg": {
+            "--ff": args.ff,
+            "--no-elastic-network": args.no_elastic_network,
+            "--martinize-maxwarn": args.maxwarn,
+        },
+        "mlmm": {
+            "--ml-selection": args.ml_selection,
+            "--ml-backend": args.ml_backend,
+            "--ml-device": args.ml_device,
+            "--ml-charge": args.ml_charge,
+            "--ml-mult": args.ml_mult,
+            "--ml-compile": args.ml_compile,
+            "--enable-cueq": args.enable_cueq,
+            "--link-atom-method": args.link_atom_method,
+        },
+    }
+    invalid = [
+        flag
+        for level, values in groups.items()
+        if level != args.level
+        for flag, value in values.items()
+        if value not in (None, False)
+    ]
+    if invalid:
+        print(
+            f"pymol_imd: {' / '.join(invalid)} not valid for --level {args.level}.",
+            file=sys.stderr,
+        )
+        return 2
+    return None
+
+
 def _run_minimize(imd, args: argparse.Namespace) -> None:
     # Use `is not None`, not `or`: an explicit 0 (uncapped iterations / disabled
     # early-convergence / zero chunks) is falsy, so `or` would silently swap it
@@ -679,6 +761,7 @@ def _run_minimize(imd, args: argparse.Namespace) -> None:
         args.min_max_chunks if args.min_max_chunks is not None else constants.DEFAULT_MIN_MAX_CHUNKS
     )
     tol = args.min_tol_kj if args.min_tol_kj is not None else constants.DEFAULT_MIN_ENERGY_TOL_KJ
+    imd.reset_minimization()
     for _ in range(chunks):
         if imd.minimize_step(max_iterations=max_iter, tol_kj=tol):
             break
@@ -715,15 +798,93 @@ def _resolve_topology_dir(args: argparse.Namespace, pdb_path: Path) -> None:
         args.topology_dir = str(Path.cwd() / f"{pdb_path.stem}_topology")
 
 
+def _resolve_record_defaults(args: argparse.Namespace, pdb_path: Path) -> int | None:
+    explicit = any(value is not None for value in (args.traj_out, args.force_csv, args.state_csv))
+    if args.no_record:
+        if explicit:
+            print(
+                "pymol_imd: --no-record conflicts with an explicit "
+                "--traj-out / --force-csv / --state-csv.",
+                file=sys.stderr,
+            )
+            return 2
+        return None
+    stem = pdb_path.stem
+    if args.traj_out is None:
+        args.traj_out = str(Path.cwd() / f"{stem}.xtc")
+    if args.force_csv is None:
+        args.force_csv = str(Path.cwd() / f"{stem}_forces.csv")
+    if args.state_csv is None:
+        args.state_csv = str(Path.cwd() / f"{stem}_state.csv")
+    return None
+
+
+def _validate_numeric_args(args: argparse.Namespace, *, mode: str) -> int | None:
+    positive = {
+        "temperature": "--temperature",
+        "nsteps_per_frame": "--nsteps-per-frame",
+        "max_force_kj": "--max-force-kj",
+        "timestep_ps": "--timestep-ps",
+        "pressure": "--pressure",
+        "energy_cutoff_kj": "--energy-cutoff-kj",
+        "frame_interval_ms": "--frame-interval-ms",
+        "nonbonded_cutoff_nm": "--nonbonded-cutoff-nm",
+        "box_padding_nm": "--box-padding-nm",
+        "min_max_chunks": "--min-max-chunks",
+        "traj_interval": "--traj-interval",
+        "force_csv_interval": "--force-csv-interval",
+        "state_csv_interval": "--state-csv-interval",
+        "ml_mult": "--ml-mult",
+        "rate": "--rate",
+    }
+    nonnegative = {
+        "const_k": "--const-k",
+        "friction": "--friction",
+        "min_max_iter": "--min-max-iter",
+        "min_tol_kj": "--min-tol-kj",
+    }
+    for attr, flag in positive.items():
+        value = getattr(args, attr, None)
+        if value is not None and (not math.isfinite(float(value)) or float(value) <= 0.0):
+            print(f"pymol_imd: {flag} must be finite and > 0.", file=sys.stderr)
+            return 2
+    for attr, flag in nonnegative.items():
+        value = getattr(args, attr, None)
+        if value is not None and (not math.isfinite(float(value)) or float(value) < 0.0):
+            print(f"pymol_imd: {flag} must be finite and >= 0.", file=sys.stderr)
+            return 2
+    if args.ph is not None and (not math.isfinite(args.ph) or not 0.0 <= args.ph <= 14.0):
+        print("pymol_imd: --ph must be finite and between 0 and 14.", file=sys.stderr)
+        return 2
+    if args.pressure is not None and not args.pbc:
+        print("pymol_imd: --pressure requires --pbc.", file=sys.stderr)
+        return 2
+    if mode == "serve" and not 0 <= args.port <= 65535:
+        print("pymol_imd: --port must be between 0 and 65535.", file=sys.stderr)
+        return 2
+    if args.maxwarn is not None:
+        try:
+            maxwarn = int(args.maxwarn)
+        except ValueError:
+            print("pymol_imd: --martinize-maxwarn must be an integer.", file=sys.stderr)
+            return 2
+        if maxwarn < 0:
+            print("pymol_imd: --martinize-maxwarn must be >= 0.", file=sys.stderr)
+            return 2
+    return None
+
+
 def _connect_statement(prepared: str, host: str, port: int, obj: str, extra: dict) -> str:
     kw = {"host": host, "port": port, "object": obj, **extra}
     kw_str = ", ".join(f"{k}={v!r}" for k, v in kw.items())
-    return f"from pymol_imd import *; cmd.load({prepared!r}, {obj!r}); imd_connect({kw_str})"
+    return (
+        "from pymol_imd import *; cmd.set('retain_order', 1); "
+        f"cmd.load({prepared!r}, {obj!r}); imd_connect({kw_str})"
+    )
 
 
 def _main_serve(argv: list[str]) -> int:
-    srv_args, rest = _server_flag_parser().parse_known_args(argv)
-    args = _build_parser().parse_args(rest)
+    args = _build_parser("serve").parse_args(argv)
     pdb_path = Path(args.pdb).expanduser().resolve()
     if not pdb_path.exists():
         print(f"pymol_imd: PDB file not found: {pdb_path}", file=sys.stderr)
@@ -731,43 +892,65 @@ def _main_serve(argv: list[str]) -> int:
     rc = _validate_mlmm_args(args)
     if rc:
         return rc
+    rc = _validate_level_args(args)
+    if rc:
+        return rc
     rc = _validate_implicit_solvent_args(args)
     if rc:
         return rc
-    if args.const_k is not None or args.max_force_kj is not None:
-        # The pull force is computed client-side in socket mode, so these knobs
-        # are dead on the server. Warn instead of silently ignoring them.
-        print(
-            "pymol_imd serve: --const-k / --max-force-kj have NO effect in socket "
-            "mode (the pull force is computed client-side). Pass them to "
-            "`pymol_imd connect` / imd_connect instead.",
-            file=sys.stderr,
-        )
+    rc = _validate_numeric_args(args, mode="serve")
+    if rc:
+        return rc
     _resolve_topology_dir(args, pdb_path)
+    rc = _resolve_record_defaults(args, pdb_path)
+    if rc:
+        return rc
     from .server import IMDServer
 
-    imd, _bundle = _build_imd_system_headless(args, pdb_path)
-    if args.minimize:
-        _run_minimize(imd, args)
-    port = srv_args.port if srv_args.port is not None else constants.IMD_DEFAULT_PORT
+    try:
+        imd, _bundle = _build_imd_system_headless(args, pdb_path)
+        if args.minimize:
+            _run_minimize(imd, args)
+    except Exception as exc:
+        print(f"pymol_imd serve: setup failed: {exc}", file=sys.stderr)
+        return 1
+    record_settings = _collect_record_kwargs(args) or None
     server = IMDServer(
         imd,
-        host=srv_args.host,
-        port=port,
-        rate=srv_args.rate,
-        send_velocities=srv_args.send_velocities,
-        send_forces=srv_args.send_forces,
+        host=args.host,
+        port=args.port,
+        rate=args.rate,
+        send_velocities=args.send_velocities,
+        send_forces=args.send_forces,
+        record_settings=record_settings,
     )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\npymol_imd serve: stopping")
         server.request_stop()
-    return 0
+        return 130
+    return 1 if server.failure_reason is not None else 0
 
 
 def _main_connect(argv: list[str]) -> int:
     args = _build_connect_parser().parse_args(argv)
+    if not 1 <= args.port <= 65535:
+        print("pymol_imd connect: --port must be between 1 and 65535.", file=sys.stderr)
+        return 2
+    for value, flag, allow_zero in (
+        (args.const_k, "--const-k", True),
+        (args.max_force_kj, "--max-force-kj", False),
+        (args.frame_interval_ms, "--frame-interval-ms", False),
+    ):
+        if value is None:
+            continue
+        numeric = float(value)
+        invalid = not math.isfinite(numeric) or numeric < 0.0 or (not allow_zero and numeric == 0.0)
+        if invalid:
+            relation = ">= 0" if allow_zero else "> 0"
+            print(f"pymol_imd connect: {flag} must be finite and {relation}.", file=sys.stderr)
+            return 2
     pdb_path = Path(args.pdb).expanduser().resolve()
     if not pdb_path.exists():
         print(f"pymol_imd: PDB file not found: {pdb_path}", file=sys.stderr)
@@ -782,6 +965,8 @@ def _main_connect(argv: list[str]) -> int:
         extra["const_k"] = args.const_k
     if args.max_force_kj is not None:
         extra["max_force_kj"] = args.max_force_kj
+    if args.frame_interval_ms is not None:
+        extra["frame_interval_ms"] = args.frame_interval_ms
     if args.drag_level is not None:
         extra["drag_level"] = args.drag_level
     statement = _connect_statement(str(pdb_path), args.host, args.port, obj, extra)
@@ -799,22 +984,44 @@ def _main_local(argv: list[str]) -> int:
     # transport is only for serve/connect (splitting compute across machines),
     # so `local` simply implies --run on the standard launch path. This keeps
     # the local experience free of any socket latency / backpressure / freeze.
-    return _main_launch([*argv, "--run"])
+    return _main_launch(argv, mode="local")
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in {"-h", "--help"}:
+        print(
+            "usage: pymol_imd {launch,local,serve,connect} ...\n\n"
+            "commands:\n"
+            "  launch   configure and open PyMOL\n"
+            "  local    configure, open PyMOL, and start the local run\n"
+            "  serve    run a headless IMDv3 server\n"
+            "  connect  open PyMOL as an IMDv3 client"
+        )
+        return 0 if argv else 2
+    if argv[0] == "--version":
+        from . import __version__
+
+        print(__version__)
+        return 0
+    if argv[0] == "launch":
+        return _main_launch(argv[1:], mode="launch")
     if argv and argv[0] == "serve":
         return _main_serve(argv[1:])
     if argv and argv[0] == "connect":
         return _main_connect(argv[1:])
     if argv and argv[0] == "local":
         return _main_local(argv[1:])
-    return _main_launch(argv)
+    print(
+        f"pymol_imd: unknown command {argv[0]!r}. "
+        "Use `pymol_imd launch <PDB>` (the old `pymol_imd <PDB>` form was removed).",
+        file=sys.stderr,
+    )
+    return 2
 
 
-def _main_launch(argv: list[str] | None) -> int:
-    args = _build_parser().parse_args(argv)
+def _main_launch(argv: list[str] | None, *, mode: str = "launch") -> int:
+    args = _build_parser(mode).parse_args(argv)
 
     pdb_path = Path(args.pdb).expanduser().resolve()
     if not pdb_path.exists():
@@ -823,29 +1030,17 @@ def _main_launch(argv: list[str] | None) -> int:
 
     # Level-specific required-flag validation, done up front so we don't
     # launch PyMOL only to error out from inside setup_*.
-    if args.level == "mlmm":
-        missing = [
-            flag
-            for flag, val in (
-                ("--ml-selection", args.ml_selection),
-                ("--ml-charge", args.ml_charge),
-                ("--ml-mult", args.ml_mult),
-            )
-            if val is None
-        ]
-        if missing:
-            print(
-                f"pymol_imd: --level mlmm requires {', '.join(missing)}.\n"
-                "ml_selection uses PyMOL's selection language. Example:\n"
-                "  pymol_imd input.pdb --level mlmm \\\n"
-                "      --ml-selection 'resi 1 and resn MET' \\\n"
-                "      --ml-charge 0 --ml-mult 1\n"
-                "Multiplicity (2S+1): 1=singlet, 2=doublet/radical, 3=triplet.",
-                file=sys.stderr,
-            )
-            return 2
+    rc = _validate_mlmm_args(args)
+    if rc:
+        return rc
 
     rc = _validate_implicit_solvent_args(args)
+    if rc:
+        return rc
+    rc = _validate_level_args(args)
+    if rc:
+        return rc
+    rc = _validate_numeric_args(args, mode=mode)
     if rc:
         return rc
 
@@ -860,32 +1055,21 @@ def _main_launch(argv: list[str] | None) -> int:
 
     # Resolve recording / topology defaults now that the PDB stem is known
     # (argparse defaults can't see it). All paths anchor at the launch cwd.
-    stem = pdb_path.stem
     traj_explicit = args.traj_out is not None
     force_explicit = args.force_csv is not None
     state_explicit = args.state_csv is not None
-    if args.no_record:
-        if traj_explicit or force_explicit or state_explicit:
-            print(
-                "pymol_imd: --no-record conflicts with an explicit "
-                "--traj-out / --force-csv / --state-csv. Drop one.",
-                file=sys.stderr,
-            )
-            return 2
-    else:
-        if args.traj_out is None:
-            args.traj_out = str(Path.cwd() / f"{stem}.xtc")
-        if args.force_csv is None:
-            args.force_csv = str(Path.cwd() / f"{stem}_forces.csv")
-        if args.state_csv is None:
-            args.state_csv = str(Path.cwd() / f"{stem}_state.csv")
+    rc = _resolve_record_defaults(args, pdb_path)
+    if rc:
+        return rc
+    run = bool(args.run) if mode == "launch" else True
+    stem = pdb_path.stem
     if args.topology_dir is None:
         args.topology_dir = str(Path.cwd() / f"{stem}_topology")
 
     kwargs = _collect_setup_kwargs(args)
     record_kwargs = _collect_record_kwargs(args)
     minimize_kwargs = _collect_minimize_kwargs(args)
-    if (traj_explicit or force_explicit or state_explicit) and not args.run:
+    if (traj_explicit or force_explicit or state_explicit) and not run:
         print(
             "pymol_imd: --traj-out / --force-csv / --state-csv given without --run; "
             "recording is armed but only starts on imd_run.",
@@ -901,7 +1085,7 @@ def _main_launch(argv: list[str] | None) -> int:
         str(pdb_path),
         kwargs,
         minimize=args.minimize,
-        run=args.run,
+        run=run,
         record_kwargs=record_kwargs,
         minimize_kwargs=minimize_kwargs,
     )

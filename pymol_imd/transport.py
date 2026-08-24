@@ -58,6 +58,8 @@ class IMDConnection:
 
     def close(self) -> None:
         with contextlib.suppress(OSError):
+            self.sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
             self.sock.close()
 
 

@@ -12,12 +12,13 @@ consume identically to the AA path.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import math
 import os
 import shutil
 import subprocess
 import tempfile
-import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,7 @@ from openmm import unit
 from openmm.app import PDBFile
 
 from .. import constants
+from ..prep import _download_atomic
 from .base import SystemBundle
 
 logger = logging.getLogger(__name__)
@@ -39,9 +41,25 @@ MARTINI_FF = constants.CG_MARTINI_FF
 _MARTINI3_FILES = {
     "martini.itp": (
         "https://raw.githubusercontent.com/marrink-lab/martini-forcefields/"
-        "main/martini_forcefields/regular/v3.0.0/gmx_files/martini_v3.0.0.itp"
+        "784591ebdc91d762ed4df986c4650546c938f776/"
+        "martini_forcefields/regular/v3.0.0/gmx_files/martini_v3.0.0.itp"
     ),
 }
+_MARTINI3_SHA256 = {
+    "martini.itp": "0ecbf0ff334b2ec21dc5e3151aca42167b977bc2aed41eb2a44bd8c997754894",
+}
+
+
+def _validate_martini_file(path: Path, expected_sha256: str) -> None:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != expected_sha256:
+        raise ValueError(
+            f"SHA-256 mismatch for {path.name}: expected {expected_sha256}, got {actual}"
+        )
 
 
 def _martini_cache_dir() -> Path:
@@ -60,11 +78,21 @@ def _ensure_martini_ff(cache_dir: Path | None = None) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
     for name, url in _MARTINI3_FILES.items():
         dest = cache_dir / name
-        if dest.exists() and dest.stat().st_size > 0:
-            continue
+        expected = _MARTINI3_SHA256[name]
+        if dest.exists():
+            try:
+                _validate_martini_file(dest, expected)
+            except (OSError, ValueError) as exc:
+                logger.warning("Ignoring invalid Martini cache %s: %s", dest, exc)
+            else:
+                continue
         logger.info("Fetching Martini 3 forcefield: %s -> %s", url, dest)
         try:
-            urllib.request.urlretrieve(url, dest)
+            _download_atomic(
+                url,
+                dest,
+                validate=lambda path, checksum=expected: _validate_martini_file(path, checksum),
+            )
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to download Martini 3 forcefield {name} from {url}: {exc}. "
@@ -122,6 +150,22 @@ class CGBackend:
         include_dir: Path | None = None,
         **_: object,
     ) -> SystemBundle:
+        if (
+            not math.isfinite(nonbonded_cutoff_nm)
+            or nonbonded_cutoff_nm < constants.CG_NONBONDED_CUTOFF_NM
+        ):
+            raise ValueError(
+                f"nonbonded_cutoff_nm must be finite and >= "
+                f"{constants.CG_NONBONDED_CUTOFF_NM} for Martini"
+            )
+        if not math.isfinite(box_padding_nm) or box_padding_nm < 0.0:
+            raise ValueError("box_padding_nm must be finite and >= 0")
+        try:
+            maxwarn_value = int(maxwarn)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("maxwarn must be an integer >= 0") from exc
+        if maxwarn_value < 0:
+            raise ValueError("maxwarn must be an integer >= 0")
         if ligand_sdf is not None:
             raise NotImplementedError(
                 "CG backend does not yet support custom ligand SDFs; "
@@ -160,7 +204,7 @@ class CGBackend:
             "-ss",
             ss_string,
             "-maxwarn",
-            str(maxwarn),
+            str(maxwarn_value),
         ]
         if elastic_network:
             cmd += ["-elastic"]
@@ -188,7 +232,11 @@ class CGBackend:
         # vacuum-like for short runs.
         box_vectors = coords.topology.getPeriodicBoxVectors()
         if box_vectors is None:
-            box_vectors = _bounding_box_vectors(coords.positions, padding_nm=box_padding_nm)
+            box_vectors = _bounding_box_vectors(
+                coords.positions,
+                padding_nm=box_padding_nm,
+                nonbonded_cutoff_nm=nonbonded_cutoff_nm,
+            )
             coords.topology.setPeriodicBoxVectors(box_vectors)
         top = MartiniTopFile(
             str(cg_top),
@@ -250,7 +298,11 @@ def _check_for_nan_bead_positions(
     )
 
 
-def _bounding_box_vectors(positions, padding_nm: float = constants.CG_BOX_PADDING_NM):
+def _bounding_box_vectors(
+    positions,
+    padding_nm: float = constants.CG_BOX_PADDING_NM,
+    nonbonded_cutoff_nm: float = constants.CG_NONBONDED_CUTOFF_NM,
+):
     """Cubic periodic vectors enclosing positions with padding (nm).
 
     Returns a tuple of three ``Vec3 * nanometer`` Quantities, the form
@@ -262,7 +314,9 @@ def _bounding_box_vectors(positions, padding_nm: float = constants.CG_BOX_PADDIN
     xs = [p[0] for p in pos_nm]
     ys = [p[1] for p in pos_nm]
     zs = [p[2] for p in pos_nm]
-    side = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) + 2.0 * padding_nm
+    requested_side = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) + 2.0 * padding_nm
+    minimum_side = 2.0 * nonbonded_cutoff_nm + constants.MINIMUM_BOX_MARGIN_NM
+    side = max(requested_side, minimum_side)
     return (
         Vec3(side, 0.0, 0.0) * unit.nanometer,
         Vec3(0.0, side, 0.0) * unit.nanometer,
