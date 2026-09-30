@@ -26,8 +26,8 @@ from openmm import unit
 from openmm.app import PME, HBonds, NoCutoff
 
 from .. import constants
-from ..prep import load_and_complete_hydrogens, write_prepared_pdb
-from .aa import FORCEFIELD_FILES, _set_bounding_box
+from ..prep import write_prepared_pdb
+from .aa import FORCEFIELD_FILES, _prepare_modeller, _set_bounding_box
 from .base import SystemBundle
 
 logger = logging.getLogger(__name__)
@@ -723,13 +723,7 @@ class MLMMBackend:
         ff_files = (*FORCEFIELD_FILES, implicit_xml) if implicit_xml else FORCEFIELD_FILES
         forcefield = ForceField(*ff_files)
 
-        if ligand_sdf is not None:
-            raise NotImplementedError(
-                "MLMM backend does not yet support ligand SDF; bake the "
-                "ligand into the input PDB or open an issue."
-            )
-
-        modeller = load_and_complete_hydrogens(pdb_path, forcefield)
+        modeller = _prepare_modeller(pdb_path, forcefield, ligand_sdf=ligand_sdf)
 
         nonbonded_method = PME if pbc else NoCutoff
         if pbc:

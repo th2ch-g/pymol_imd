@@ -68,34 +68,9 @@ class AABackend:
         ff_files = (*FORCEFIELD_FILES, implicit_xml) if implicit_xml else FORCEFIELD_FILES
         forcefield = ForceField(*ff_files)
 
-        if ligand_sdf is not None:
-            from copy import deepcopy
-            from io import StringIO
-
-            ligand = prepare_ligand_am1bcc(ligand_sdf)
-            from openmmforcefields.generators import GAFFTemplateGenerator
-
-            generator = GAFFTemplateGenerator(molecules=ligand, forcefield=gaff_version)
-            # Expose the ligand's hydrogen template before Modeller runs.
-            # GAFF generation changes conformers, so preserve the input copy.
-            ffxml = generator.generate_residue_template(deepcopy(ligand))
-            forcefield.loadFile(StringIO(ffxml))
-            logger.info("Registered GAFF template for ligand %s", ligand.name)
-        else:
-            ligand = None
-
-        modeller = load_and_complete_hydrogens(pdb_path, forcefield, ph=ph)
-        if ligand is not None:
-            ligand_template = ligand.to_smiles()
-            existing = sum(
-                template.name == ligand_template
-                for template in forcefield.getMatchingTemplates(modeller.topology)
-            )
-            if existing:
-                logger.info("Using %d existing ligand residue(s) from the input PDB", existing)
-            else:
-                ligand_top = ligand.to_topology()
-                modeller.add(ligand_top.to_openmm(), ligand_top.get_positions().to_openmm())
+        modeller = _prepare_modeller(
+            pdb_path, forcefield, ligand_sdf=ligand_sdf, ph=ph, gaff_version=gaff_version
+        )
 
         nonbonded_method = PME if pbc else NoCutoff
         if pbc:
@@ -128,6 +103,45 @@ class AABackend:
             prepared_pdb_path=prepared_pdb,
             pbc=pbc,
         )
+
+
+def _prepare_modeller(
+    pdb_path: Path,
+    forcefield,
+    *,
+    ligand_sdf: Path | None = None,
+    ph: float = constants.AA_PH,
+    gaff_version: str = constants.AA_GAFF_VERSION,
+) -> Modeller:
+    """Share ligand templates and hydrogen completion between AA and ML/MM."""
+    if ligand_sdf is not None:
+        from copy import deepcopy
+        from io import StringIO
+
+        from openmmforcefields.generators import GAFFTemplateGenerator
+
+        ligand = prepare_ligand_am1bcc(ligand_sdf)
+        generator = GAFFTemplateGenerator(molecules=ligand, forcefield=gaff_version)
+        # GAFF generation changes conformers; preserve the input coordinates.
+        ffxml = generator.generate_residue_template(deepcopy(ligand))
+        forcefield.loadFile(StringIO(ffxml))
+        logger.info("Registered GAFF template for ligand %s", ligand.name)
+    else:
+        ligand = None
+
+    modeller = load_and_complete_hydrogens(pdb_path, forcefield, ph=ph)
+    if ligand is not None:
+        ligand_template = ligand.to_smiles()
+        existing = sum(
+            template.name == ligand_template
+            for template in forcefield.getMatchingTemplates(modeller.topology)
+        )
+        if existing:
+            logger.info("Using %d existing ligand residue(s) from the input PDB", existing)
+        else:
+            ligand_top = ligand.to_topology()
+            modeller.add(ligand_top.to_openmm(), ligand_top.get_positions().to_openmm())
+    return modeller
 
 
 def _set_bounding_box(

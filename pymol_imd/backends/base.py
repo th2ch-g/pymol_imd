@@ -65,8 +65,8 @@ class Backend(Protocol):
     (``"langevin"`` / ``"langevin_middle"``), and ``recommended_timestep_ps``.
     The command layer resolves "user value else backend recommendation".
 
-    ``ligand_sdf`` is **AA-only**; CG and ML/MM backends raise if it is
-    passed. Backend-specific kwargs (``ff`` / ``elastic_network`` for CG,
+    ``ligand_sdf`` is supported by AA and ML/MM; CG rejects it.
+    Backend-specific kwargs (``ff`` / ``elastic_network`` for CG,
     ``ml_selection`` / ``ml_backend`` for ML/MM) flow in via ``**kwargs``.
 
     ``prepared_pdb_path`` in the returned bundle is *backend-defined*:

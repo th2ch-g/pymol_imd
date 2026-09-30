@@ -485,6 +485,9 @@ pixi run -e gpu smoke-backends --backend mace --platform cuda --ml-device cuda -
 ```
 
 `--molecule dna`, `rna`, or `popc` selects a whole-molecule ML region. The
+`complex` and `complex_no_h` cases select a bound ligand and exercise the
+ML/MM backend's `ligand_sdf` input, including missing-hydrogen completion.
+The
 cross-device tolerance applies only to these comparisons; pinned numerical
 references keep their original tolerance. ORB/UMA require their optional
 installation tasks. Use separate working environments when checking UMA and

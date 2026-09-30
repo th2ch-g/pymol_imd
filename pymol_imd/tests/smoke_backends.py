@@ -32,7 +32,11 @@ def main() -> int:
     parser.add_argument("--platform", default="cpu")
     parser.add_argument("--ml-device", default="cpu")
     parser.add_argument("--ml-mult", type=int, default=1)
-    parser.add_argument("--molecule", choices=("peptide", "dna", "rna", "popc"), default="peptide")
+    parser.add_argument(
+        "--molecule",
+        choices=("peptide", "dna", "rna", "popc", "complex", "complex_no_h"),
+        default="peptide",
+    )
     parser.add_argument("--compare-cpu", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -47,7 +51,8 @@ def main() -> int:
         root = Path(tmp)
         paths = write_inputs(root)
         charge = -3 if args.molecule in {"dna", "rna"} else 0
-        selection = "resi 1-2" if args.molecule == "peptide" else "all"
+        ligand = args.molecule.startswith("complex")
+        selection = "resn UNL" if ligand else "resi 1-2" if args.molecule == "peptide" else "all"
         bundle = MLMMBackend().build_system(
             paths[args.molecule],
             ml_backend=args.backend,
@@ -55,8 +60,14 @@ def main() -> int:
             ml_selection=selection,
             ml_charge=charge,
             ml_mult=args.ml_mult,
+            ligand_sdf=paths["sdf"] if ligand else None,
             work_dir=root / "prepared",
         )
+        if ligand:
+            assert bundle.topology.getNumAtoms() == 42
+            assert bundle.topology.getNumResidues() == 4
+            assert len(bundle.extra["ml_indices"]) == 9
+            assert not bundle.extra["link_atoms"]
         system = IMDSystem(
             bundle,
             IMDConfig(
