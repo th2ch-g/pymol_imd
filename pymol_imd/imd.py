@@ -582,9 +582,9 @@ class IMDSystem:
         The first MLIP call pays for model download, TorchScript/torch.compile
         tracing, and (AIMNet2) Warp kernel codegen — seconds of work that would
         otherwise freeze the viewer on the first dragged frame. Doing it here at
-        setup moves that cost to where the user expects setup work, and primes
-        the ML/MM correction force with the t0 delta. Numerically lossless: the
-        throwaway forces are recomputed every frame anyway.
+        setup moves that cost to where the user expects setup work. The
+        throwaway correction is cleared afterward: a fixed linear force must
+        not enter the subsequent MM minimization.
 
         No-op for non-MLMM backends. Failures are non-fatal (logged) — the real
         per-frame path surfaces any genuine error with full context.
@@ -595,6 +595,17 @@ class IMDSystem:
             self._apply_mlmm_correction_force()
         except Exception as exc:
             logger.warning("MLMM warmup inference failed (non-fatal): %s", exc)
+        finally:
+            self._clear_mlmm_correction_force()
+
+    def _clear_mlmm_correction_force(self) -> None:
+        """Remove the frozen per-frame correction before MM minimization."""
+        if self._mlmm_force is None:
+            return
+        for index in range(self._mlmm_force.getNumParticles()):
+            atom_index, _parameters = self._mlmm_force.getParticleParameters(index)
+            self._mlmm_force.setParticleParameters(index, atom_index, (0.0, 0.0, 0.0))
+        self._mlmm_force.updateParametersInContext(self.simulation.context)
 
     def _apply_mlmm_correction_force(
         self,
@@ -804,6 +815,8 @@ class IMDSystem:
         ``tol_kj`` is the energy-change convergence tolerance: two consecutive
         chunks differing by less than this (kJ/mol) count as converged.
         """
+        self.clear_pull_forces()
+        self._clear_mlmm_correction_force()
         self.simulation.minimizeEnergy(maxIterations=max_iterations)
         self._sync_positions_to_pymol()
         energy = self.simulation.context.getState(getEnergy=True).getPotentialEnergy()

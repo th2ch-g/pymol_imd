@@ -9,16 +9,16 @@ levels are supported from the same plugin:
 | Level | Forcefield | Use when |
 |---|---|---|
 | `aa`   | Amber ff14SB / GAFF (AM1-BCC ligand charges) | Atomistic protein / DNA / RNA / lipid / ligand systems |
-| `cg`   | Martini 3 via `vermouth` + `martini_openmm`  | Large biomolecules, fast 20 fs timestep |
+| `cg`   | Martini 3 via `vermouth` + `martini_openmm`  | Protein coarse graining, fast 20 fs timestep |
 | `mlmm` | ONIOM-style: full-system Amber MM + MLIP delta on a selected region | Reactive / electronic-effect-sensitive regions |
 
 Supported MLIP backends for `--level mlmm` (in order of "ready to use"):
 
 | Backend | Default | Login | Size | Notes |
 |---|---|---|---|---|
-| [AIMNet2](https://github.com/zubatyuk/aimnet) | **yes** | no | ~10 MB (bundled) | Fastest CPU; charge / mult go to the constructor |
+| [AIMNet2](https://github.com/zubatyuk/aimnet) | **yes** | no | ~10 MB (cached on first use) | Fastest CPU; charge / mult go to the constructor |
 | [MACE-OMOL-0](https://github.com/ACEsuit/mace-foundations) | no | no | ~400 MB | ASL license (academic only) |
-| [ORB](https://github.com/orbital-materials/orb-models) | no | no | ~100 MB | `atoms.info["spin"]` driven |
+| [ORB](https://github.com/orbital-materials/orb-models) | no | no | ~100 MB | Charge and spin multiplicity from `atoms.info` |
 | [UMA](https://huggingface.co/facebook/UMA) | no | **yes** | gated | Needs HF auth + `pixi run install-uma` |
 
 **Solvent:** `aa` and `mlmm` default to **GBn2 generalized-Born implicit solvent**
@@ -27,6 +27,10 @@ Supported MLIP backends for `--level mlmm` (in order of "ready to use"):
 periodic box with PME/NPT (which disables GB). `cg` (Martini) keeps its own solvent
 treatment. For ML/MM the GB term is applied to both the full system and the
 subtracted MM region so the ONIOM energy stays consistent.
+
+The minimization stage relaxes the Amber MM system. Frozen ML/MM corrections
+and mouse-pull forces are cleared before minimization; the ML correction is
+recomputed from the relaxed coordinates when production starts.
 
 ---
 
@@ -69,6 +73,19 @@ pixi install -e gpu
 pixi run -e gpu pymol_imd local input.pdb --level mlmm \
     --ml-selection "resi 30-50" --ml-charge 0 --ml-mult 1
 ```
+
+AIMNet2's CUDA helper compilation needs CUDA Toolkit headers visible to the
+host compiler. If it reports `cuda.h: No such file or directory`, load the
+site's CUDA Toolkit and expose its existing `CUDA_HOME` include directory:
+
+```bash
+export CPATH="${CUDA_HOME:?Load the CUDA Toolkit first}/include${CPATH:+:$CPATH}"
+```
+
+`--ml-compile` is opt-in for every backend, including ORB and UMA. ORB uses
+full float32 precision so CUDA does not silently enable TF32 matrix products.
+For MACE, ORB, and UMA, `--ml-mult` is passed as spin multiplicity (`2S+1`);
+a singlet is `1`.
 
 ---
 
@@ -305,8 +322,8 @@ prepared PDB:
 # A single residue
 --ml-selection 'resi 1 and resn MET'
 
-# A bound ligand and everything within 5 Å (shell residues whole)
---ml-selection 'byres (resn LIG) within 5 of chain A'
+# Protein residues around a selected active-site residue
+--ml-selection 'byres (chain A within 5 of (chain A and resi 42))'
 
 # Active-site residues only, no water
 --ml-selection 'chain A and resi 30-50 and not resn HOH'
@@ -426,7 +443,8 @@ pymol_imd/
 ## Validation
 
 `pixi run smoke-molecules` checks DNA, RNA, POPC/POPE lipids with and without
-hydrogens, and an AM1-BCC ethanol ligand. It verifies GBn2, preservation of
+hydrogens, and an AM1-BCC ethanol ligand, including a bound ligand without
+hydrogens. It verifies GBn2, preservation of
 heavy-atom coordinates, atom counts, minimization, and finite MD forces.
 Use `--platform cuda` in the GPU environment to check the same inputs on CUDA.
 
@@ -457,6 +475,20 @@ current references were verified with the OpenMM OpenCL platform and CPU
 AIMNet2; a CPU-only OpenMM run can exceed the strict absolute tolerance because
 its coordinates and forces use different precision. Check the logged main and
 subset platforms before interpreting a numerical-reference failure.
+
+`smoke-backends` checks a chosen MLIP with GBn2, link atoms, minimization,
+production, trajectory/CSV recording, and optional CPU/CUDA force comparison:
+
+```bash
+pixi run -e gpu smoke-backends --backend aimnet2 --platform cuda --ml-device cuda --compare-cpu
+pixi run -e gpu smoke-backends --backend mace --platform cuda --ml-device cuda --compare-cpu
+```
+
+`--molecule dna`, `rna`, or `popc` selects a whole-molecule ML region. The
+cross-device tolerance applies only to these comparisons; pinned numerical
+references keep their original tolerance. ORB/UMA require their optional
+installation tasks. Use separate working environments when checking UMA and
+MACE/ORB because their dependency versions conflict.
 
 ---
 

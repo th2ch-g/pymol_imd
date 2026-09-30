@@ -118,8 +118,9 @@ def _compute_ss_string(pdb_path: Path) -> str:
     import mdtraj as md
 
     traj = md.load(str(pdb_path))
-    protein_idx = traj.topology.select("protein")
-    if protein_idx.size == 0:
+    # Avoid the selection parser's cached exceptions retaining caller frames.
+    protein_idx = [atom.index for atom in traj.topology.atoms if atom.residue.is_protein]
+    if not protein_idx:
         raise RuntimeError(f"No protein atoms found in {pdb_path}")
     protein = traj.atom_slice(protein_idx)
     ss = md.compute_dssp(protein, simplified=True)[0]

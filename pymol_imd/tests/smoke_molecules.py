@@ -76,6 +76,11 @@ def write_inputs(root: Path) -> dict[str, Path]:
     paths["complex"] = root / "complex.pdb"
     with paths["complex"].open("w") as stream:
         PDBFile.writeFile(modeller.topology, modeller.positions, stream)
+    ligand_residue = list(modeller.topology.residues())[-1]
+    modeller.delete([atom for atom in ligand_residue.atoms() if atom.element.symbol == "H"])
+    paths["complex_no_h"] = root / "complex_no_h.pdb"
+    with paths["complex_no_h"].open("w") as stream:
+        PDBFile.writeFile(modeller.topology, modeller.positions, stream)
     return paths
 
 
@@ -102,6 +107,16 @@ def _check_case(name: str, pdb: Path, root: Path, platform: str, **kwargs) -> No
     assert bundle.topology.getNumAtoms() == expected, (name, bundle.topology.getNumAtoms())
     if name.startswith("ligand_"):
         assert bundle.topology.getNumResidues() == 4, "The bound ligand was duplicated"
+    if name == "ligand_append":
+        from rdkit import Chem
+
+        sdf = next(iter(Chem.SDMolSupplier(str(kwargs["ligand_sdf"]), removeHs=False)))
+        input_xyz = sdf.GetConformer().GetPositions() * 0.1
+        ligand_residue = list(bundle.topology.residues())[-1]
+        ligand_xyz = np.asarray(bundle.positions.value_in_unit(unit.nanometer))[
+            [atom.index for atom in ligand_residue.atoms()]
+        ]
+        np.testing.assert_allclose(ligand_xyz, input_xyz, atol=1e-12)
     system = IMDSystem(bundle, IMDConfig(platform=platform, nsteps_per_frame=1, mouse_force=False))
     system.simulation.minimizeEnergy(maxIterations=20)
     system.running = True
@@ -126,7 +141,11 @@ def main() -> int:
         paths = write_inputs(root)
         for name in ("dna", "rna", "popc", "popc_no_h", "pope", "pope_no_h"):
             _check_case(name, paths[name], root, args.platform)
-        for name, source in (("ligand_append", "peptide"), ("ligand_in_pdb", "complex")):
+        for name, source in (
+            ("ligand_append", "peptide"),
+            ("ligand_in_pdb", "complex"),
+            ("ligand_in_pdb_no_h", "complex_no_h"),
+        ):
             _check_case(name, paths[source], root, args.platform, ligand_sdf=paths["sdf"])
     log.info("Molecule smoke test OK")
     return 0

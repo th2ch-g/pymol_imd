@@ -6,10 +6,12 @@ Run with ``pixi run smoke-pymol`` or in a fresh viewer with
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import tempfile
 import time
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -67,7 +69,7 @@ def _until(app, condition, timeout: float = 20.0) -> None:
         time.sleep(0.005)
 
 
-def _exercise_backend(app, pdb: Path, level: str, output: Path | None) -> None:
+def _exercise_backend(app, pdb: Path, level: str, output: Path | None) -> list:
     setup = getattr(commands, f"imd_setup_{level}")
     kwargs = {"platform": "cpu", "nsteps_per_frame": 1, "frame_interval_ms": 5}
     if level == "mlmm":
@@ -79,6 +81,16 @@ def _exercise_backend(app, pdb: Path, level: str, output: Path | None) -> None:
     assert cmd.get_setting_int("retain_order") == 1
     if level != "cg":
         assert cmd.count_atoms(f"{obj} and hydro") > 0
+    if level == "mlmm":
+        correction = system._mlmm_force
+        for i in range(correction.getNumParticles()):
+            assert tuple(correction.getParticleParameters(i)[1]) == (0.0, 0.0, 0.0)
+        system.apply_mlmm_if_present()
+        system.set_pull_forces(np.array([0]), np.ones((system.n_atoms, 3)))
+        system.minimize_step(max_iterations=20)
+        assert not system._active_pull_idx_prev
+        for i in range(correction.getNumParticles()):
+            assert tuple(correction.getParticleParameters(i)[1]) == (0.0, 0.0, 0.0)
     paths = [pdb.parent / f"{level}{suffix}" for suffix in (".xtc", "_forces.csv", "_state.csv")]
     commands.imd_record(traj=str(paths[0]), force_csv=str(paths[1]), state_csv=str(paths[2]))
     commands.imd_minimize(max_iter_per_chunk=20, max_chunks=3, run_after=True)
@@ -121,6 +133,10 @@ def _exercise_backend(app, pdb: Path, level: str, output: Path | None) -> None:
     log.info(
         "%s PyMOL/Qt OK: setup, minimize -> run, stop, all drag levels, coordinate sync", level
     )
+    owned = [system, system.simulation.context, commands._timer, commands._timer_minimize]
+    if level == "mlmm":
+        owned.extend((system._mlip_atoms, system.bundle.extra["ml_calculator"]))
+    return [weakref.ref(item) for item in owned]
 
 
 def _check_coordset_sync(system) -> None:
@@ -211,9 +227,21 @@ def main() -> int:
         with tempfile.TemporaryDirectory() as tmp:
             pdb = Path(tmp) / "test_peptide.pdb"
             _write_peptide(pdb)
+            previous = []
             for level in ("aa", "cg", "mlmm"):
-                _exercise_backend(app, pdb, level, Path(output) if output else None)
+                current = _exercise_backend(app, pdb, level, Path(output) if output else None)
+                QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+                gc.collect()
+                assert all(ref() is None for ref in previous), (
+                    "Previous setup is still retained",
+                    [type(ref()).__name__ for ref in previous if ref() is not None],
+                )
+                previous = current
             _check_live_temperature(pdb)
+            QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+            gc.collect()
+            assert all(ref() is None for ref in previous), "Previous ML/MM setup is still retained"
+            log.info("setup replacement releases systems, Qt timers, contexts, and ML calculators")
             _check_error_cleanup(app)
             _check_socket_cleanup()
     finally:

@@ -338,9 +338,8 @@ def _build_orb_calculator(model: str, device_str: str, *, ml_compile: bool = Fal
     paths (``orb_models.forcefield.calculator``, single-return pretrained)
     are gone — this code targets 0.7.x onwards.
 
-    ``ml_compile`` wraps the underlying model in ``torch.compile`` (ORB has no
-    native compile flag). ORBCalculator keeps it as ``self.model`` and calls it
-    every frame, so replacing that attribute with the compiled module is enough.
+    ``ml_compile`` controls ORB's native compile flag explicitly; its upstream
+    default otherwise enables compilation even when the plugin flag is false.
     """
     try:
         from orb_models.forcefield import pretrained
@@ -356,13 +355,10 @@ def _build_orb_calculator(model: str, device_str: str, *, ml_compile: bool = Fal
         )
         raise ValueError(f"Unknown ORB model {model!r}. Available: {available}")
     device_str = _mps_to_cpu_fallback(device_str, "ORB")
-    orb_model, adapter = getattr(pretrained, model)(device=device_str)
-    calc = ORBCalculator(orb_model, adapter, device=device_str)
-    if ml_compile:
-        import torch
-
-        calc.model = torch.compile(calc.model)
-    return calc
+    orb_model, adapter = getattr(pretrained, model)(
+        device=device_str, compile=ml_compile, precision="float32-highest"
+    )
+    return ORBCalculator(orb_model, adapter, device=device_str)
 
 
 def _build_aimnet2_calculator(
@@ -396,27 +392,24 @@ def _build_aimnet2_calculator(
 def _build_uma_calculator(model: str, device_str: str, task_name: str, *, ml_compile: bool = False):
     """Build a FAIRChem (UMA) ASE calculator.
 
-    fairchem-core 2.20.x moved ``get_predict_unit`` to
-    ``fairchem.core.calculate.pretrained_mlip`` (the old
-    ``fairchem.core.pretrained_mlip`` path no longer imports). The predict unit
-    holds the torch model at ``predictor.model`` whose core network is
-    ``predictor.model.module``; ``ml_compile`` wraps that core in
-    ``torch.compile`` (UMA has no native compile flag).
+    Use the prediction unit's native inference settings so ``ml_compile``
+    controls compilation without replacing internal model wrappers.
     """
     try:
         from fairchem.core import FAIRChemCalculator
         from fairchem.core.calculate.pretrained_mlip import get_predict_unit
+        from fairchem.core.units.mlip_unit import InferenceSettings
     except ImportError as exc:
         raise RuntimeError(
             "fairchem-core>=2.20.0 is required for --ml-backend uma. "
             "Install with `pixi run install-uma` and `huggingface-cli login` "
             "(facebook/UMA is a gated HF repo)."
         ) from exc
-    predictor = get_predict_unit(model, device=device_str)
-    if ml_compile:
-        import torch
-
-        predictor.model.module = torch.compile(predictor.model.module)
+    predictor = get_predict_unit(
+        model,
+        device=device_str,
+        inference_settings=InferenceSettings(compile=ml_compile, merge_mole=True),
+    )
     return FAIRChemCalculator(predictor, task_name=task_name)
 
 
@@ -438,12 +431,11 @@ def _build_mlip_calculator(
     """Build an ASE Calculator for the requested MLIP backend.
 
     ``ml_charge`` / ``ml_mult`` are only consumed by backends whose ASE
-    wrapper takes them in the constructor (AIMNet2). ORB still reads them
-    from ``atoms.info`` each frame.
+    wrapper takes them in the constructor (AIMNet2). MACE, ORB, and UMA read
+    charge and spin multiplicity from ``atoms.info``.
 
-    ``ml_compile`` requests ``torch.compile`` where the backend supports it
-    (AIMNet2 today). It is numerically ~identical but not bitwise, hence
-    opt-in; backends without a wired compile path ignore it.
+    ``ml_compile`` requests ``torch.compile`` where the backend supports it.
+    It is numerically ~identical but not bitwise, hence opt-in.
     """
     backend = backend.lower()
     if backend == "mace":
@@ -798,13 +790,11 @@ class MLMMBackend:
             mace_model=mace_model,
             mace_dtype=mace_dtype,
         )
-        # `atoms.info` payload that satisfies every supported backend:
-        # AIMNet2 reads `mult`, ORB reads `spin` (= unpaired electrons,
-        # always `mult - 1` by definition), MACE / UMA ignore them.
+        # MACE, ORB, and UMA use spin multiplicity (2S+1), not unpaired electrons.
         ml_calc_info = {
             "charge": int(ml_charge),
             "mult": int(ml_mult),
-            "spin": int(ml_mult) - 1,
+            "spin": int(ml_mult),
         }
 
         # MM subset for the ONIOM subtraction. Under PBC it reuses the

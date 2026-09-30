@@ -69,11 +69,17 @@ class AABackend:
         forcefield = ForceField(*ff_files)
 
         if ligand_sdf is not None:
+            from copy import deepcopy
+            from io import StringIO
+
             ligand = prepare_ligand_am1bcc(ligand_sdf)
             from openmmforcefields.generators import GAFFTemplateGenerator
 
             generator = GAFFTemplateGenerator(molecules=ligand, forcefield=gaff_version)
-            forcefield.registerTemplateGenerator(generator.generator)
+            # Expose the ligand's hydrogen template before Modeller runs.
+            # GAFF generation changes conformers, so preserve the input copy.
+            ffxml = generator.generate_residue_template(deepcopy(ligand))
+            forcefield.loadFile(StringIO(ffxml))
             logger.info("Registered GAFF template for ligand %s", ligand.name)
         else:
             ligand = None
