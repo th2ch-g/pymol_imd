@@ -372,8 +372,7 @@ def _build_parser(mode: str = "launch") -> argparse.ArgumentParser:
         metavar="M",
         help=(
             "ML region spin multiplicity (2S+1). Default: 1 (singlet). "
-            "The unpaired-electron count expected by ORB (atoms.info['spin']) "
-            "is auto-derived as mult - 1."
+            "Passed directly to every MLIP backend as a multiplicity."
         ),
     )
     mlmm.add_argument(

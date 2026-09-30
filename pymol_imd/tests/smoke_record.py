@@ -124,7 +124,7 @@ def _check_xtc(xtc_path: Path, bundle, *, expected_frames: int) -> None:
 
 def _check_pdb_footer(pdb_path: Path) -> None:
     # PDBReporter writes its trailing END only in __del__ (via writeFooter), so
-    # a standalone "END" line proves stop_recording's gc.collect() close path.
+    # a standalone "END" line proves stop_recording finalized the reporter.
     lines = pdb_path.read_text().splitlines()
     if not any(line.strip() == "END" for line in lines):
         raise AssertionError("PDB trajectory missing END footer (close path failed)")
@@ -250,6 +250,53 @@ def _check_reported_state(tmp_path: Path) -> None:
     log.info("frame states OK: unwrapped coordinates, final-step time, velocity and force fields")
 
 
+def _check_cg_recording(tmp_path: Path) -> None:
+    import mdtraj
+    from openmm import unit
+
+    from pymol_imd.backends.cg import CGBackend
+    from pymol_imd.imd import IMDConfig, IMDSystem
+    from pymol_imd.tests.smoke_pymol import _write_peptide
+
+    pdb = tmp_path / "cg_input.pdb"
+    _write_peptide(pdb)
+    bundle = CGBackend().build_system(pdb, work_dir=tmp_path / "cg")
+    config = IMDConfig(
+        platform="cpu",
+        mouse_force=False,
+        nsteps_per_frame=1,
+        timestep_ps=CGBackend.recommended_timestep_ps,
+    )
+    imd = IMDSystem(bundle, config)
+    imd.simulation.minimizeEnergy(maxIterations=20)
+    top = mdtraj.Topology.from_openmm(bundle.topology)
+    expected_box = np.asarray(
+        [vector.value_in_unit(unit.nanometer) for vector in bundle.topology.getPeriodicBoxVectors()]
+    )
+    for ext in ("xtc", "dcd", "pdb"):
+        path = tmp_path / f"cg_traj.{ext}"
+        state_path = tmp_path / f"cg_{ext}_state.csv"
+        imd.set_recording(traj=str(path), state_csv=str(state_path))
+        imd.start_recording()
+        imd.running = True
+        try:
+            for _ in range(3):
+                alive, _state = imd.advance_openmm()
+                assert alive
+        finally:
+            imd.stop_recording()
+        traj = mdtraj.load(str(path), top=top)
+        assert traj.n_frames == 3 and traj.n_atoms == bundle.topology.getNumAtoms()
+        assert np.isfinite(traj.xyz).all()
+        np.testing.assert_allclose(
+            traj.unitcell_vectors, np.broadcast_to(expected_box, (3, 3, 3)), atol=5e-5
+        )
+        _check_state_csv(state_path, pbc=True, expected_rows=3)
+        if ext == "pdb":
+            _check_pdb_footer(path)
+    log.info("CG recording OK: XTC, DCD and PDB preserve frames and periodic box lengths")
+
+
 def main(pdb_id: str = "1aki", n_steps: int = 6) -> int:
     from pymol_imd.backends.aa import AABackend
     from pymol_imd.prep import fetch_pdb
@@ -258,6 +305,7 @@ def main(pdb_id: str = "1aki", n_steps: int = 6) -> int:
         tmp_path = Path(tmp)
         _check_live_recording(tmp_path)
         _check_reported_state(tmp_path)
+        _check_cg_recording(tmp_path)
         pdb_path = fetch_pdb(pdb_id, out_dir=tmp_path)
         bundle = AABackend().build_system(pdb_path)
         log.info("Built AA system: %d atoms", bundle.topology.getNumAtoms())

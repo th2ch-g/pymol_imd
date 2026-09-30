@@ -306,8 +306,7 @@ def _bounding_box_vectors(
 ):
     """Cubic periodic vectors enclosing positions with padding (nm).
 
-    Returns a tuple of three ``Vec3 * nanometer`` Quantities, the form
-    ``Topology.setPeriodicBoxVectors`` and ``PDBFile.writeFile`` both expect.
+    Wrap the whole vector triple in one Quantity so PDB writers can strip units.
     """
     from openmm import Vec3
 
@@ -319,7 +318,7 @@ def _bounding_box_vectors(
     minimum_side = 2.0 * nonbonded_cutoff_nm + constants.MINIMUM_BOX_MARGIN_NM
     side = max(requested_side, minimum_side)
     return (
-        Vec3(side, 0.0, 0.0) * unit.nanometer,
-        Vec3(0.0, side, 0.0) * unit.nanometer,
-        Vec3(0.0, 0.0, side) * unit.nanometer,
-    )
+        Vec3(side, 0.0, 0.0),
+        Vec3(0.0, side, 0.0),
+        Vec3(0.0, 0.0, side),
+    ) * unit.nanometer

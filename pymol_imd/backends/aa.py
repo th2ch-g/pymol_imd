@@ -151,9 +151,7 @@ def _set_bounding_box(
     # returns and what computeLengthsAndAngles strips on PDB write. Uniting each
     # Vec3 separately (or passing scalar Quantities to setUnitCellDimensions)
     # leaves the CRYST1 lengths as Quantity and crashes PDBFile.writeHeader's
-    # float formatting under pbc=True. (CG's _bounding_box_vectors unites each
-    # Vec3 separately but dodges this by copying martinize2's PDB, never writing
-    # one through PDBFile.)
+    # float formatting under pbc=True.
     modeller.topology.setPeriodicBoxVectors(
         (
             Vec3(side, 0.0, 0.0),
