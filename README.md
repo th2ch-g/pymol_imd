@@ -471,7 +471,9 @@ scripts. Drag tests change atom coordinates through PyMOL; physical mouse
 gestures still require a separate UI check.
 
 `smoke-mlmm` uses the saved numerical references without replacing them. The
-current references were verified with the OpenMM OpenCL platform and CPU
+default selection explicitly includes protein residues 1-3 and water residues
+130-132 from 1AKI to retain the original reference atom set after preserving
+PDB identifiers. The current references were verified with the OpenMM OpenCL platform and CPU
 AIMNet2; a CPU-only OpenMM run can exceed the strict absolute tolerance because
 its coordinates and forces use different precision. Check the logged main and
 subset platforms before interpreting a numerical-reference failure.
@@ -487,8 +489,7 @@ pixi run -e gpu smoke-backends --backend mace --platform cuda --ml-device cuda -
 `--molecule dna`, `rna`, or `popc` selects a whole-molecule ML region. The
 `complex` and `complex_no_h` cases select a bound ligand and exercise the
 ML/MM backend's `ligand_sdf` input, including missing-hydrogen completion.
-The
-cross-device tolerance applies only to these comparisons; pinned numerical
+The cross-device tolerance applies only to these comparisons; pinned numerical
 references keep their original tolerance. ORB/UMA require their optional
 installation tasks. Use separate working environments when checking UMA and
 MACE/ORB because their dependency versions conflict.

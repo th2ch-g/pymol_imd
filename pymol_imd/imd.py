@@ -7,7 +7,7 @@ AA / CG / ML-MM backend) and turns it into a runnable simulation that:
   * reads PyMOL atomic coordinates each frame and pushes a pulling force into
     a single :class:`CustomExternalForce` so the user can drag atoms in the
     PyMOL window during MD,
-  * writes OpenMM positions back into PyMOL via ``cmd.alter_state``.
+  * writes OpenMM positions back into the PyMOL coordinate set.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from openmm.app import DCDReporter, PDBReporter, Simulation, XTCReporter
 
 from . import constants
 from .backends.base import SystemBundle
+from .pymol_io import load_coordinates
 
 logger = logging.getLogger(__name__)
 
@@ -1336,7 +1337,7 @@ class IMDSystem:
             )
         positions_ang = positions_nm * 10.0
         if self.pymol_object:
-            cmd.load_coordset(positions_ang, self.pymol_object, state=1)
+            load_coordinates(cmd, self.pymol_object, positions_ang)
         else:
             cmd.alter_state(
                 1,

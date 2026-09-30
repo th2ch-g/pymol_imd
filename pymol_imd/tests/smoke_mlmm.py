@@ -42,6 +42,10 @@ REF_DIR = Path(__file__).parent / "refs"
 # float64 by default so it can be held to a tighter bound.
 _ATOL_BY_BACKEND = {"mace": 1e-7, "aimnet2": 1e-4, "orb": 1e-4, "uma": 1e-4}
 
+# The saved 1AKI baseline includes three waters formerly renumbered as 1-3.
+# Select their original identifiers explicitly without changing the reference.
+_DEFAULT_ML_SELECTION = "resi 1-3+130-132"
+
 
 def _compute_ml_delta(imd) -> np.ndarray:
     """Run one ONIOM correction and read the per-particle delta force back.
@@ -201,7 +205,9 @@ def _run_gb_build(pdb_path: Path, *, backend: str, ml_selection: str) -> None:
     log.info("MLMM GBn2 OK: GB force on full + MM subset, finite ONIOM delta across steps")
 
 
-def main(pdb_id: str = "1aki", backend: str = "aimnet2", ml_selection: str = "resi 1-3") -> int:
+def main(
+    pdb_id: str = "1aki", backend: str = "aimnet2", ml_selection: str = _DEFAULT_ML_SELECTION
+) -> int:
     from pymol_imd.backends.mlmm import MLMMBackend
     from pymol_imd.imd import IMDConfig, IMDSystem
     from pymol_imd.prep import fetch_pdb
@@ -310,5 +316,5 @@ def main(pdb_id: str = "1aki", backend: str = "aimnet2", ml_selection: str = "re
 if __name__ == "__main__":
     pdb = sys.argv[1] if len(sys.argv) > 1 else "1aki"
     ml_backend = sys.argv[2] if len(sys.argv) > 2 else "aimnet2"
-    sel = sys.argv[3] if len(sys.argv) > 3 else "resi 1-3"
+    sel = sys.argv[3] if len(sys.argv) > 3 else _DEFAULT_ML_SELECTION
     raise SystemExit(main(pdb, ml_backend, sel))

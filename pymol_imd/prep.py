@@ -224,7 +224,9 @@ def write_prepared_pdb(
     file, ``index - 1`` lookups in the IMD sync step land on the wrong atoms
     and the visible structure collapses.
 
-    Emits ``CONECT`` records from ``topology.bonds()`` so PyMOL can draw
+    Preserves chain and residue identifiers so ML selections address the
+    same residues before and after preparation. Emits ``CONECT`` records
+    from ``topology.bonds()`` so PyMOL can draw
     bonds. Pass ``bond_filter=_chemical_bond_only`` (or a custom callable)
     to suppress Martini elastic-network springs etc.; the OpenMM ``System``
     still holds the full bond list, so MD physics is unaffected.
@@ -236,7 +238,7 @@ def write_prepared_pdb(
 
     with open(out_path, "w") as fh:
         PDBFile.writeHeader(topology, fh)
-        PDBFile.writeModel(topology, positions, fh, modelIndex=1)
+        PDBFile.writeModel(topology, positions, fh, modelIndex=1, keepIds=True)
         for atom_a, atom_b in topology.bonds():
             if bond_filter is not None and not bond_filter(atom_a, atom_b):
                 continue

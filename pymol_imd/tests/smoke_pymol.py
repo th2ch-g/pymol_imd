@@ -69,6 +69,49 @@ def _until(app, condition, timeout: float = 20.0) -> None:
         time.sleep(0.005)
 
 
+def _check_prepared_identifiers(pdb: Path) -> None:
+    from openmm import Vec3, unit
+    from openmm.app import PDBFile, element
+
+    from pymol_imd.backends.mlmm import _resolve_ml_indices
+    from pymol_imd.prep import write_prepared_pdb
+
+    source = PDBFile(str(pdb))
+    protein = next(source.topology.chains())
+    protein.id = "Z"
+    residues = list(protein.residues())
+    for number, residue in enumerate(residues, 41):
+        residue.id = str(number)
+    residues[1].insertionCode = "A"
+    water = source.topology.addResidue("HOH", source.topology.addChain("W"), "901")
+    oxygen = source.topology.addAtom("O", element.oxygen, water)
+    hydrogen1 = source.topology.addAtom("H1", element.hydrogen, water)
+    hydrogen2 = source.topology.addAtom("H2", element.hydrogen, water)
+    source.topology.addBond(oxygen, hydrogen1)
+    source.topology.addBond(oxygen, hydrogen2)
+    positions = list(source.positions.value_in_unit(unit.nanometer))
+    positions.extend((Vec3(2, 0, 0), Vec3(2.1, 0, 0), Vec3(2, 0.1, 0)))
+    prepared = write_prepared_pdb(
+        source.topology, positions * unit.nanometer, pdb.parent / "identifiers.pdb"
+    )
+    reread = PDBFile(str(prepared))
+    expected_ids = [
+        (res.chain.id, res.id, res.insertionCode.strip()) for res in source.topology.residues()
+    ]
+    actual_ids = [
+        (res.chain.id, res.id, res.insertionCode.strip()) for res in reread.topology.residues()
+    ]
+    assert actual_ids == expected_ids, (actual_ids, expected_ids)
+    expected = tuple(
+        atom.index for atom in source.topology.atoms() if atom.residue in (residues[1], water)
+    )
+    actual = _resolve_ml_indices(
+        source.topology, "chain W or (chain Z and resi 42A)", prepared_pdb_path=prepared
+    )
+    assert actual == expected, (actual, expected)
+    log.info("prepared PDB preserves chain/residue/insertion identifiers and ML selection")
+
+
 def _exercise_backend(app, pdb: Path, level: str, output: Path | None) -> list:
     setup = getattr(commands, f"imd_setup_{level}")
     kwargs = {"platform": "cpu", "nsteps_per_frame": 1, "frame_interval_ms": 5}
@@ -149,14 +192,40 @@ def _check_coordset_sync(system) -> None:
     original_other = cmd.get_coordset(other, state=1)
     second_state = cmd.get_coordset(obj, state=1) + 1
     cmd.load_coordset(second_state, obj, state=2)
+    measurement = cmd.get_unused_name("imd_distance_probe")
+    dynamic_measures = cmd.get_setting_int("dynamic_measures")
+    cmd.set("dynamic_measures", 1)
+
+    def measured_positions():
+        # The session stores the coordinates used by the visible distance label.
+        session = cmd.get_session(measurement)
+        return np.asarray(session["names"][0][5][2][0][1]).reshape(2, 3)
+
     try:
+        displaced = cmd.get_coordset(obj, state=1)
+        displaced[0, 0] += 1
+        cmd.load_coordset(displaced, obj, state=1)
+        cmd.distance(measurement, f"{obj} and index 1", f"{obj} and index 2")
         system._sync_positions_to_pymol()
+        expected = cmd.get_coordset(obj, state=1)
+        np.testing.assert_allclose(measured_positions(), expected[:2], atol=1e-5)
+        viewer = PyMOLIMDClient(None, obj, const_k=10000, max_force_kj=5000)
+        streamed = expected.copy()
+        streamed[0, 0] += 0.2
+        viewer._display(streamed)
+        np.testing.assert_allclose(measured_positions(), streamed[:2], atol=1e-5)
+        cmd.set("dynamic_measures", 0)
+        viewer._display(expected)
+        np.testing.assert_allclose(measured_positions(), streamed[:2], atol=1e-5)
         np.testing.assert_array_equal(cmd.get_coordset(other, state=1), original_other)
         np.testing.assert_array_equal(cmd.get_coordset(obj, state=2), second_state)
         assert cmd.count_states(obj) == 2
     finally:
+        cmd.set("dynamic_measures", dynamic_measures)
+        cmd.delete(measurement)
         cmd.delete(other)
         cmd.delete_states(obj, "2")
+        system._sync_positions_to_pymol()
 
 
 def _check_error_cleanup(app) -> None:
@@ -227,6 +296,7 @@ def main() -> int:
         with tempfile.TemporaryDirectory() as tmp:
             pdb = Path(tmp) / "test_peptide.pdb"
             _write_peptide(pdb)
+            _check_prepared_identifiers(pdb)
             previous = []
             for level in ("aa", "cg", "mlmm"):
                 current = _exercise_backend(app, pdb, level, Path(output) if output else None)

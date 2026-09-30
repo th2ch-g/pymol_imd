@@ -23,6 +23,7 @@ import numpy as np
 from . import constants, protocol, transport
 from .imd import compute_pull_forces
 from .protocol import IMDHeaderType, SessionInfo
+from .pymol_io import load_coordinates
 
 logger = logging.getLogger(__name__)
 
@@ -330,7 +331,7 @@ class PyMOLIMDClient:
 
         self._validate_object(cmd, len(positions_ang))
         # Positions arrive in angstrom — already PyMOL's unit, so no conversion.
-        cmd.load_coordset(positions_ang, self.pymol_object, state=1)
+        load_coordinates(cmd, self.pymol_object, positions_ang)
         cmd.refresh()
 
     def _send_drag_forces(self) -> None:
