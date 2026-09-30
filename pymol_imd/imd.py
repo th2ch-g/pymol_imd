@@ -29,7 +29,7 @@ from openmm import (
     Platform,
     unit,
 )
-from openmm.app import DCDReporter, PDBReporter, Simulation, XTCReporter
+from openmm.app import DCDFile, DCDReporter, PDBReporter, Simulation, XTCFile, XTCReporter
 
 from . import constants
 from .backends.base import SystemBundle
@@ -40,6 +40,36 @@ logger = logging.getLogger(__name__)
 # eV/Å -> kJ/(mol·nm) bridge. Single source of truth lives in constants.py;
 # kept as a module alias so the per-frame call sites below stay terse.
 _EV_PER_A_TO_KJ_PER_MOL_NM = constants.EV_PER_A_TO_KJ_PER_MOL_NM
+
+
+class _XTCReporter(XTCReporter):
+    """Keep the full-system trajectory clock aligned across recording restarts."""
+
+    def report(self, simulation, state) -> None:
+        if self._xtc is None:
+            self._xtc = XTCFile(
+                self._fileName,
+                simulation.topology,
+                simulation.integrator.getStepSize(),
+                firstStep=simulation.currentStep,
+                interval=self._reportInterval,
+            )
+        super().report(simulation, state)
+
+
+class _DCDReporter(DCDReporter):
+    """Use the cumulative first MD step in the full-system DCD header."""
+
+    def report(self, simulation, state) -> None:
+        if self._dcd is None:
+            self._dcd = DCDFile(
+                self._out,
+                simulation.topology,
+                simulation.integrator.getStepSize(),
+                firstStep=simulation.currentStep,
+                interval=self._reportInterval,
+            )
+        super().report(simulation, state)
 
 
 class _CSVReporter:
@@ -1000,8 +1030,8 @@ class IMDSystem:
         """
         ext = Path(traj_path).suffix.lower()
         reporter_classes = {
-            ".xtc": XTCReporter,
-            ".dcd": DCDReporter,
+            ".xtc": _XTCReporter,
+            ".dcd": _DCDReporter,
             ".pdb": PDBReporter,
         }
         reporter_class = reporter_classes.get(ext)

@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import logging
 import math
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -188,6 +189,45 @@ def _check_live_recording(tmp_path: Path) -> None:
     log.info("live recording OK: step changes stay aligned; off flushes and detaches all outputs")
 
 
+def _check_restart_clock(tmp_path: Path) -> None:
+    import mdtraj
+
+    from pymol_imd.tests.smoke_drag import _toy_imd_system
+
+    imd = _toy_imd_system("atom")
+    imd.config.mouse_force = False
+    imd.config.nsteps_per_frame = 3
+    imd.simulation.step(7)
+    for extension in ("xtc", "dcd"):
+        trajectory = tmp_path / f"restart.{extension}"
+        state_csv = tmp_path / f"restart_{extension}.csv"
+        start_step = imd.simulation.currentStep
+        expected_steps = np.arange((start_step // 6 + 1) * 6, start_step + 13, 6)
+        imd.set_recording(
+            traj=str(trajectory), traj_interval=2, state_csv=str(state_csv), state_csv_interval=2
+        )
+        imd.start_recording()
+        for _ in range(4):
+            imd.step()
+        imd.stop_recording()
+        with state_csv.open() as stream:
+            rows = list(csv.DictReader(stream))
+        np.testing.assert_array_equal([int(row["step"]) for row in rows], expected_steps)
+        if extension == "xtc":
+            with mdtraj.formats.XTCTrajectoryFile(str(trajectory)) as stream:
+                _, times, steps, _ = stream.read()
+            np.testing.assert_array_equal(steps, expected_steps)
+            np.testing.assert_allclose(times, [float(row["time_ps"]) for row in rows], atol=1e-7)
+        else:
+            count, first_step, interval = struct.unpack_from("<3i", trajectory.read_bytes(), 8)
+            np.testing.assert_array_equal(first_step + np.arange(count) * interval, expected_steps)
+            top = mdtraj.Topology.from_openmm(imd.bundle.topology)
+            traj = mdtraj.load_dcd(str(trajectory), top=top)
+            assert traj.n_frames == len(expected_steps)
+            assert np.isfinite(traj.xyz).all()
+    log.info("restart clock OK: XTC and DCD retain cumulative steps and match state CSV")
+
+
 def _check_reported_state(tmp_path: Path) -> None:
     import openmm
     from openmm import unit
@@ -304,6 +344,7 @@ def main(pdb_id: str = "1aki", n_steps: int = 6) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         _check_live_recording(tmp_path)
+        _check_restart_clock(tmp_path)
         _check_reported_state(tmp_path)
         _check_cg_recording(tmp_path)
         pdb_path = fetch_pdb(pdb_id, out_dir=tmp_path)
