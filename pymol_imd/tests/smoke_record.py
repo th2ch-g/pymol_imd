@@ -153,12 +153,111 @@ def _check_csv_steps_match_traj(
     log.info("CSV/traj step alignment OK (interval=%d): steps=%s", interval, csv_steps)
 
 
+def _check_live_recording(tmp_path: Path) -> None:
+    import mdtraj
+
+    from pymol_imd.tests.smoke_drag import _toy_imd_system
+
+    imd = _toy_imd_system("atom")
+    imd.config.mouse_force = True
+    imd.config.nsteps_per_frame = 2
+    imd._read_pymol_positions_nm = lambda: imd._read_openmm_positions_nm() + [0.01, 0, 0]
+    imd._sync_positions_to_pymol = lambda state=None: None
+    paths = [tmp_path / name for name in ("live.xtc", "live_forces.csv", "live_state.csv")]
+    imd.set_recording(traj=str(paths[0]), force_csv=str(paths[1]), state_csv=str(paths[2]))
+    imd.start_recording()
+    for nsteps in (2, 3, 1):
+        imd.config.nsteps_per_frame = nsteps
+        imd.step()
+    imd.set_recording()
+    assert not imd._recording and not imd.simulation.reporters
+    assert imd._force_csv_file is None and imd._state_csv_file is None
+    for path in paths[1:]:
+        with path.open() as fh:
+            steps = sorted({int(row["step"]) for row in csv.DictReader(fh)})
+        assert steps == [2, 4, 6], (path.name, steps)
+    top = mdtraj.Topology.from_openmm(imd.bundle.topology)
+    traj = mdtraj.load_xtc(str(paths[0]), top=top)
+    assert traj.n_frames == 3
+    np.testing.assert_allclose(traj.time, np.array([2, 4, 6]) * imd.config.timestep_ps)
+    sizes = [path.stat().st_size for path in paths]
+    imd.step()
+    assert sizes == [path.stat().st_size for path in paths]
+    imd.start_recording()
+    assert not imd._recording
+    log.info("live recording OK: step changes stay aligned; off flushes and detaches all outputs")
+
+
+def _check_reported_state(tmp_path: Path) -> None:
+    import openmm
+    from openmm import unit
+    from openmm.app import Element, Topology
+
+    from pymol_imd.backends.base import SystemBundle
+    from pymol_imd.imd import IMDConfig, IMDSystem
+
+    topology = Topology()
+    residue = topology.addResidue("MOL", topology.addChain())
+    system = openmm.System()
+    nonbonded = openmm.NonbondedForce()
+    nonbonded.setNonbondedMethod(nonbonded.CutoffPeriodic)
+    nonbonded.setCutoffDistance(0.9)
+    for i in range(2):
+        topology.addAtom(f"C{i}", Element.getBySymbol("C"), residue)
+        system.addParticle(12)
+        nonbonded.addParticle(0, 0.3, 0)
+    system.addForce(nonbonded)
+    box = np.eye(3) * 3 * unit.nanometer
+    topology.setPeriodicBoxVectors(box)
+    system.setDefaultPeriodicBoxVectors(*box)
+    bundle = SystemBundle(
+        system=system,
+        topology=topology,
+        positions=np.array([[3.4, 0, 0], [3.8, 0, 0]]) * unit.nanometer,
+        backend_name="aa",
+        prepared_pdb_path=tmp_path / "unused.pdb",
+    )
+    imd = IMDSystem(bundle, IMDConfig(nsteps_per_frame=2, mouse_force=False, platform="reference"))
+    imd.set_recording(traj=str(tmp_path / "periodic.xtc"), state_csv=str(tmp_path / "periodic.csv"))
+    imd.start_recording()
+    imd.running = True
+    try:
+        for nsteps, velocities, forces in ((2, False, False), (3, False, False), (1, True, True)):
+            imd.config.nsteps_per_frame = nsteps
+            ok, state = imd.advance_openmm(
+                get_positions=True, get_velocities=velocities, get_forces=forces
+            )
+            assert ok
+            fresh = imd.simulation.context.getState(
+                getPositions=True, getEnergy=True, getVelocities=velocities, getForces=forces
+            )
+            assert state.getTime() == fresh.getTime()
+            assert state.getPotentialEnergy() == fresh.getPotentialEnergy()
+            positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+            np.testing.assert_array_equal(positions, fresh.getPositions(asNumpy=True)._value)
+            assert np.all(positions[:, 0] > 3), "The viewer must retain unwrapped coordinates"
+            if velocities:
+                np.testing.assert_array_equal(
+                    state.getVelocities(asNumpy=True)._value,
+                    fresh.getVelocities(asNumpy=True)._value,
+                )
+            if forces:
+                np.testing.assert_array_equal(
+                    state.getForces(asNumpy=True)._value, fresh.getForces(asNumpy=True)._value
+                )
+    finally:
+        imd.stop_recording()
+    log.info("frame states OK: unwrapped coordinates, final-step time, velocity and force fields")
+
+
 def main(pdb_id: str = "1aki", n_steps: int = 6) -> int:
     from pymol_imd.backends.aa import AABackend
     from pymol_imd.prep import fetch_pdb
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
+        _check_live_recording(tmp_path)
+        _check_reported_state(tmp_path)
         pdb_path = fetch_pdb(pdb_id, out_dir=tmp_path)
         bundle = AABackend().build_system(pdb_path)
         log.info("Built AA system: %d atoms", bundle.topology.getNumAtoms())
@@ -243,6 +342,19 @@ def main(pdb_id: str = "1aki", n_steps: int = 6) -> int:
             imd2.step()
         imd2.stop_recording()
         _check_pdb_footer(pdb_traj)
+
+        dcd = tmp_path / "traj.dcd"
+        imd2.set_recording(traj=str(dcd))
+        imd2.start_recording()
+        for _ in range(n_steps):
+            imd2.step()
+        imd2.stop_recording()
+        import mdtraj
+
+        traj = mdtraj.load_dcd(str(dcd), top=mdtraj.Topology.from_openmm(bundle.topology))
+        assert traj.n_frames == n_steps
+        assert np.all(np.isfinite(traj.xyz))
+        log.info("DCD OK: %d finite frames", traj.n_frames)
 
         # --- pbc=True: state CSV gains volume/density columns ---
         bundle_pbc = AABackend().build_system(pdb_path, pbc=True)

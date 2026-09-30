@@ -89,6 +89,9 @@ pixi run pymol_imd local 1ubq.pdb --level mlmm \
 PyMOL opens with Editing mode preselected, so **Ctrl + left-drag** on an
 atom pulls it; the IMD loop converts the drag into a per-atom force on
 OpenMM each frame.
+Picked atoms or bonds can change PyMOL's editing bindings. Click **Unpick**
+to return to the usual controls, or follow the **MovA** entry in the mouse
+grid at the lower right.
 
 Show the generated PyMOL command without launching:
 
@@ -245,7 +248,8 @@ After `setup_*`:
 
 `imd_record` arms output for the **next** `imd_run`. Recording starts when
 `imd_run` is called and stops — files flushed + closed — on `imd_stop` (or on
-an automatic divergence / error halt). Minimization is never recorded.
+an automatic divergence / error halt). `imd_record off` also closes active
+outputs immediately without stopping MD. Minimization is never recorded.
 
 ```
 PyMOL> imd_setup_aa input.pdb
@@ -283,9 +287,10 @@ pixi run pymol_imd local input.pdb --level aa \
     --force-csv pull.csv --state-csv state.csv
 ```
 
-> Changing `nsteps_per_frame` with `imd_change` mid-run does **not** retune an
-> active trajectory reporter's interval (fixed at `imd_run` time). Run
-> `imd_stop` then `imd_run` again to resync.
+Recording intervals are converted to MD steps at `imd_run` time and stay fixed
+until the next run. Changing `nsteps_per_frame` keeps trajectory and CSV samples
+aligned, including samples inside a GUI frame. Run `imd_stop` then `imd_run` to
+derive new intervals from the current frame size.
 
 ---
 
@@ -412,8 +417,35 @@ pymol_imd/
     ├── smoke_drag.py   Headless drag-level (atom/residue/chain) group-expansion smoke
     ├── smoke_socket.py Headless IMDv3 server<->client round-trip + protocol regression
     ├── smoke_cli.py    Headless CLI/subcommand/coercion regression
+    ├── smoke_pymol.py  Real PyMOL command + Qt timer integration for all backends
     └── refs/           Pinned coordinates + reference ML/MM delta arrays
 ```
+
+---
+
+## Validation
+
+`pixi run smoke-pymol` exercises AA, CG, and AIMNet2 ML/MM with a generated
+tripeptide: setup, hydrogen completion, minimization followed by production,
+recording, stop/restart, all drag levels, and cleanup after atom/object edits.
+It uses real PyMOL commands and Qt timers, without requiring a visible window.
+
+To run the same checks in a fresh GUI and export molecular renderings:
+
+```bash
+PYMOL_IMD_TEST_OUTPUT=.pixi/debug/gui PYTHONUTF8=1 \
+    pixi run pymol -k -r pymol_imd/tests/smoke_pymol.py
+```
+
+The viewer exits after the checks. `-k` isolates the run from personal startup
+scripts. Drag tests change atom coordinates through PyMOL; physical mouse
+gestures still require a separate UI check.
+
+`smoke-mlmm` uses the saved numerical references without replacing them. The
+current references were verified with the OpenMM OpenCL platform and CPU
+AIMNet2; a CPU-only OpenMM run can exceed the strict absolute tolerance because
+its coordinates and forces use different precision. Check the logged main and
+subset platforms before interpreting a numerical-reference failure.
 
 ---
 

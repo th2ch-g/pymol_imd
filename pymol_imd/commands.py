@@ -17,13 +17,13 @@ import math
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from . import constants, protocol, transport
-from .backends.aa import AABackend
-from .backends.cg import CGBackend
-from .backends.mlmm import MLMMBackend
-from .client import IMDClient, PyMOLIMDClient
-from .imd import IMDConfig, IMDSystem
+from . import constants
+
+if TYPE_CHECKING:
+    from .client import PyMOLIMDClient
+    from .imd import IMDSystem
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +81,8 @@ def _as_float(value: object) -> float:
 
 
 def _make_imd(bundle, pymol_object: str, **kwargs) -> IMDSystem:
+    from .imd import IMDConfig, IMDSystem
+
     cfg = IMDConfig(**kwargs)
     return IMDSystem(bundle, cfg, pymol_object=pymol_object)
 
@@ -190,7 +192,7 @@ def _validate_drag_level(drag_level: str) -> str:
 
     The pull is expanded to the whole residue / chain inside ``IMDSystem`` each
     frame. PyMOL's own ``mouse_selection_mode`` does NOT affect 3-Button Editing
-    drag (Ctrl+drag moves a covalent fragment regardless), so nothing is set on
+    drag, so nothing is set on
     PyMOL here — this only guards the value flowing into ``IMDConfig`` and the
     live ``imd_change`` / ``imd_drag_level`` commands.
     """
@@ -355,6 +357,8 @@ def imd_setup_aa(
     ``pbc=True`` switches to explicit PME/NPT and disables GB.
     """
     global _imd_system, _timer, _timer_minimize
+    from .backends.aa import AABackend
+
     pdb_path = Path(pdb_file)
     ligand_path = Path(ligand_sdf) if ligand_sdf else None
     pbc_enabled = _as_bool(pbc)
@@ -439,6 +443,8 @@ def imd_setup_cg(
     faster than AA per wall-clock second. Override if you observe instability.
     """
     global _imd_system, _timer, _timer_minimize
+    from .backends.cg import CGBackend
+
     pdb_path = Path(pdb_file)
     pbc_enabled = _as_bool(pbc)
     if pressure is not None and not pbc_enabled:
@@ -567,6 +573,8 @@ def imd_setup_mlmm(
         stays consistent. ``pbc=True`` switches to PME/NPT and disables GB.
     """
     global _imd_system, _timer, _timer_minimize
+    from .backends.mlmm import MLMMBackend
+
     if ml_selection is None:
         raise ValueError(
             "imd_setup_mlmm requires ml_selection. Selection language is PyMOL's "
@@ -825,13 +833,15 @@ def imd_run() -> None:
         try:
             _imd_system.step()
         except Exception as exc:
-            logger.exception("imd_run: step failed")
+            logger.debug("imd_run: step failed", exc_info=True)
             _imd_system.running = False
             print(f"imd_run: stopped due to error — {exc}")
         if not _imd_system.running:
             _timer.stop()
-            _imd_system.stop_recording()
-            print("imd_run: stopped (divergence or error). Adjust const_k / max_force_kj.")
+            try:
+                _imd_system.clear_pull_forces()
+            finally:
+                _imd_system.stop_recording()
 
     _reset_timer(_timer)
     _timer.timeout.connect(_tick)
@@ -881,17 +891,16 @@ def imd_change(
     """Hot-patch IMD parameters without rebuilding the system.
 
     Updatable in place: ``const_k``, ``mouse_force``, ``nsteps_per_frame``,
-    ``temperature`` (live Langevin integrator update), ``max_force_kj``,
+    ``temperature`` (live integrator and barostat update), ``max_force_kj``,
     ``energy_cutoff_kj``, ``drag_level`` (atom / residue / chain, applied live).
     Other ``IMDConfig`` fields (``friction``,
     ``timestep_ps``, ``pressure``, ``integrator``) need a fresh ``setup_*``
     because they require rebuilding the integrator or the barostat;
     ``frame_interval_ms`` needs a stop/run cycle (it is read at timer start).
 
-    Note: changing ``nsteps_per_frame`` while a recording is active does NOT
-    retune the trajectory reporter's interval (it is fixed at ``imd_run``
-    time). Run ``imd_stop`` then ``imd_run`` again to resync the trajectory
-    sampling cadence.
+    Recording intervals are fixed in MD steps at ``imd_run`` time. Changing
+    ``nsteps_per_frame`` keeps trajectory and CSV sampling aligned. Stop and
+    restart to derive new intervals from the updated frame size.
     """
     if _imd_system is None:
         print("imd: no system loaded")
@@ -920,8 +929,13 @@ def imd_change(
     for name in updates:
         setattr(cfg, name, getattr(candidate, name))
     if temperature is not None:
-        # Langevin integrator temperature can be updated live.
         _imd_system.simulation.integrator.setTemperature(cfg.temperature)
+        if _imd_system._has_barostat(_imd_system.bundle.system):
+            from openmm import MonteCarloBarostat
+
+            _imd_system.simulation.context.setParameter(
+                MonteCarloBarostat.Temperature(), cfg.temperature
+            )
     if mouse_force is not None and not cfg.mouse_force:
         _imd_system.clear_pull_forces()
     print(f"imd_change: {cfg}")
@@ -1006,6 +1020,9 @@ def imd_connect(
         ``serve --const-k``) has NO effect — set it here instead.
     """
     global _imd_client
+    from . import protocol, transport
+    from .client import IMDClient, PyMOLIMDClient
+
     try:
         from pymol import cmd
     except ImportError:

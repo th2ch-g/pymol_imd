@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import contextlib
 import csv
-import gc
 import logging
 import math
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +39,26 @@ logger = logging.getLogger(__name__)
 # eV/Å -> kJ/(mol·nm) bridge. Single source of truth lives in constants.py;
 # kept as a module alias so the per-frame call sites below stay terse.
 _EV_PER_A_TO_KJ_PER_MOL_NM = constants.EV_PER_A_TO_KJ_PER_MOL_NM
+
+
+class _CSVReporter:
+    """Sample CSV streams at fixed MD steps, including within GUI frames."""
+
+    def __init__(self, owner, intervals: tuple[int, ...]) -> None:
+        self._owner = weakref.ref(owner)
+        self._intervals = intervals
+
+    def describeNextReport(self, simulation):
+        steps = min(interval - simulation.currentStep % interval for interval in self._intervals)
+        return steps, True, False, False, True, False
+
+    def report(self, simulation, state) -> None:
+        owner = self._owner()
+        if owner is not None:
+            owner._reported_state = (simulation.currentStep, state)
+            if not owner._diverged(state):
+                owner._record_force_csv()
+                owner._record_state_csv(state)
 
 
 def compute_pull_forces(
@@ -269,6 +289,8 @@ class IMDSystem:
         self._record_settings: dict | None = None
         self._recording: bool = False
         self._traj_reporter: object | None = None
+        self._csv_reporter: _CSVReporter | None = None
+        self._reported_state: tuple[int, openmm.State] | None = None
         self._force_csv_path: Path | None = None
         self._force_csv_file = None
         self._force_csv_writer = None
@@ -443,13 +465,9 @@ class IMDSystem:
             self.set_pull_forces(np.empty(0, dtype=int), np.zeros((self.n_atoms, 3)))
         if self._mlmm_force is not None:
             self._apply_mlmm_correction_force(full_positions, box_vectors)
-        self.simulation.step(self.config.nsteps_per_frame)  # trajectory reporter fires here
-        state = self.simulation.context.getState(getPositions=True, getEnergy=True)
+        state = self._step_and_get_state(get_positions=True)
         if self._diverged(state):
             return
-        if self._recording:
-            self._record_force_csv()
-            self._record_state_csv(state)
         self._frame_index += 1
         self._sync_positions_to_pymol(state)
 
@@ -483,20 +501,42 @@ class IMDSystem:
         correction is applied separately via :meth:`apply_mlmm_if_present` so
         the server controls the inject -> correct -> step ordering.
         """
+        state = self._step_and_get_state(
+            get_positions=get_positions, get_velocities=get_velocities, get_forces=get_forces
+        )
+        if self._diverged(state):
+            return False, state
+        self._frame_index += 1
+        return self.running, state
+
+    def _step_and_get_state(
+        self, *, get_positions=False, get_velocities=False, get_forces=False
+    ) -> openmm.State:
+        """Reuse a final-step report without re-evaluating its energy."""
+        self._reported_state = None
         self.simulation.step(self.config.nsteps_per_frame)
-        state = self.simulation.context.getState(
+        reported, self._reported_state = self._reported_state, None
+        required = openmm.State.Energy
+        if get_positions:
+            required |= openmm.State.Positions
+        if get_velocities:
+            required |= openmm.State.Velocities
+        if get_forces:
+            required |= openmm.State.Forces
+        if reported is not None:
+            step, state = reported
+            if (
+                step == self.simulation.currentStep
+                and state.getDataTypes() & required == required
+                and self.simulation.integrator.getIntegrationForceGroups() == -1
+            ):
+                return state
+        return self.simulation.context.getState(
             getPositions=get_positions,
             getEnergy=True,
             getVelocities=get_velocities,
             getForces=get_forces,
         )
-        if self._diverged(state):
-            return False, state
-        if self._recording:
-            self._record_force_csv()
-            self._record_state_csv(state)
-        self._frame_index += 1
-        return self.running, state
 
     def _init_mlmm_cache(self) -> None:
         """Precompute per-frame-invariant ML/MM data once (Tier-1 lossless).
@@ -816,6 +856,7 @@ class IMDSystem:
         recording.
         """
         if traj is None and force_csv is None and state_csv is None:
+            self.stop_recording()
             self._record_settings = None
             return
         outputs = [
@@ -862,7 +903,9 @@ class IMDSystem:
                 self._traj_reporter = self._make_traj_reporter(traj, settings["traj_interval"])
                 self.simulation.reporters.append(self._traj_reporter)
             if force_csv is not None:
-                self._force_csv_interval = settings["force_csv_interval"]
+                self._force_csv_interval = (
+                    settings["force_csv_interval"] * self.config.nsteps_per_frame
+                )
                 path = Path(force_csv)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 self._force_csv_path = path
@@ -874,7 +917,9 @@ class IMDSystem:
                 self._force_csv_file.flush()
                 self._force_csv_rows_since_flush = 0
             if state_csv is not None:
-                self._state_csv_interval = settings["state_csv_interval"]
+                self._state_csv_interval = (
+                    settings["state_csv_interval"] * self.config.nsteps_per_frame
+                )
                 self._state_csv_pbc = bool(self.bundle.system.usesPeriodicBoundaryConditions())
                 if self._total_mass_amu is None:
                     self._total_mass_amu = self._compute_total_mass_amu()
@@ -897,6 +942,17 @@ class IMDSystem:
                 self._state_csv_writer.writerow(header)
                 self._state_csv_file.flush()
                 self._state_csv_rows_since_flush = 0
+            intervals = tuple(
+                interval
+                for path, interval in (
+                    (force_csv, self._force_csv_interval),
+                    (state_csv, self._state_csv_interval),
+                )
+                if path is not None
+            )
+            if intervals:
+                self._csv_reporter = _CSVReporter(self, intervals)
+                self.simulation.reporters.append(self._csv_reporter)
         except Exception:
             # Roll back any partially-opened output (e.g. traj attached but
             # the CSV open failed) so we never leave a dangling reporter.
@@ -957,16 +1013,19 @@ class IMDSystem:
         """Flush + close any active trajectory / CSV outputs. Idempotent.
 
         The trajectory reporter is removed from the simulation, its reference
-        dropped, then ``gc.collect()`` is forced: PDBReporter writes its
-        trailing footer and DCDReporter closes its file only in ``__del__``,
-        so this is the format-uniform way to finalize the file. XTCReporter
-        completes each frame at the C level and needs nothing extra.
+        dropped: PDBReporter writes its trailing footer and DCDReporter closes
+        its file in ``__del__``. These reporters have no reference cycles, so
+        releasing the last reference finalizes them without a global collection.
+        XTCReporter completes each frame at the C level.
         """
+        if self._csv_reporter is not None:
+            with contextlib.suppress(ValueError):
+                self.simulation.reporters.remove(self._csv_reporter)
+            self._csv_reporter = None
         if self._traj_reporter is not None:
             with contextlib.suppress(ValueError):
                 self.simulation.reporters.remove(self._traj_reporter)
             self._traj_reporter = None
-            gc.collect()
         if self._force_csv_file is not None:
             try:
                 self._force_csv_file.flush()
@@ -1001,15 +1060,9 @@ class IMDSystem:
         """
         if self._force_csv_writer is None:
             return
-        # Gate on the cumulative MD step (mirrors the trajectory reporter's
-        # currentStep % (interval * nsteps_per_frame)), NOT the per-run GUI
-        # frame counter: equal force_csv_interval / traj_interval then sample
-        # the SAME frames, even across imd_stop -> imd_run cycles (currentStep
-        # is never reset, _frame_index is). The CSV `step` column is the join
-        # key to the trajectory; `frame` stays an advisory per-run ordinal.
-        report_interval = max(1, self._force_csv_interval * self.config.nsteps_per_frame)
+        # Freeze the MD-step interval at start, as the trajectory reporter does.
         step = self.simulation.currentStep
-        if step % report_interval != 0:
+        if step % self._force_csv_interval != 0:
             return
         active = self._last_pull_active_idx
         if active.size == 0:
@@ -1052,9 +1105,8 @@ class IMDSystem:
         """
         if self._state_csv_writer is None:
             return
-        report_interval = max(1, self._state_csv_interval * self.config.nsteps_per_frame)
         step = self.simulation.currentStep
-        if step % report_interval != 0:
+        if step % self._state_csv_interval != 0:
             return
         if state is None:
             state = self.simulation.context.getState(getEnergy=True)
@@ -1226,20 +1278,25 @@ class IMDSystem:
     def _read_pymol_positions_nm(self) -> np.ndarray:
         from pymol import cmd
 
-        coords: list[tuple[float, float, float]] = []
-        cmd.iterate_state(
-            1,
-            self.pymol_selector,
-            "coords.append((x, y, z))",
-            space={"coords": coords},
-        )
-        if len(coords) != self.n_atoms:
+        if self.pymol_object:
+            # Coordsets preserve PDB order and exclude object display transforms.
+            coords = cmd.get_coordset(self.pymol_object, state=1)
+        else:
+            coords = []
+            cmd.iterate_state(
+                1,
+                self.pymol_selector,
+                "coords.append((x, y, z))",
+                space={"coords": coords},
+            )
+        count = 0 if coords is None else len(coords)
+        if count != self.n_atoms:
             raise RuntimeError(
-                f"PyMOL atom count {len(coords)} in selector '{self.pymol_selector}' "
-                f"!= OpenMM atom count {self.n_atoms}"
+                f"PyMOL atom count {count} in selector '{self.pymol_selector}' "
+                f"!= OpenMM atom count {self.n_atoms}. Re-run imd_setup_* after changing atoms."
             )
         # PyMOL stores coordinates in angstrom; OpenMM IMD logic works in nm.
-        return np.asarray(coords) * 0.1
+        return np.asarray(coords, dtype=float) * constants.ANGSTROM_TO_NM
 
     def _sync_positions_to_pymol(self, state=None) -> None:
         try:
@@ -1265,11 +1322,13 @@ class IMDSystem:
                 state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
             )
         positions_ang = positions_nm * 10.0
-        space = {"positions": positions_ang}
-        cmd.alter_state(
-            1,
-            self.pymol_selector,
-            "x, y, z = positions[index - 1]",
-            space=space,
-        )
+        if self.pymol_object:
+            cmd.load_coordset(positions_ang, self.pymol_object, state=1)
+        else:
+            cmd.alter_state(
+                1,
+                self.pymol_selector,
+                "x, y, z = positions[index - 1]",
+                space={"positions": positions_ang},
+            )
         cmd.refresh()

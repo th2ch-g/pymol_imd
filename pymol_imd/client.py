@@ -288,24 +288,25 @@ class PyMOLIMDClient:
             self._timer.stop()
             self._timer = None
         self.client.disconnect()
+        self._active_prev.clear()
+        self._last_server_ang = None
 
     def _tick(self) -> None:
         if self.client.closed:
             self.stop()
             return
-        # 1) Read the user's drag FIRST (vs the last displayed server coords),
-        #    so the display overwrite below never wipes an in-progress pull.
-        self._send_drag_forces()
-        # 2) Drain to the newest available frame, then show it.
         try:
+            # Read drag before displaying a new frame can overwrite it.
+            self._send_drag_forces()
+            if self.client.closed:
+                return
             latest = self._drain_to_latest()
-        except (protocol.ProtocolError, OSError) as exc:
+            if latest is not None and latest.positions_ang is not None:
+                self._display(latest.positions_ang)
+                self._last_server_ang = latest.positions_ang
+        except Exception as exc:
             logger.error("IMD client stream stopped: %s", exc)
             self.stop()
-            return
-        if latest is not None and latest.positions_ang is not None:
-            self._display(latest.positions_ang)
-            self._last_server_ang = latest.positions_ang
 
     def _drain_to_latest(self) -> Frame | None:
         """Read up to ``IMD_CLIENT_MAX_FRAMES_PER_TICK`` queued frames, newest wins.
@@ -327,10 +328,9 @@ class PyMOLIMDClient:
     def _display(self, positions_ang: np.ndarray) -> None:
         from pymol import cmd
 
+        self._validate_object(cmd, len(positions_ang))
         # Positions arrive in angstrom — already PyMOL's unit, so no conversion.
-        cmd.alter_state(
-            1, self.selector, "x, y, z = positions[index - 1]", space={"positions": positions_ang}
-        )
+        cmd.load_coordset(positions_ang, self.pymol_object, state=1)
         cmd.refresh()
 
     def _send_drag_forces(self) -> None:
@@ -338,11 +338,11 @@ class PyMOLIMDClient:
             return
         from pymol import cmd
 
-        coords: list[tuple[float, float, float]] = []
-        cmd.iterate_state(1, self.selector, "coords.append((x, y, z))", space={"coords": coords})
-        if len(coords) != self._last_server_ang.shape[0]:
-            return  # atom-count mismatch (wrong object loaded); skip silently
-        pymol_ang = np.asarray(coords)
+        self._validate_object(cmd, len(self._last_server_ang))
+        coords = cmd.get_coordset(self.pymol_object, state=1)
+        if coords is None or len(coords) != self._last_server_ang.shape[0]:
+            raise RuntimeError("PyMOL coordinates changed; reload the prepared PDB and reconnect")
+        pymol_ang = np.asarray(coords, dtype=float)
         delta_nm = (pymol_ang - self._last_server_ang) * constants.ANGSTROM_TO_NM
         active_idx, forces_nm, n_exceeded = compute_pull_forces(
             delta_nm, self.const_k, self.max_force_kj, self.delta_noise_nm
@@ -373,6 +373,18 @@ class PyMOLIMDClient:
                 self.stop()
                 return
         self._active_prev = active_set
+
+    def _validate_object(self, cmd, n_atoms: int) -> None:
+        if self.pymol_object not in cmd.get_object_list():
+            raise RuntimeError(
+                f"PyMOL object '{self.pymol_object}' was removed; reload the prepared PDB and reconnect"
+            )
+        actual = cmd.count_atoms(self.selector)
+        if actual != n_atoms:
+            raise RuntimeError(
+                f"PyMOL object '{self.pymol_object}' has {actual} atoms, expected {n_atoms}; "
+                "reload the prepared PDB and reconnect"
+            )
 
     def _group_of(self, level: str, n_atoms: int) -> np.ndarray | None:
         """Per-atom integer group id for residue / chain, read from PyMOL once.
