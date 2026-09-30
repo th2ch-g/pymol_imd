@@ -1,0 +1,4 @@
+interface:
+  display_name: "PyMOL IMD Computer Use"
+  short_description: "Operate and verify PyMOL IMD with real mouse input"
+  default_prompt: "Use $pymol-imd-computer-use to operate this PyMOL IMD session and verify mouse pulling against recorded forces."
