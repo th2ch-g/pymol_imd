@@ -80,8 +80,16 @@ class AABackend:
 
         modeller = load_and_complete_hydrogens(pdb_path, forcefield, ph=ph)
         if ligand is not None:
-            ligand_top = ligand.to_topology()
-            modeller.add(ligand_top.to_openmm(), ligand_top.get_positions().to_openmm())
+            ligand_template = ligand.to_smiles()
+            existing = sum(
+                template.name == ligand_template
+                for template in forcefield.getMatchingTemplates(modeller.topology)
+            )
+            if existing:
+                logger.info("Using %d existing ligand residue(s) from the input PDB", existing)
+            else:
+                ligand_top = ligand.to_topology()
+                modeller.add(ligand_top.to_openmm(), ligand_top.get_positions().to_openmm())
 
         nonbonded_method = PME if pbc else NoCutoff
         if pbc:

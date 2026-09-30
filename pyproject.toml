@@ -116,6 +116,7 @@ smoke-socket = "python -m pymol_imd.tests.smoke_socket"
 smoke-drag = "python -m pymol_imd.tests.smoke_drag"
 smoke-cli = "python -m pymol_imd.tests.smoke_cli"
 smoke-pymol = { cmd = "python -m pymol_imd.tests.smoke_pymol", env = { PYTHONUTF8 = "1" } }
+smoke-molecules = "python -m pymol_imd.tests.smoke_molecules"
 install-uma = "pip install --no-build-isolation 'fairchem-core>=2.20.0'"
 install-orb = "pip install --no-build-isolation orb-models"
 # cuEquivariance acceleration for MACE. CUDA 12 + linux-64 only — run inside

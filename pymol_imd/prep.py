@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from openmm.app import ForceField, Modeller, PDBFile, Topology
+from openmm.app import ForceField, Modeller, PDBFile, Topology, element
 from openmm.unit import Quantity
 
 from . import constants
@@ -100,8 +100,71 @@ def load_and_complete_hydrogens(
     """
     pdb = PDBFile(str(pdb_path))
     modeller = Modeller(pdb.topology, pdb.positions)
-    modeller.addHydrogens(forcefield=forcefield, pH=ph)
+    variants = _template_hydrogen_variants(modeller.topology, forcefield)
+    modeller.addHydrogens(forcefield=forcefield, pH=ph, variants=variants)
     return modeller
+
+
+def _template_hydrogen_variants(topology: Topology, forcefield: ForceField):
+    """Use unambiguous closed-residue templates for nonstandard hydrogens."""
+    Modeller._loadStandardHydrogenDefinitions()
+    residues = list(topology.residues())
+    unknown = [res for res in residues if res.name not in Modeller._residueHydrogens]
+    if not unknown:
+        return None
+
+    templates = {}
+    for template in forcefield._templates.values():
+        if template.externalBonds:
+            continue
+        heavy = frozenset(
+            (atom.name, atom.element) for atom in template.atoms if atom.element != element.hydrogen
+        )
+        bonds = set()
+        hydrogens = []
+        for i, j in template.bonds:
+            a, b = template.atoms[i], template.atoms[j]
+            if a.element == element.hydrogen:
+                hydrogens.append((a.name, b.name))
+            elif b.element == element.hydrogen:
+                hydrogens.append((b.name, a.name))
+            else:
+                bonds.add(frozenset((a.name, b.name)))
+        if hydrogens:
+            templates.setdefault(heavy, []).append((bonds, tuple(sorted(hydrogens))))
+
+    residue_bonds = {res: set() for res in unknown}
+    external = set()
+    for a, b in topology.bonds():
+        if a.residue is not b.residue:
+            external.update((a.residue, b.residue))
+        elif a.residue in residue_bonds and element.hydrogen not in (a.element, b.element):
+            residue_bonds[a.residue].add(frozenset((a.name, b.name)))
+
+    variants = [None] * len(residues)
+    for residue in unknown:
+        if residue in external:
+            continue
+        atoms = list(residue.atoms())
+        heavy = frozenset(
+            (atom.name, atom.element) for atom in atoms if atom.element != element.hydrogen
+        )
+        present = {atom.name for atom in atoms if atom.element == element.hydrogen}
+        choices = {
+            hydrogens
+            for bonds, hydrogens in templates.get(heavy, ())
+            if bonds == residue_bonds[residue] and present.issubset(name for name, _ in hydrogens)
+        }
+        if len(choices) > 1:
+            raise ValueError(
+                f"Hydrogen completion is ambiguous for residue {residue.id} ({residue.name}); "
+                "provide its hydrogens explicitly."
+            )
+        if choices:
+            hydrogens = choices.pop()
+            if len(present) < len(hydrogens):
+                variants[residue.index] = list(hydrogens)
+    return variants
 
 
 def _chemical_bond_only(atom_a, atom_b) -> bool:

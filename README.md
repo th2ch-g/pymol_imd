@@ -425,6 +425,17 @@ pymol_imd/
 
 ## Validation
 
+`pixi run smoke-molecules` checks DNA, RNA, POPC/POPE lipids with and without
+hydrogens, and an AM1-BCC ethanol ligand. It verifies GBn2, preservation of
+heavy-atom coordinates, atom counts, minimization, and finite MD forces.
+Use `--platform cuda` in the GPU environment to check the same inputs on CUDA.
+
+Nonstandard residues can gain missing hydrogens through `Modeller.addHydrogens`
+when their atom names and heavy-atom bonds uniquely match a closed forcefield
+template. Ambiguous protonation states require explicit input hydrogens.
+With `--ligand-sdf`, a matching ligand already present in the PDB is
+parameterized in place; otherwise, the SDF coordinates are appended.
+
 `pixi run smoke-pymol` exercises AA, CG, and AIMNet2 ML/MM with a generated
 tripeptide: setup, hydrogen completion, minimization followed by production,
 recording, stop/restart, all drag levels, and cleanup after atom/object edits.
