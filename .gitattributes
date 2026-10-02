@@ -1,0 +1,2 @@
+# PDB records retain their fixed-width blank charge columns.
+examples/*.pdb whitespace=-blank-at-eol

@@ -1,0 +1,4 @@
+interface:
+  display_name: "PyMOL IMD Mouse Experiments"
+  short_description: "Test enzyme reactions and domain motion with real mouse drags"
+  default_prompt: "Use $pymol-imd-mouse-experiments to test chorismate mutase and QBP through physical mouse drags and inspect the recorded trajectories."

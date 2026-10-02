@@ -448,6 +448,16 @@ pymol_imd/
 
 ## Validation
 
+Versioned QBP and chorismate mutase inputs are in [examples/](examples/README.md).
+The [molecular mouse experiment skill](.agents/skills/pymol-imd-mouse-experiments/SKILL.md)
+describes physical domain dragging in AA/CG and ligand dragging in ML/MM, with
+trajectory analysis and explicit structural criteria. These manual computer-use
+experiments are separate from the headless smoke tests; save their generated
+evidence under an ignored directory such as `.pixi/cua/`.
+
+`pixi run smoke-recovery` checks rollback and bounded retry, preservation of the
+ML/MM correction, and rejection of invalid frames from XTC/DCD/PDB/CSV outputs.
+
 `pixi run smoke-molecules` checks DNA, RNA, POPC/POPE lipids with and without
 hydrogens, and an AM1-BCC ethanol ligand, including a bound ligand without
 hydrogens. It verifies GBn2, preservation of

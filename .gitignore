@@ -222,3 +222,6 @@ __marimo__/
 *.xtc
 *.csv
 *_topology/
+
+# Versioned example inputs; generated trajectories remain ignored.
+!examples/*.pdb
