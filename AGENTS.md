@@ -60,6 +60,7 @@ pixi run smoke-mlmm               # ML/MM ONIOM delta regression vs tests/refs/*
 pixi run record-smoke             # trajectory (XTC/DCD/PDB) + force-CSV recording smoke
 pixi run smoke-socket             # IMDv3 server<->client localhost round-trip + protocol/units regression
 pixi run smoke-drag               # drag-level (atom/residue/chain) group-expansion regression
+pixi run smoke-scripted-drag      # code-driven drag parity, timing, release, recovery, and recording
 pixi run smoke-cli                # CLI/subcommand/coercion regression
 ```
 

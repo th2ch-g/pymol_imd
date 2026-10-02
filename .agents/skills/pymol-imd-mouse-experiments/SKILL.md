@@ -16,6 +16,14 @@ when needed. Physical gestures must go through computer-use; helper scripts may
 observe or analyze coordinates but must not generate pulling forces or alter
 coordinates during a mouse trial.
 
+When the user explicitly requests a code-driven variant, use
+`pymol_imd.scripted.run_drag` as described in the repository README. It holds
+virtual mouse offsets over simulated time through the same force-cap,
+recovery and recording path. Label those outputs as scripted; they do not
+satisfy the physical-gesture criterion below. Read the
+[scripted protocols](references/scripted.md) for the molecular selections,
+target schedules and release checks.
+
 - For QBP, read [the AA and CG procedure](references/qbp.md).
 - For chorismate mutase, read [the ML/MM procedure](references/chorismate.md).
 - Use [the trajectory analyzer](scripts/analyze_trajectory.py) after stopping

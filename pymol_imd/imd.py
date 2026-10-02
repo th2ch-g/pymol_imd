@@ -1302,6 +1302,35 @@ class IMDSystem:
         if openmm_xyz is None:
             openmm_xyz = self._read_openmm_positions_nm()
         delta = pymol_xyz - openmm_xyz
+        self._apply_drag_delta_nm(delta)
+
+    def apply_drag(self, atom_indices, offsets_angstrom) -> int:
+        """Apply virtual mouse offsets to selected zero-based atom indices.
+
+        ``offsets_angstrom`` is a three-vector or one vector per selected atom.
+        It is a cursor offset from the current position, not a coordinate edit
+        or a requested final molecular displacement. The same scale, noise
+        floor, whole-frame force cap and group expansion as mouse dragging apply.
+        Reapply before each MD frame to hold a drag; ``clear_pull_forces`` releases
+        it. Returns the number of atoms receiving a force in this frame.
+        """
+        indices = np.asarray(atom_indices)
+        if indices.ndim != 1 or not indices.size or not np.issubdtype(indices.dtype, np.integer):
+            raise ValueError("atom_indices must be a nonempty one-dimensional integer sequence")
+        if np.any(indices < 0) or np.any(indices >= self.n_atoms):
+            raise ValueError("atom_indices contains an index outside the prepared topology")
+        if len(np.unique(indices)) != len(indices):
+            raise ValueError("atom_indices must not contain duplicates")
+        offsets = np.asarray(offsets_angstrom, dtype=float)
+        if offsets.shape not in ((3,), (len(indices), 3)) or not np.isfinite(offsets).all():
+            raise ValueError("offsets_angstrom must be finite with shape (3,) or (n_selected, 3)")
+        delta = np.zeros((self.n_atoms, 3))
+        delta[indices] = offsets * constants.ANGSTROM_TO_NM
+        self._apply_drag_delta_nm(delta)
+        return int(np.count_nonzero(np.any(self._last_pull_forces, axis=1)))
+
+    def _apply_drag_delta_nm(self, delta: np.ndarray) -> None:
+        """Use one force path for observed mouse and explicit code offsets."""
         active_idx, forces, n_exceeded = compute_pull_forces(
             delta, self.config.const_k, self.config.max_force_kj, self._DELTA_NOISE_NM
         )

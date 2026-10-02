@@ -53,6 +53,13 @@ accepted force frame, so report the actual force duty cycle rather than assuming
 the force was held throughout the wall-clock gesture.
 Keep the altered trial distinct from the default-parameter attempt.
 
+Translation alone can leave the opened domain twisted relative to the reference.
+Use `cmd.button("left", "none", "dgrt")` to rotate the same native drag
+selection with physical gestures, then switch back to `dgmv` for translation.
+Repeat bounded gestures while following both distance and reference RMSD;
+one or two gestures may be insufficient. Realign the display-only reference
+to domain A after global motion before judging screen overlap.
+
 AA uses Amber and GBn2 by default. CG has Martini's periodic bounding box and
 elastic network; the network can constrain an interdomain transition. Do not
 silently disable it, change secondary structure or add solvent to force opening.

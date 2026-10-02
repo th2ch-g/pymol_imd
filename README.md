@@ -261,6 +261,66 @@ After `setup_*`:
 
 ---
 
+## Scripted dragging without a viewer
+
+`pymol_imd.scripted.run_drag` repeats virtual mouse offsets at every MD step.
+It uses the same force scale, whole-frame force limit, group expansion,
+ML/MM correction, recovery and recording as interactive dragging. It never
+replaces the molecular coordinates. Select atoms by their zero-based indices
+in the prepared OpenMM topology.
+
+```python
+from pathlib import Path
+
+from pymol_imd.backends.aa import AABackend
+from pymol_imd.imd import IMDConfig, IMDSystem
+from pymol_imd.scripted import run_drag
+
+backend = AABackend()
+bundle = backend.build_system(
+    Path("examples/qbp.pdb"), work_dir=Path(".pixi/scripted/qbp/build")
+)
+system = IMDSystem(bundle, IMDConfig(
+    const_k=backend.recommended_const_k,
+    integrator=backend.recommended_integrator,
+    timestep_ps=backend.recommended_timestep_ps,
+    nsteps_per_frame=1,
+))
+for _ in range(20):
+    if system.minimize_step():
+        break
+else:
+    raise RuntimeError("Minimization did not converge")
+
+domain_b = [atom.index for atom in bundle.topology.atoms()
+            if 90 <= int(atom.residue.id) <= 180]
+system.set_recording(
+    traj=".pixi/scripted/qbp/run.xtc",
+    force_csv=".pixi/scripted/qbp/forces.csv",
+    state_csv=".pixi/scripted/qbp/state.csv",
+)
+result = run_drag(system, domain_b, [0.05, 0.0, 0.0],
+                  duration_ps=1.0, release_ps=1.0)
+print(result)
+```
+
+The offset is in angstrom and is measured from the current coordinates each
+step: `0.05` angstrom with `const_k=50000` requests `250` kJ/mol/nm per selected
+atom. It is not a promised final displacement. `duration_ps` and `release_ps`
+are simulated time and must be whole numbers of integration steps. A constant
+three-vector applies to every selected atom; an `(n_selected, 3)` array supplies
+individual vectors. A callback `offsets(elapsed_ps, positions_angstrom)` may
+compute changing directions or targets from read-only full-system coordinates;
+its return value follows the selected-index order.
+
+This synchronous API requires a stopped system, closed recorders and
+`nsteps_per_frame=1`. It opens the configured outputs, runs, releases forces and
+closes outputs even if the callback raises. Use a new output path for each run.
+`system.apply_drag(indices, offsets_angstrom)` is also available for code that
+already owns the MD step loop; call it on the simulation thread before stepping
+and call `clear_pull_forces()` on release. Scripted runs are recorded separately
+from physical mouse experiments.
+
 ## Recording trajectories, forces and state
 
 `imd_record` arms output for the **next** `imd_run`. Recording starts when
@@ -423,6 +483,7 @@ pymol_imd/
 ├── commands.py        PyMOL command surface (setup_*, imd_*)
 ├── constants.py       Single source of truth: tunable defaults + fixed physical constants
 ├── imd.py             IMDSystem driver: CustomExternalForce + Qt timer + ONIOM hook
+├── scripted.py        Continuous Python-driven drag and release through the same force path
 ├── protocol.py        IMDv3 wire format: pack/unpack, header enum, endianness oracle
 ├── transport.py       TCP framing: recv_exact, IMDConnection, bind/accept/connect
 ├── server.py          IMDServer: headless OpenMM engine streaming IMDv3 frames
@@ -438,6 +499,7 @@ pymol_imd/
     ├── smoke_mlmm.py   Headless ML/MM ONIOM delta regression (vs refs/*.npy)
     ├── smoke_record.py Headless trajectory + force-CSV recording smoke
     ├── smoke_drag.py   Headless drag-level (atom/residue/chain) group-expansion smoke
+    ├── smoke_scripted_drag.py Code-driven drag parity, timing, release and cleanup
     ├── smoke_socket.py Headless IMDv3 server<->client round-trip + protocol regression
     ├── smoke_cli.py    Headless CLI/subcommand/coercion regression
     ├── smoke_pymol.py  Real PyMOL command + Qt timer integration for all backends
@@ -457,6 +519,10 @@ evidence under an ignored directory such as `.pixi/cua/`.
 
 `pixi run smoke-recovery` checks rollback and bounded retry, preservation of the
 ML/MM correction, and rejection of invalid frames from XTC/DCD/PDB/CSV outputs.
+
+`pixi run smoke-scripted-drag` compares scripted and mouse-path trajectories
+and force CSVs, and checks continuous input, force-cap rejection, timed release,
+input validation and cleanup after callback failures.
 
 `pixi run smoke-molecules` checks DNA, RNA, POPC/POPE lipids with and without
 hydrogens, and an AM1-BCC ethanol ligand, including a bound ligand without
