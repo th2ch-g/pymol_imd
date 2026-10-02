@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import logging
 import math
+import os
 import struct
 import sys
 import tempfile
@@ -300,7 +301,9 @@ def _check_cg_recording(tmp_path: Path) -> None:
 
     pdb = tmp_path / "cg_input.pdb"
     _write_peptide(pdb)
-    bundle = CGBackend().build_system(pdb, work_dir=tmp_path / "cg")
+    bundle = CGBackend().build_system(
+        Path(os.path.relpath(pdb)), work_dir=Path(os.path.relpath(tmp_path / "cg"))
+    )
     config = IMDConfig(
         platform="cpu",
         mouse_force=False,

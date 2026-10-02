@@ -180,7 +180,10 @@ class CGBackend:
                 "(`pixi shell`) — vermouth provides this binary."
             )
 
-        work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="pymol_imd_cg_"))
+        pdb_path = Path(pdb_path).resolve()
+        work_dir = (
+            Path(work_dir).resolve() if work_dir else Path(tempfile.mkdtemp(prefix="pymol_imd_cg_"))
+        )
         work_dir.mkdir(parents=True, exist_ok=True)
         # martinize2 ignores the extension and always writes PDB coords;
         # name it accordingly so downstream readers don't get confused.
