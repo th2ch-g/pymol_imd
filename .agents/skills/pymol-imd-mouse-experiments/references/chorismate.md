@@ -29,6 +29,60 @@ of the C1-O11 linkage. Apply actual small CUA drags to selected ligand atoms,
 confirm accepted forces, and leave an unforced release segment. Never substitute
 scripted distance restraints for the physical mouse trial.
 
+## Physical input with manual MD stepping
+
+If CUA latency leaves many unforced MD frames between gestures, use a
+manual-step mouse trial. Keep `nsteps_per_frame=1` so the ML/MM correction is
+refreshed every integration step. Increasing that setting can destabilize this
+reactive model even without input; check such a condition separately before
+interpreting any reaction.
+
+Start recording at every step, call `imd_run`, then pause only its Qt timer:
+
+```python
+from pymol_imd import commands as imd_commands
+imd_commands._timer.stop()
+```
+
+The driver's `running` flag and recording stay active. Select atoms using
+PyMOL's native `cmd.select`, `cmd.drag` and `dgmv`/`dgrt` mouse mapping. Perform
+actual CUA gestures, then consume their resulting viewer displacement with the
+normal driver step on the GUI thread:
+
+```python
+imd_commands._imd_system.step()
+```
+
+A useful paired input selects `C16+C1` and pulls toward C3, then selects
+`C3+O11` and pulls oppositely before advancing that one MD step. Derive the
+screen directions and coordinates from the current camera and screenshot.
+Record both gestures for the shared MD step and verify all four force rows.
+A native rotation of `C16+O11` can also move the two reaction coordinates.
+Keep the force cap unchanged and reduce a gesture if the whole frame is rejected.
+
+This diagnostic procedure uses the current internal timer and driver. Do not
+call `run_drag`, supply synthetic offsets, or assign molecular coordinates in
+this mode. The displacement must come from the actual CUA mouse events.
+Analyze the MD coordinates after integration, not the temporary cursor-displaced
+geometry shown between the drag and the MD step. Record the manual clock mode,
+physical gesture count, accepted force frames and simulated duration separately.
+
+On release, clear pull forces, finish the native drag selection and resume the
+existing Qt timer without reopening the recorder:
+
+```python
+imd_commands._imd_system.clear_pull_forces()
+cmd.drag()
+cmd.set_wizard()
+cmd.config_mouse("three_button_editing")
+imd_commands._timer.start(imd_commands._imd_system.config.frame_interval_ms)
+```
+
+Continue an unforced segment and classify every recorded release frame. Keep
+a control from the same checkpoint when possible; label a control reinitialized
+from the same coordinates and seed as such. Save both failed continuous-clock
+attempts and the manual-step attempt instead of pooling their force exposure.
+
 ## Assess the formal [3,3] rearrangement
 
 In this ISJ atom naming, all six changes are required:
