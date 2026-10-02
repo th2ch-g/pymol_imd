@@ -142,7 +142,8 @@ def _build_parser(mode: str = "launch") -> argparse.ArgumentParser:
         type=float,
         metavar="E",
         help=(
-            "|potential energy| above this (kJ/mol) halts the loop as diverged. "
+            "|potential energy| above this (kJ/mol) triggers rollback and recovery; "
+            "the loop stops only if recovery fails. "
             f"Default {constants.DEFAULT_ENERGY_CUTOFF_KJ:g}."
         ),
     )

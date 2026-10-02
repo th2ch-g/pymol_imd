@@ -114,6 +114,7 @@ smoke-mlmm = { cmd = "python -m pymol_imd.tests.smoke_mlmm", env = { PYTHONUTF8 
 record-smoke = "python -m pymol_imd.tests.smoke_record"
 smoke-socket = "python -m pymol_imd.tests.smoke_socket"
 smoke-drag = "python -m pymol_imd.tests.smoke_drag"
+smoke-recovery = "python -m pymol_imd.tests.smoke_recovery"
 smoke-cli = "python -m pymol_imd.tests.smoke_cli"
 smoke-pymol = { cmd = "python -m pymol_imd.tests.smoke_pymol", env = { PYTHONUTF8 = "1" } }
 smoke-molecules = "python -m pymol_imd.tests.smoke_molecules"

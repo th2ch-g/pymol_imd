@@ -147,7 +147,7 @@ default in `pymol_imd/constants.py` (per-backend where noted).
 | `--timestep-ps PS` | setup | MD timestep; default per backend (AA 0.002 / CG 0.020 / MLMM 0.0005) |
 | `--friction PER_PS` | setup | Langevin friction 1/ps (default 1.0) |
 | `--pressure BAR` | setup | Barostat pressure with `--pbc` (default 1.0) |
-| `--energy-cutoff-kj E` | setup | \|U\| above this halts the loop as diverged (default 1e9) |
+| `--energy-cutoff-kj E` | setup | \|U\| above this triggers rollback and recovery (default 1e9) |
 | `--frame-interval-ms MS` | launch/local/connect | Qt/client timer interval |
 | `--nonbonded-cutoff-nm NM` | setup | Nonbonded cutoff; default per backend (AA/MLMM 1.0, CG 1.1) |
 | `--box-padding-nm NM` | setup | Bounding-box padding when a box is built (default 1.0) |
@@ -400,11 +400,17 @@ First `imd_setup_cg` downloads `martini_v3.0.0.itp` (~15.3 MB) into
 subsequent runs are offline.
 
 ### Diverging simulation
-If the structure flies apart, `imd_run` stops automatically with a hint:
-> `imd_run: stopped (divergence or error). Adjust const_k / max_force_kj.`
+When energy exceeds `--energy-cutoff-kj`, a state becomes non-finite, or OpenMM
+integration raises, the driver restores the checkpoint preceding that frame
+and retries without the user's pull. A second retry also zeros velocities;
+the Langevin thermostat restores thermal motion. The timestep stays unchanged.
+These recovery events are logged and alter the trajectory's sampling, so they
+must be considered when interpreting results.
 
-Try `imd_change const_k=10000 max_force_kj=2000` and re-run, or shorten
-`--timestep-ps`. The loop also self-halts when |U| exceeds `--energy-cutoff-kj`.
+Rejected frames are excluded from trajectories and CSVs. Both local and socket
+runs continue after successful recovery. If both retries fail, the driver leaves
+the restored coordinates in place and stops. Lower `const_k` / `max_force_kj`,
+shorten `--timestep-ps`, or inspect the starting structure before restarting.
 
 ---
 

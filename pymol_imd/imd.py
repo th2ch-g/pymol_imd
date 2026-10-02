@@ -85,11 +85,23 @@ class _CSVReporter:
 
     def report(self, simulation, state) -> None:
         owner = self._owner()
-        if owner is not None:
-            owner._reported_state = (simulation.currentStep, state)
-            if not owner._diverged(state):
-                owner._record_force_csv()
-                owner._record_state_csv(state)
+        if owner is not None and not owner._diverged(state):
+            owner._record_force_csv()
+            owner._record_state_csv(state)
+
+
+class _DeferredReporter:
+    """Hold reports until the entire integration frame has been accepted."""
+
+    def __init__(self, reporter, pending: list) -> None:
+        self.reporter = reporter
+        self.pending = pending
+
+    def describeNextReport(self, simulation):
+        return self.reporter.describeNextReport(simulation)
+
+    def report(self, simulation, state) -> None:
+        self.pending.append((self.reporter, simulation.currentStep, state))
 
 
 def compute_pull_forces(
@@ -165,10 +177,10 @@ class IMDConfig:
     # would exceed it, that whole frame's pull is skipped (no force applied) and
     # a throttled warning is logged — the MD keeps running. This prevents runaway
     # accelerations from a too-hard drag without stopping the simulation. (The
-    # separate _diverged guard halts the loop on energy blow-up.)
+    # separate energy guard retries an unstable frame without pulling.)
     max_force_kj: float = constants.DEFAULT_MAX_FORCE_KJ
     # If |potential energy| exceeds this (kJ/mol), the simulation is treated
-    # as diverged and the IMD loop halts. NaN energies trip the same guard.
+    # as diverged and retried. Stop only when bounded recovery fails.
     energy_cutoff_kj: float = constants.DEFAULT_ENERGY_CUTOFF_KJ
     # QTimer tick interval (ms) for both the production and minimize loops.
     # Read at timer start(); changing it mid-run needs a stop/run cycle.
@@ -311,6 +323,7 @@ class IMDSystem:
         # once on the rising edge, reset on the falling edge, so a sustained
         # over-limit drag doesn't flood the console (the QTimer ticks every few ms).
         self._force_exceeded_prev: bool = False
+        self._recovery_count: int = 0
 
         # --- recording state (production run only; never during minimize) ---
         # set_recording() (imd_record) stores the pending config here;
@@ -321,7 +334,6 @@ class IMDSystem:
         self._recording: bool = False
         self._traj_reporter: object | None = None
         self._csv_reporter: _CSVReporter | None = None
-        self._reported_state: tuple[int, openmm.State] | None = None
         self._force_csv_path: Path | None = None
         self._force_csv_file = None
         self._force_csv_writer = None
@@ -496,8 +508,9 @@ class IMDSystem:
             self.set_pull_forces(np.empty(0, dtype=int), np.zeros((self.n_atoms, 3)))
         if self._mlmm_force is not None:
             self._apply_mlmm_correction_force(full_positions, box_vectors)
-        state = self._step_and_get_state(get_positions=True)
-        if self._diverged(state):
+        accepted, state = self._step_and_get_state(get_positions=True)
+        if not accepted:
+            self._sync_positions_to_pymol(state)
             return
         self._frame_index += 1
         self._sync_positions_to_pymol(state)
@@ -532,42 +545,134 @@ class IMDSystem:
         correction is applied separately via :meth:`apply_mlmm_if_present` so
         the server controls the inject -> correct -> step ordering.
         """
-        state = self._step_and_get_state(
+        accepted, state = self._step_and_get_state(
             get_positions=get_positions, get_velocities=get_velocities, get_forces=get_forces
         )
-        if self._diverged(state):
+        if not accepted:
             return False, state
         self._frame_index += 1
         return self.running, state
 
     def _step_and_get_state(
         self, *, get_positions=False, get_velocities=False, get_forces=False
-    ) -> openmm.State:
-        """Reuse a final-step report without re-evaluating its energy."""
-        self._reported_state = None
-        self.simulation.step(self.config.nsteps_per_frame)
-        reported, self._reported_state = self._reported_state, None
-        required = openmm.State.Energy
-        if get_positions:
-            required |= openmm.State.Positions
-        if get_velocities:
-            required |= openmm.State.Velocities
-        if get_forces:
-            required |= openmm.State.Forces
-        if reported is not None:
-            step, state = reported
-            if (
-                step == self.simulation.currentStep
-                and state.getDataTypes() & required == required
-                and self.simulation.integrator.getIntegrationForceGroups() == -1
-            ):
-                return state
-        return self.simulation.context.getState(
+    ) -> tuple[bool, openmm.State]:
+        """Commit a stable frame, or restore and retry without the user's pull.
+
+        Checkpoints preserve the clock, box, velocities and RNG state. Reports
+        remain buffered across each attempt so discarded steps cannot enter a
+        trajectory or CSV. The second retry starts with zero velocities; the
+        Langevin thermostat restores thermal motion without changing the step
+        size or the frame's physical duration.
+        """
+        simulation = self.simulation
+        context = simulation.context
+        checkpoint = context.createCheckpoint()
+        reporters = simulation.reporters
+        pending: list = []
+        simulation.reporters = [_DeferredReporter(reporter, pending) for reporter in reporters]
+        state_kwargs = dict(
             getPositions=get_positions,
             getEnergy=True,
             getVelocities=get_velocities,
             getForces=get_forces,
         )
+        accepted = False
+        reason = ""
+        try:
+            for attempt in range(constants.ENERGY_RECOVERY_RETRIES + 1):
+                pending.clear()
+                try:
+                    simulation.step(self.config.nsteps_per_frame)
+                    state = self._final_frame_state(pending, state_kwargs)
+                    invalid_report = any(self._invalid_state(report) for _, _, report in pending)
+                    if not self._invalid_state(state) and not invalid_report:
+                        accepted = True
+                        break
+                    reason = "non-finite state or energy outside energy_cutoff_kj"
+                except openmm.OpenMMException as exc:
+                    reason = str(exc)
+                context.loadCheckpoint(checkpoint)
+                self.clear_pull_forces()
+                self._pull_force.updateParametersInContext(context)
+                self.apply_mlmm_if_present()
+                if attempt == constants.ENERGY_RECOVERY_RETRIES:
+                    break
+                if attempt:
+                    context.setVelocities(
+                        np.zeros((self.n_atoms, 3)) * unit.nanometer / unit.picosecond
+                    )
+                logger.warning(
+                    "Unstable MD frame (%s); restored step %d, released pull forces, "
+                    "retry %d/%d%s.",
+                    reason,
+                    simulation.currentStep,
+                    attempt + 1,
+                    constants.ENERGY_RECOVERY_RETRIES,
+                    " with zero velocities" if attempt else "",
+                )
+        finally:
+            simulation.reporters = reporters
+        if not accepted:
+            self.running = False
+            logger.error(
+                "MD recovery failed after %d retries (%s). Restored step %d and stopped; "
+                "lower const_k / max_force_kj or shorten timestep_ps.",
+                constants.ENERGY_RECOVERY_RETRIES,
+                reason,
+                simulation.currentStep,
+            )
+            return False, context.getState(**state_kwargs)
+        if attempt:
+            self._recovery_count += 1
+            logger.warning(
+                "MD recovered at step %d; continuing without the rejected pull.",
+                simulation.currentStep,
+            )
+        final_step = simulation.currentStep
+        try:
+            for reporter, step, report in pending:
+                simulation.currentStep = step
+                reporter.report(simulation, report)
+        finally:
+            simulation.currentStep = final_step
+        return True, state
+
+    def _final_frame_state(self, pending: list, state_kwargs: dict) -> openmm.State:
+        """Reuse the unwrapped final CSV sample when it has all requested data."""
+        required = openmm.State.Energy
+        if state_kwargs["getPositions"]:
+            required |= openmm.State.Positions
+        if state_kwargs["getVelocities"]:
+            required |= openmm.State.Velocities
+        if state_kwargs["getForces"]:
+            required |= openmm.State.Forces
+        for reporter, step, state in reversed(pending):
+            if (
+                reporter is self._csv_reporter
+                and step == self.simulation.currentStep
+                and state.getDataTypes() & required == required
+                and self.simulation.integrator.getIntegrationForceGroups() == -1
+            ):
+                return state
+        return self.simulation.context.getState(**state_kwargs)
+
+    def _invalid_state(self, state) -> bool:
+        """Check available state fields without mutating the driver or logs."""
+        fields = state.getDataTypes()
+        if fields & openmm.State.Energy:
+            if self._diverged(state):
+                return True
+            kinetic = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
+            if not np.isfinite(kinetic):
+                return True
+        for flag, getter in (
+            (openmm.State.Positions, state.getPositions),
+            (openmm.State.Velocities, state.getVelocities),
+            (openmm.State.Forces, state.getForces),
+        ):
+            if fields & flag and not np.isfinite(getter(asNumpy=True)._value).all():
+                return True
+        return False
 
     def _init_mlmm_cache(self) -> None:
         """Precompute per-frame-invariant ML/MM data once (Tier-1 lossless).
@@ -813,27 +918,12 @@ class IMDSystem:
         return f_q, f_m
 
     def _diverged(self, state=None) -> bool:
-        """Return True (and mark the system stopped) if energy went insane.
-
-        Reads the potential energy after a step; NaN/inf or |U| > cutoff
-        indicates the integrator blew up (typically from over-large pull
-        forces or a too-large timestep). Stopping here keeps PyMOL from
-        receiving garbage coordinates that would push atoms off-screen.
-        """
+        """Detect invalid potential energy without stopping before recovery."""
         if state is None:
             state = self.simulation.context.getState(getEnergy=True)
         energy = state.getPotentialEnergy()
         u_kj = energy.value_in_unit(unit.kilojoule_per_mole)
-        if np.isfinite(u_kj) and abs(u_kj) <= self.config.energy_cutoff_kj:
-            return False
-        logger.error(
-            "Diverged: U = %s kJ/mol (cutoff %.2e). Halting IMD loop. "
-            "Lower const_k / max_force_kj or shorten timestep_ps.",
-            u_kj,
-            self.config.energy_cutoff_kj,
-        )
-        self.running = False
-        return True
+        return not (np.isfinite(u_kj) and abs(u_kj) <= self.config.energy_cutoff_kj)
 
     def minimize_step(
         self,
