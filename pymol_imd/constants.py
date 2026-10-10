@@ -288,3 +288,10 @@ IMD_MAX_PACKET_BODY_BYTES = 256 * 1024 * 1024
 IMD_CLIENT_FRAME_INTERVAL_MS = 8  # PyMOL client QTimer tick (ms); lower = smoother streaming
 IMD_CLIENT_POLL_TIMEOUT_S = 0.01  # client per-tick wait for the first frame header
 IMD_CLIENT_MAX_FRAMES_PER_TICK = 64  # cap frames drained per tick so the Qt loop never wedges
+
+# Experimental external CueMol3 client.
+CUEMOL_FRAME_INTERVAL_MS = 33
+CUEMOL_CDP_TIMEOUT_S = 5.0
+CUEMOL_LAUNCH_TIMEOUT_S = 20.0
+CUEMOL_INPUT_LEASE_MS = 2000
+CUEMOL_MAX_FRAMES_PER_TICK = 1024

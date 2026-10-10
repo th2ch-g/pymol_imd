@@ -126,6 +126,81 @@ The CLI requires one of four subcommands:
 The former implicit form `pymol_imd <PDB>` was removed in 0.2.0; use
 `pymol_imd launch <PDB>` or `pymol_imd local <PDB>`.
 
+### Experimental CueMol3 viewer
+
+An external adapter can use an **installed CueMol3 Electron app** as the viewer
+for the same IMDv3 server. The CueMol app bundle and source are not modified.
+The adapter loads its JavaScript into the app's existing native worker through
+a loopback debug connection. It uses a separate app profile under the run
+directory and does not use the standalone `import cuemol` bindings.
+
+Start the engine in one terminal:
+
+```bash
+pixi run pymol_imd serve input.pdb --level aa --minimize --port 8888
+```
+
+Then use the **exact `prepared=...` PDB printed by `IMD_READY`** in another
+terminal. Replace the example paths with your prepared PDB and installed app
+bundle (macOS) or executable (Linux):
+
+```bash
+pixi run cuemol connect path/to/prepared.pdb \
+    --app path/to/CueMol3.app --port 8888
+```
+
+The viewer starts with normal camera controls. In its upper-right IMD panel:
+
+- **Pull atoms: Off / On** toggles plain left-drag atom pulling. Grab the
+  center of an atom and move a short distance. Releasing the mouse clears the
+  force; **Escape** releases it and returns to camera navigation.
+- Right/middle buttons, modified drags, and wheel events remain available to
+  CueMol. Ordinary left-drag camera rotation is available with pulling **Off**.
+- **Pause / Resume** controls the engine and releases any active pull.
+- **Disconnect** releases forces and ends this client session. A viewer
+  started with `connect --app` closes when its client exits.
+
+Excessive pulls are skipped for the entire frame, as in the PyMOL client. If
+the panel says **Pull limit: move closer**, reduce the drag distance. Client
+options include `--const-k`, `--max-force-kj`, `--drag-level atom|residue|chain`,
+and `--frame-interval-ms`. The default spring constant is for AA / ML-MM;
+use `--const-k 10000` with a CG server. Force CSV and trajectory recording
+remain on the engine side.
+
+To keep the viewer open after disconnecting, launch it separately and connect
+to the `endpoint` printed by `CUEMOL_READY`:
+
+```bash
+pixi run cuemol launch --app path/to/CueMol3.app
+pixi run cuemol connect path/to/prepared.pdb \
+    --endpoint http://127.0.0.1:PORT --port 8888
+```
+
+Use separate terminals for these commands. A normal CueMol launch without a
+debug endpoint cannot be attached this way. The server may be remote via
+`--host`; the viewer debug endpoint must remain on loopback. Each connection
+writes client evidence to a unique directory under `.pixi/cuemol3-runs/`.
+
+This prototype supports one visible viewport and one native worker. It loads
+a new ball-and-stick object on each connection, keeps the last object as a
+snapshot after detaching, and uses orthographic projection for pulling.
+Leave perspective disabled while pulling. Per-atom coordinate updates can
+be slow for large systems. It depends on CueMol3's internal worker API;
+the installed 2.3.21.544 build was tested with a 33-atom AA peptide. Other
+CueMol versions, large models, and CG / ML-MM viewer sessions are unverified.
+Physical-drag validation used 10 K and friction 100/ps to limit motion during
+screen inspection; these are test conditions, not changes to the engine defaults.
+
+Adapter regression checks:
+
+```bash
+pixi run smoke-cuemol
+pixi run smoke-cuemol-input  # isolated input-routing checks; uses an existing Node.js
+```
+
+The input-routing check uses a DOM stub and does not replace physical mouse
+verification. Node.js is only used for this optional development check.
+
 ### CLI flags
 
 All numeric / string knobs are optional; each falls back to its single-source

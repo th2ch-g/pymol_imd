@@ -19,6 +19,9 @@ build-backend = "setuptools.build_meta"
 where = ["."]
 include = ["pymol_imd*"]
 
+[tool.setuptools.package-data]
+"pymol_imd.cuemol" = ["*.js"]
+
 # ---------------------------------------------------------------------------
 # pixi workspace
 # ---------------------------------------------------------------------------
@@ -117,6 +120,9 @@ smoke-drag = "python -m pymol_imd.tests.smoke_drag"
 smoke-scripted-drag = "python -m pymol_imd.tests.smoke_scripted_drag"
 smoke-recovery = "python -m pymol_imd.tests.smoke_recovery"
 smoke-cli = "python -m pymol_imd.tests.smoke_cli"
+cuemol = "python -m pymol_imd.cuemol"
+smoke-cuemol = "python -m pymol_imd.tests.smoke_cuemol"
+smoke-cuemol-input = "node pymol_imd/tests/smoke_cuemol_input.cjs"
 smoke-pymol = { cmd = "python -m pymol_imd.tests.smoke_pymol", env = { PYTHONUTF8 = "1" } }
 smoke-molecules = "python -m pymol_imd.tests.smoke_molecules"
 smoke-backends = { cmd = "python -m pymol_imd.tests.smoke_backends", env = { PYTHONUTF8 = "1" } }
