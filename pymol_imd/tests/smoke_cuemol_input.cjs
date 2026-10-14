@@ -57,6 +57,12 @@ ui.configure({ leaseMs: 2000 });
 const panel = document.body.children[0];
 const mode = panel.children.find(element => element.textContent === "Pull atoms: Off");
 const pause = panel.children.find(element => element.textContent === "Pause");
+const level = panel.children.flatMap(element => element.children)
+  .find(element => element.attributes["aria-label"] === "Drag level");
+ui.configure({ dragLevel: "residue" });
+assert.equal(level.value, "residue");
+assert.equal(ui.poll().controls.length, 0);
+assert.throws(() => ui.configure({ dragLevel: "invalid" }), /Invalid drag level/);
 
 function send(type, options = {}, target = canvas) {
   const event = {
@@ -119,6 +125,23 @@ send("blur", {}, window);
 assert.equal(ui.poll().events.map(x => x.type).join(","), "release");
 
 send("pointerdown");
+level.value = "chain";
+send("change", {}, level);
+const changedDuringPull = ui.poll();
+assert.equal(changedDuringPull.events.map(x => x.type).join(","), "down,release");
+assert.equal(changedDuringPull.controls.join(","), "drag-level:chain");
+assert.equal(canvas.captures.size, 0);
+assert(!send("pointermove").defaultPrevented);
+assert(gesture().every(event => event.defaultPrevented));
+assert.equal(ui.poll().events.map(x => x.type).join(","), "down,move,release");
+
+level.value = "atom";
+send("change", {}, level);
+const changedBetweenPulls = ui.poll();
+assert.equal(changedBetweenPulls.events.map(x => x.type).join(","), "release");
+assert.equal(changedBetweenPulls.controls.join(","), "drag-level:atom");
+
+send("pointerdown");
 now = 3000;
 watchdog();
 const expired = ui.poll();
@@ -131,4 +154,4 @@ assert.equal(context.__cuemolIMDUI, undefined);
 assert.equal(watchdog, null);
 assert.equal(panel.isConnected, false);
 assert([...document.listeners.values(), ...window.listeners.values()].every(list => list.length === 0));
-console.log("CueMol input smoke OK (camera, modifiers, controls, release, timeout, detach)");
+console.log("CueMol input smoke OK (camera, modifiers, controls, drag level, release, timeout, detach)");

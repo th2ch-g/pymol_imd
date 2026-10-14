@@ -156,6 +156,9 @@ The viewer starts with normal camera controls. In its upper-right IMD panel:
   force; **Escape** releases it and returns to camera navigation.
 - Right/middle buttons, modified drags, and wheel events remain available to
   CueMol. Ordinary left-drag camera rotation is available with pulling **Off**.
+- **Drag level** switches atom, residue, or chain pulling during the session.
+  Switching releases the active pull; the next drag uses the selected level.
+  The initial selection follows `--drag-level`.
 - **Pause / Resume** controls the engine and releases any active pull.
 - **Disconnect** releases forces and ends this client session. A viewer
   started with `connect --app` closes when its client exits.
@@ -182,7 +185,8 @@ debug endpoint cannot be attached this way. The server may be remote via
 writes client evidence to a unique directory under `.pixi/cuemol3-runs/`.
 
 This prototype supports one visible viewport and one native worker. It loads
-a new ball-and-stick object on each connection, keeps the last object as a
+a new ball-and-stick object with CueMol's default secondary-structure painting
+and element colors on each connection, keeps the last object as a
 snapshot after detaching, and uses orthographic projection for pulling.
 Leave perspective disabled while pulling. Per-atom coordinate updates can
 be slow for large systems. It depends on CueMol3's internal worker API;

@@ -188,6 +188,9 @@ class CueMolBridge:
     def poll_input(self) -> dict:
         return self._page_call("poll")
 
+    def configure_drag_level(self, level: str) -> None:
+        self._page_call("configure", {"dragLevel": level})
+
     def tick(self, positions, step: int, events: list[dict]) -> dict:
         return self._worker_call(
             "tick",
@@ -245,6 +248,8 @@ class CueMolIMD:
             "force_cap_skips": 0,
             "pointer_counts": {},
             "paused": False,
+            "drag_level": drag_level,
+            "drag_level_changes": 0,
         }
         self.last_positions = None
         self.active_prev = False
@@ -277,6 +282,7 @@ class CueMolIMD:
             self.client.connect()
             if not self.client.session.coords:
                 raise ValueError("The IMD server does not stream coordinates")
+            self.bridge.configure_drag_level(self.drag_level)
             print(
                 "CUEMOL_IMD_READY "
                 + json.dumps(
@@ -303,6 +309,16 @@ class CueMolIMD:
                     elif control == "resume":
                         self.client.send_control(IMDHeaderType.RESUME)
                         self.stats["paused"] = False
+                    elif control.startswith("drag-level:"):
+                        level = control.removeprefix("drag-level:")
+                        if level not in constants.SUPPORTED_DRAG_LEVELS:
+                            raise ValueError(f"Invalid CueMol drag level: {level!r}")
+                        if level != self.drag_level:
+                            self._release()
+                            inputs["events"].insert(0, {"type": "release"})
+                            self.drag_level = level
+                            self.stats["drag_level"] = level
+                            self.stats["drag_level_changes"] += 1
                 frame = self._latest_frame(tick_started + self.interval / 2)
                 if self.client.closed:
                     raise ConnectionError("The IMD server disconnected")
@@ -357,6 +373,8 @@ class CueMolIMD:
                                 "elapsed_s": time.monotonic() - started,
                                 "step": self.stats["last_step"],
                                 "events": inputs["events"],
+                                "controls": inputs["controls"],
+                                "drag_level": self.drag_level,
                                 "target": target,
                                 "force_kj_per_nm": force_max,
                             }

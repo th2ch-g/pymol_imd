@@ -24,6 +24,27 @@
   status.textContent = "IMD · Connecting";
   status.style.cssText = "margin-bottom:8px;min-width:250px";
   panel.append(status);
+  const dragLevels = ["atom", "residue", "chain"];
+  const levelLabel = document.createElement("label");
+  levelLabel.textContent = "Drag level";
+  levelLabel.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px";
+  const level = document.createElement("select");
+  level.setAttribute("aria-label", "Drag level");
+  level.style.cssText = "padding:4px 8px;border:1px solid #8aa0b2;border-radius:4px;background:#2d4153;color:white;font:inherit";
+  for (const value of dragLevels) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value[0].toUpperCase() + value.slice(1);
+    level.append(option);
+  }
+  level.value = "atom";
+  level.addEventListener("change", () => {
+    if (pointer === null) queue({ type: "release", trusted: false });
+    else release();
+    controls.push(`drag-level:${level.value}`);
+  });
+  levelLabel.append(level);
+  panel.append(levelLabel);
   function button(label, action) {
     const element = document.createElement("button");
     element.textContent = label;
@@ -138,7 +159,13 @@
   }, 250);
 
   globalThis.__cuemolIMDUI = {
-    configure(options) { leaseMs = options.leaseMs; },
+    configure(options) {
+      if (options.leaseMs !== undefined) leaseMs = options.leaseMs;
+      if (options.dragLevel !== undefined) {
+        if (!dragLevels.includes(options.dragLevel)) throw new Error("Invalid drag level");
+        level.value = options.dragLevel;
+      }
+    },
     poll() {
       if (!canvas.isConnected) throw new Error("The IMD viewport was closed");
       heartbeat = Date.now();

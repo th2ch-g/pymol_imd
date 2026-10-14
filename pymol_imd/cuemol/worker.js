@@ -29,6 +29,27 @@
     }
   }
 
+  function setDefaultColoring() {
+    const coloring = internal.createObj("PaintColoring");
+    const styleManager = internal.getService("StyleManager");
+    const sceneId = prop(scene, "uid");
+    // Mirror CueMol's normal molecule-loading defaults.
+    for (const [expression, colorName] of [
+      ["sheet", "SteelBlue"],
+      ["helix", "khaki"],
+      ["nucleic", "yellow"],
+      ["*", "FloralWhite"],
+    ]) {
+      const selection = internal.createObj("SelCommand");
+      if (!invoke(selection, "compile", expression, sceneId)) {
+        throw new Error("CueMol could not compile the default coloring selection: " + expression);
+      }
+      const color = invoke(styleManager, "compileColor", colorName, sceneId);
+      invoke(coloring, "append", selection, color);
+    }
+    molecule.setProp("coloring", coloring);
+  }
+
   function load(options) {
     const sceneIDs = ids(invoke(manager, "getSceneUIDList"));
     if (!options.sceneId && sceneIDs.length !== 1) {
@@ -74,8 +95,10 @@
     atomIndex = new Map(atoms.map((atom, index) => [prop(atom, "id"), index]));
     molecule.setProp("name", options.name || "IMD molecule");
     invoke(scene, "addObject", molecule);
+    setDefaultColoring();
     const renderer = invoke(molecule, "createRenderer", "ballstick");
     renderer.setProp("name", "IMD atoms");
+    invoke(renderer, "applyStyles", "DefaultBallStick,DefaultCPKColoring");
     invoke(molecule, "fitView", view, false);
     view.setProp("perspective", false);
     invoke(view, "invalidate");

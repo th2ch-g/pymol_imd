@@ -230,6 +230,10 @@ class _Bridge:
         self.closed = False
         self.step = 0
         self.limit_warnings = []
+        self.configured_drag_level = None
+
+    def configure_drag_level(self, level):
+        self.configured_drag_level = level
 
     def poll_input(self):
         row = self.script.popleft()
@@ -237,14 +241,21 @@ class _Bridge:
             raise row
         self.target = row.get("target")
         self.step += 1
-        self.client.frames.append(SimpleNamespace(positions_ang=np.zeros((1, 3)), step=self.step))
-        return {"events": [], "controls": row.get("controls", []), "counts": {}}
+        self.client.frames.append(
+            SimpleNamespace(positions_ang=np.zeros((len(self.atom_keys), 3)), step=self.step)
+        )
+        return {"events": row.get("events", []), "controls": row.get("controls", []), "counts": {}}
 
     def tick(self, positions, step, events):
+        for event in events:
+            if event["type"] == "release":
+                self.target = None
+            elif event["type"] == "down":
+                self.target = event["target"]
         return {"target": self.target}
 
     def snapshot(self):
-        return {"positions": [[0, 0, 0]]}
+        return {"positions": [[0, 0, 0]] * len(self.atom_keys)}
 
     def status(self, step, force, *, over_limit=False):
         self.limit_warnings.append(over_limit)
@@ -295,6 +306,72 @@ def _test_loop_cleanup(root):
     with contextlib.redirect_stdout(io.StringIO()):
         _raises(OSError, lambda: CueMolIMD(bridge, client).run(evidence=output))
     assert client.closed and bridge.closed
+
+
+def _test_live_drag_level(root):
+    target = {"index": 0, "position": [0.1, 0, 0]}
+    script = [
+        {"target": target},
+        {"target": target, "controls": ["drag-level:residue"]},
+        {"events": [{"type": "down", "target": target}]},
+        {
+            "target": target,
+            "controls": ["drag-level:atom"],
+            "events": [{"type": "release"}, {"type": "down", "target": target}],
+        },
+        {"target": target, "controls": ["pause", "drag-level:chain"]},
+        {"controls": ["resume"]},
+        {"events": [{"type": "down", "target": target}]},
+        {"controls": ["disconnect"]},
+    ]
+    client = _Client()
+    bridge = _Bridge(client, script)
+    bridge.atom_keys = [
+        ["A", "1", "ALA", "CA", ""],
+        ["A", "1", "ALA", "N", ""],
+        ["A", "2", "ALA", "CA", ""],
+        ["B", "1", "ALA", "CA", ""],
+    ]
+    runner = CueMolIMD(bridge, client, drag_level="chain", frame_interval_ms=1)
+    with contextlib.redirect_stdout(io.StringIO()):
+        stats = runner.run(evidence=root / "drag-level.json")
+    assert bridge.configured_drag_level == "chain"
+    assert stats["drag_level"] == "chain" and stats["drag_level_changes"] == 3
+    assert [indices.tolist() for indices, _ in client.forces] == [
+        [0, 1, 2],
+        [],
+        [0, 1],
+        [],
+        [0],
+        [],
+        [],
+        [0, 1, 2],
+        [],
+    ]
+    for indices, forces in client.forces:
+        if len(indices):
+            np.testing.assert_allclose(forces, [[50, 0, 0]] * len(indices))
+    records = [
+        json.loads(line) for line in (root / "drag-level.events.jsonl").read_text().splitlines()
+    ]
+    assert [row["drag_level"] for row in records] == [
+        "chain",
+        "residue",
+        "residue",
+        "atom",
+        "chain",
+        "chain",
+    ]
+    assert records[1]["target"] is None and records[4]["target"] is None
+    assert records[3]["target"] == target
+    assert client.controls == [IMDHeaderType.PAUSE, IMDHeaderType.RESUME]
+    assert client.closed and bridge.closed
+
+    client = _Client()
+    bridge = _Bridge(client, [{"target": target}, {"controls": ["drag-level:invalid"]}])
+    with contextlib.redirect_stdout(io.StringIO()):
+        _raises(ValueError, CueMolIMD(bridge, client, frame_interval_ms=1).run)
+    assert not client.forces[-1][0].size and client.closed and bridge.closed
 
 
 def _test_launcher(root):
@@ -376,9 +453,12 @@ def main_test():
         _test_mapping_and_forces(root)
         _test_websocket()
         _test_loop_cleanup(root)
+        _test_live_drag_level(root)
         _test_launcher(root)
         _test_cold_attach(root)
-    print("CueMol smoke test OK (mapping, forces, transport, cleanup, launcher, cold attach)")
+    print(
+        "CueMol smoke test OK (mapping, forces, live drag level, transport, cleanup, launcher, cold attach)"
+    )
     return 0
 
 
