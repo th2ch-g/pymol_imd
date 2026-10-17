@@ -264,6 +264,7 @@ class PyMOLIMDClient:
         self.frame_interval_ms = frame_interval_ms
         self.drag_level = drag_level
         self._timer = None
+        self._in_tick = False
         self._last_server_ang: np.ndarray | None = None
         self._active_prev: set[int] = set()
         # Edge-triggered guard for the pull-force limit warning (mirrors
@@ -293,10 +294,14 @@ class PyMOLIMDClient:
         self._last_server_ang = None
 
     def _tick(self) -> None:
-        if self.client.closed:
-            self.stop()
+        """Keep input, display and its baseline atomic across nested Qt events."""
+        if self._in_tick:
             return
+        self._in_tick = True
         try:
+            if self.client.closed:
+                self.stop()
+                return
             # Read drag before displaying a new frame can overwrite it.
             self._send_drag_forces()
             if self.client.closed:
@@ -308,6 +313,8 @@ class PyMOLIMDClient:
         except Exception as exc:
             logger.error("IMD client stream stopped: %s", exc)
             self.stop()
+        finally:
+            self._in_tick = False
 
     def _drain_to_latest(self) -> Frame | None:
         """Read up to ``IMD_CLIENT_MAX_FRAMES_PER_TICK`` queued frames, newest wins.
@@ -345,19 +352,20 @@ class PyMOLIMDClient:
             raise RuntimeError("PyMOL coordinates changed; reload the prepared PDB and reconnect")
         pymol_ang = np.asarray(coords, dtype=float)
         delta_nm = (pymol_ang - self._last_server_ang) * constants.ANGSTROM_TO_NM
+        # Consume this edit even when no new server frame is available.
+        self._last_server_ang = pymol_ang.copy()
         active_idx, forces_nm, n_exceeded = compute_pull_forces(
             delta_nm, self.const_k, self.max_force_kj, self.delta_noise_nm
         )
-        # Over-limit drag: the whole frame's pull was skipped. Warn once on the
-        # rising edge (not every tick) and keep streaming.
         if n_exceeded and not self._force_exceeded_prev:
-            logger.warning(
-                "Pull force on %d atom(s) exceeded max_force_kj=%.1f kJ/mol/nm; "
-                "this frame's pull was skipped (no force sent), MD continues. "
-                "Drag a shorter distance or raise max_force_kj to pull harder.",
-                n_exceeded,
-                self.max_force_kj,
-            )
+            if active_idx.size:
+                logger.warning(
+                    "Pull force on %d atom(s) capped at max_force_kj=%.1f kJ/mol/nm",
+                    n_exceeded,
+                    self.max_force_kj,
+                )
+            else:
+                logger.warning("Non-finite pull input; released the entire pull frame")
         self._force_exceeded_prev = bool(n_exceeded)
         # Expand to the whole residue / chain (same behavior as the in-process
         # IMDSystem); no-op for the default atom level / a skipped frame.

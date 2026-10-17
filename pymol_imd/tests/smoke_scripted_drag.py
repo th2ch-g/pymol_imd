@@ -130,9 +130,10 @@ def check_callback_cap_and_release(root):
 
     result = run_drag(driver, [0, 2], offset, duration_ps=0.005, release_ps=0.002)
     np.testing.assert_allclose(samples, np.arange(5) * 0.001)
-    assert result.skipped_frames == 3 and result.applied_frames == 2
+    assert result.skipped_frames == 0 and result.applied_frames == 5
     force_rows = rows(root / "cap/forces.csv")
-    assert sorted(set(int(r["step"]) for r in force_rows)) == [4, 5]
+    assert sorted(set(int(r["step"]) for r in force_rows)) == [1, 2, 3, 4, 5]
+    assert max(float(r["fmag"]) for r in force_rows) == driver.config.max_force_kj
     assert [int(r["step"]) for r in rows(root / "cap/state.csv")] == list(range(1, 8))
 
 
@@ -160,7 +161,7 @@ def check_recovery_and_mlmm(root):
     recovering = make_system(root / "recovery")
     recovering.config.energy_cutoff_kj = 0.001
     result = run_drag(recovering, [1], [0.1, 0, 0], duration_ps=0.002)
-    assert result.recovery_frames == 2 and result.applied_frames == 0
+    assert result.recovery_frames == 1 and result.applied_frames == 0
     assert result.end_step == 2 and not rows(root / "recovery/forces.csv")
 
     driver = make_system(root / "mlmm", mlmm=True)
@@ -168,7 +169,7 @@ def check_recovery_and_mlmm(root):
     calls_before = calculator.calls
     driver.config.drag_level = "residue"
     result = run_drag(driver, [1], [0.1, 0, 0], duration_ps=0.003, release_ps=0.002)
-    assert calculator.calls - calls_before == 5
+    assert calculator.calls - calls_before == 6  # Initial state and five accepted proposals.
     assert result.applied_frames == 3
     force_rows = rows(root / "mlmm/forces.csv")
     assert len(force_rows) == 9

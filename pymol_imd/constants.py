@@ -107,11 +107,11 @@ DEFAULT_PRESSURE_BAR = 1.0  # MonteCarloBarostat pressure (bar; NPT only)
 DEFAULT_FRICTION_PER_PS = 1.0  # Langevin friction (1/ps)
 DEFAULT_TIMESTEP_PS = 0.002  # generic IMDConfig fallback (ps); backends override
 DEFAULT_NSTEPS_PER_FRAME = 1  # MD steps advanced per GUI frame
-DEFAULT_CONST_K = 10000.0  # pulling-force scale (kJ/mol/nm); backends override
+DEFAULT_CONST_K = 10000.0  # pulling-force scale (kJ/mol/nm^2); backends override
 DEFAULT_MOUSE_FORCE = True  # whether the user pull-force mechanism is active
 DEFAULT_INTEGRATOR = "langevin"  # "langevin" | "langevin_middle"; AA overrides
 DEFAULT_MAX_FORCE_KJ = 5000.0  # per-atom hard cap on pull-force magnitude (kJ/mol/nm)
-DEFAULT_ENERGY_CUTOFF_KJ = 1e9  # |U| above this rejects the current frame (kJ/mol)
+DEFAULT_ENERGY_CUTOFF_KJ = 1e9  # |U| or kinetic energy above this rejects the frame (kJ/mol)
 ENERGY_RECOVERY_RETRIES = 2  # Retry without pulling, then with zero velocities.
 DEFAULT_FRAME_INTERVAL_MS = 1  # QTimer tick interval for the IMD / minimize loops (ms)
 DEFAULT_DRAG_LEVEL = "atom"  # mouse-drag granularity: atom | residue | chain
@@ -288,6 +288,7 @@ IMD_MAX_PACKET_BODY_BYTES = 256 * 1024 * 1024
 IMD_CLIENT_FRAME_INTERVAL_MS = 8  # PyMOL client QTimer tick (ms); lower = smoother streaming
 IMD_CLIENT_POLL_TIMEOUT_S = 0.01  # client per-tick wait for the first frame header
 IMD_CLIENT_MAX_FRAMES_PER_TICK = 64  # cap frames drained per tick so the Qt loop never wedges
+IMD_FORCE_LEASE_S = 0.25  # Release a pull when its client stops refreshing it.
 
 # Experimental external CueMol3 client.
 CUEMOL_FRAME_INTERVAL_MS = 33

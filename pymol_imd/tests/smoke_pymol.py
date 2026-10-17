@@ -6,6 +6,7 @@ Run with ``pixi run smoke-pymol`` or in a fresh viewer with
 
 from __future__ import annotations
 
+import csv
 import gc
 import logging
 import os
@@ -18,8 +19,8 @@ import numpy as np
 from pymol import cmd
 from pymol.Qt import QtCore, QtWidgets
 
-from pymol_imd import commands
-from pymol_imd.client import PyMOLIMDClient
+from pymol_imd import commands, constants
+from pymol_imd.client import Frame, PyMOLIMDClient
 
 log = logging.getLogger("smoke-pymol")
 
@@ -137,7 +138,7 @@ def _exercise_backend(app, pdb: Path, level: str, output: Path | None) -> list:
     paths = [pdb.parent / f"{level}{suffix}" for suffix in (".xtc", "_forces.csv", "_state.csv")]
     commands.imd_record(traj=str(paths[0]), force_csv=str(paths[1]), state_csv=str(paths[2]))
     commands.imd_minimize(max_iter_per_chunk=20, max_chunks=3, run_after=True)
-    _until(app, lambda: system.simulation.currentStep >= 3)
+    _until(app, lambda: system._frame_index >= 3)
     assert commands._timer.isActive() and not commands._timer_minimize.isActive()
     commands.imd_stop()
     assert not system.running and not system._recording
@@ -158,6 +159,7 @@ def _exercise_backend(app, pdb: Path, level: str, output: Path | None) -> list:
     commands.imd_stop()
     commands.imd_record("off")
     assert not system._active_pull_idx_prev
+    _check_async_drag(app, system, pdb.parent / f"{level}_async_forces.csv")
 
     positions = system._read_openmm_positions_nm() * 10
     displayed = np.asarray(cmd.get_coords(obj, state=1))
@@ -180,6 +182,29 @@ def _exercise_backend(app, pdb: Path, level: str, output: Path | None) -> list:
     if level == "mlmm":
         owned.extend((system._mlip_atoms, system.bundle.extra["ml_calculator"]))
     return [weakref.ref(item) for item in owned]
+
+
+def _check_async_drag(app, system, force_csv: Path) -> None:
+    commands.imd_drag_level("atom")
+    system._sync_positions_to_pymol()
+    cmd.alter_state(
+        1,
+        f"{system.pymol_object} and index 1",
+        "x += offset",
+        space={"offset": 2 * constants.DELTA_NOISE_NM * constants.NM_TO_ANGSTROM},
+    )
+    commands.imd_record(force_csv=str(force_csv))
+    commands.imd_run()
+    _until(app, lambda: system._frame_index >= 3)
+    commands.imd_stop()
+    commands.imd_record("off")
+    with force_csv.open() as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1, ("mouse offset was lost or applied more than once", rows)
+    assert int(rows[0]["atom_index"]) == 0
+    assert float(rows[0]["fx"]) > 0
+    assert commands._local_loop is None and not system._active_pull_idx_prev
+    log.info("worker consumes real PyMOL coordinate edits once and releases the pull")
 
 
 def _check_coordset_sync(system) -> None:
@@ -287,6 +312,81 @@ def _check_socket_cleanup() -> None:
     log.info("socket object edits stop Qt and disconnect instead of retaining a pull")
 
 
+def _check_socket_input_consumption() -> None:
+    class Connection:
+        def __init__(self):
+            self.sent = []
+
+        def send_forces(self, indices, forces):
+            self.sent.append((indices.copy(), forces.copy()))
+
+    obj = cmd.get_unused_name("imd_socket_input")
+    cmd.pseudoatom(obj, pos=[0, 0, 0])
+    connection = Connection()
+    viewer = PyMOLIMDClient(connection, obj, const_k=10000, max_force_kj=5000)
+    viewer._last_server_ang = np.zeros((1, 3))
+    cmd.load_coordset(np.array([[0.2, 0, 0]]), obj, state=1)
+    viewer._send_drag_forces()
+    viewer._send_drag_forces()
+    viewer._send_drag_forces()
+    assert len(connection.sent) == 2
+    assert connection.sent[0][0].tolist() == [0]
+    assert connection.sent[1][0].size == 0, "An old edit was resent while waiting for a frame"
+    cmd.delete(obj)
+
+
+def _check_socket_feedback(app) -> None:
+    class Connection:
+        closed = False
+
+        def __init__(self):
+            self.sent = []
+
+        def send_forces(self, indices, forces):
+            self.sent.append((indices.copy(), forces.copy()))
+
+        def disconnect(self):
+            self.closed = True
+
+    obj = cmd.get_unused_name("imd_socket_feedback")
+    cmd.pseudoatom(obj, pos=[0, 0, 0])
+    connection = Connection()
+    viewer = PyMOLIMDClient(connection, obj, const_k=50000, max_force_kj=5000)
+    viewer._last_server_ang = np.zeros((1, 3))
+    frame_number = 0
+    redrawing = False
+    display = viewer._display
+
+    def next_frame():
+        nonlocal frame_number
+        frame_number += 1
+        return Frame(positions_ang=np.array([[0.2 * frame_number, 0, 0]]))
+
+    def redraw(positions):
+        nonlocal redrawing
+        display(positions)
+        if not redrawing:
+            redrawing = True
+            try:
+                QtCore.QTimer.singleShot(0, viewer._tick)
+                app.processEvents()
+            finally:
+                redrawing = False
+
+    viewer._drain_to_latest = next_frame
+    viewer._display = redraw
+    try:
+        for _ in range(100):
+            viewer._tick()
+        assert not connection.closed
+        assert not connection.sent, "Server motion became a mouse force during a nested Qt tick"
+        assert frame_number == 100, "A nested Qt tick advanced the display twice"
+        np.testing.assert_allclose(cmd.get_coordset(obj, state=1), viewer._last_server_ang)
+    finally:
+        cmd.delete(obj)
+    log.info("socket redraw consumes no MD motion as input, including nested Qt callbacks")
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     app = QtCore.QCoreApplication.instance() or QtCore.QCoreApplication([])
@@ -314,6 +414,8 @@ def main() -> int:
             log.info("setup replacement releases systems, Qt timers, contexts, and ML calculators")
             _check_error_cleanup(app)
             _check_socket_cleanup()
+            _check_socket_input_consumption()
+            _check_socket_feedback(app)
     finally:
         commands.imd_stop()
         commands.imd_disconnect()

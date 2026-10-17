@@ -28,7 +28,7 @@ import numpy as np
 from openmm import unit
 
 from . import constants, protocol, transport
-from .imd import IMDSystem
+from .imd import IMDSystem, cap_pull_forces
 from .protocol import IMDHeaderType, SessionInfo
 
 logger = logging.getLogger(__name__)
@@ -78,6 +78,9 @@ class IMDServer:
         self._pending_idx: np.ndarray | None = None
         self._pending_forces_nm: np.ndarray | None = None
         self._pending_dirty = False
+        self._release_after_pending = False
+        self._release_before_pending = False
+        self._force_received_at = 0.0
         # Control flags.
         self._stop = threading.Event()  # end the CURRENT session
         self._shutdown = threading.Event()  # end serve_forever's accept loop
@@ -170,8 +173,11 @@ class IMDServer:
         self._force_exceeded_prev = False
         with self._force_lock:
             self._pending_dirty = False
+            self._release_after_pending = False
+            self._release_before_pending = False
             self._pending_idx = None
             self._pending_forces_nm = None
+            self._force_received_at = 0.0
 
     def _teardown_session(self) -> None:
         self._stop.set()
@@ -303,31 +309,62 @@ class IMDServer:
             forces_nm = forces_ang * constants.KJ_PER_ANGSTROM_TO_KJ_PER_NM
             if idx.size and ((idx < 0).any() or (idx >= self.imd.n_atoms).any()):
                 raise protocol.ProtocolError(f"MDComm atom index outside [0, {self.imd.n_atoms})")
-            magnitudes = np.linalg.norm(forces_nm, axis=1)
-            exceeded = int(np.count_nonzero(magnitudes > self.imd.config.max_force_kj))
+            forces_nm, exceeded = cap_pull_forces(forces_nm, self.imd.config.max_force_kj)
             if exceeded:
                 if not self._force_exceeded_prev:
                     logger.warning(
-                        "MDComm force on %d atom(s) exceeded max_force_kj=%.1f; "
-                        "the packet was skipped and active pulls were released",
+                        "MDComm force on %d atom(s) capped at max_force_kj=%.1f kJ/mol/nm",
                         exceeded,
                         self.imd.config.max_force_kj,
                     )
                 self._force_exceeded_prev = True
-                idx = np.empty(0, dtype=np.int64)
-                forces_nm = np.empty((0, 3), dtype=float)
             else:
                 self._force_exceeded_prev = False
             with self._force_lock:
-                self._pending_idx = idx
-                self._pending_forces_nm = forces_nm
+                now = time.monotonic()
+                if (
+                    slot == 0
+                    and not self._pause.is_set()
+                    and self._pending_dirty
+                    and self._pending_idx is not None
+                    and self._pending_idx.size
+                    and now - self._force_received_at <= constants.IMD_FORCE_LEASE_S
+                ):
+                    # Preserve a completed gesture for one MD frame, then release it.
+                    self._release_after_pending = True
+                    return True
+                if idx.size:
+                    self._release_before_pending |= self._release_after_pending or (
+                        self._pending_dirty
+                        and (self._pending_idx is None or not self._pending_idx.size)
+                    )
+                else:
+                    self._release_before_pending = False
+                self._release_after_pending = False
+                self._pending_idx = idx if not self._pause.is_set() else np.empty(0, dtype=int)
+                self._pending_forces_nm = (
+                    forces_nm if not self._pause.is_set() else np.empty((0, 3))
+                )
                 self._pending_dirty = True
+                self._force_received_at = now
             return True
         if htype is IMDHeaderType.PAUSE:
-            self._pause.set()
+            with self._force_lock:
+                self._pause.set()
+                self._release_after_pending = False
+                self._release_before_pending = False
+                self._pending_idx = None
+                self._pending_forces_nm = None
+                self._pending_dirty = True
             return True
         if htype is IMDHeaderType.RESUME:
-            self._pause.clear()
+            with self._force_lock:
+                self._release_after_pending = False
+                self._release_before_pending = False
+                self._pending_idx = None
+                self._pending_forces_nm = None
+                self._pending_dirty = True
+                self._pause.clear()
             return True
         if htype is IMDHeaderType.TRATE:
             if slot >= 1:
@@ -351,6 +388,7 @@ class IMDServer:
         dt_ps = self.imd.config.timestep_ps
         while not self._stop.is_set():
             if self._pause.is_set():
+                self._apply_pending_forces()
                 time.sleep(0.005)
                 continue
             try:
@@ -384,12 +422,25 @@ class IMDServer:
 
     def _apply_pending_forces(self) -> None:
         with self._force_lock:
-            if not self._pending_dirty:
-                return  # no new MDComm -> keep last frame's pull force in place
+            expired = time.monotonic() - self._force_received_at > constants.IMD_FORCE_LEASE_S
+            if not self._pending_dirty and not (expired and self.imd._active_pull_idx_prev):
+                return
             idx = None if self._pending_idx is None else self._pending_idx.copy()
             forces_nm = None if self._pending_forces_nm is None else self._pending_forces_nm.copy()
-            self._pending_dirty = False
-        active = np.asarray(idx, dtype=int) if idx is not None else np.empty(0, dtype=int)
+            release_first = self._release_before_pending
+            self._pending_dirty = self._release_after_pending
+            if self._release_after_pending:
+                self._pending_idx = None
+                self._pending_forces_nm = None
+            self._release_after_pending = False
+            self._release_before_pending = False
+        if release_first:
+            self.imd.clear_pull_forces()
+        active = (
+            np.asarray(idx, dtype=int)
+            if idx is not None and not expired
+            else np.empty(0, dtype=int)
+        )
         full = np.zeros((self.imd.n_atoms, 3), dtype=float)
         if active.size:
             full[active] = forces_nm

@@ -24,6 +24,7 @@ from . import constants
 if TYPE_CHECKING:
     from .client import PyMOLIMDClient
     from .imd import IMDSystem
+    from .interactive import LocalIMDLoop
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 _imd_system: IMDSystem | None = None
 _timer = None  # type: ignore[var-annotated]
 _timer_minimize = None  # type: ignore[var-annotated]
+_local_loop: LocalIMDLoop | None = None
 # Socket client mode (imd_connect / imd_disconnect). Kept separate from
 # _imd_system (the in-process / server-side simulation) so the two modes never
 # alias each other.
@@ -311,6 +313,7 @@ def _prepare_new_setup() -> None:
     _reset_timer(_timer_minimize)
     if _imd_system is not None:
         _imd_system.running = False
+        _close_local_loop(sync=False)
         _imd_system.clear_pull_forces()
         _imd_system.stop_recording()
     if _imd_client is not None:
@@ -700,6 +703,8 @@ def imd_record(
         print("imd: no system loaded — call imd_setup_aa / imd_setup_cg / imd_setup_mlmm first")
         return
     # "off" (or no paths at all) clears recording.
+    if _local_loop is not None:
+        _local_loop.wait()
     if traj == "off" or (traj is None and force_csv is None and state_csv is None):
         _imd_system.set_recording()
         print("imd_record: recording disabled")
@@ -813,40 +818,64 @@ def imd_run() -> None:
     starts here and stops on ``imd_stop`` (or automatically on divergence /
     error). With no armed config this behaves exactly as before.
     """
+    global _local_loop
     if _imd_system is None:
         print("imd: no system loaded — call imd_setup_aa / imd_setup_cg / imd_setup_mlmm first")
         return
     if _imd_system.running:
         print("imd: already running")
         return
-    _imd_system.running = True
+    from .interactive import LocalIMDLoop
+
+    _reset_timer(_timer)
+    _close_local_loop()
+    system = _imd_system
+    system.running = True
     try:
-        _imd_system.start_recording()
+        system.start_recording()
+        _local_loop = LocalIMDLoop(system)
     except Exception as exc:
         # Bad trajectory extension / unwritable path etc. — don't start the
         # loop with a half-initialized recorder.
-        _imd_system.running = False
-        print(f"imd_run: recording setup failed — {exc}")
+        system.running = False
+        system.stop_recording()
+        print(f"imd_run: startup failed — {exc}")
         return
+    loop = _local_loop
 
     def _tick() -> None:
+        if _local_loop is not loop:
+            return
         try:
-            _imd_system.step()
+            loop.tick()
         except Exception as exc:
             logger.debug("imd_run: step failed", exc_info=True)
-            _imd_system.running = False
+            system.running = False
             print(f"imd_run: stopped due to error — {exc}")
-        if not _imd_system.running:
+        if not system.running and _local_loop is loop:
             _timer.stop()
+            _close_local_loop()
             try:
-                _imd_system.clear_pull_forces()
+                system.clear_pull_forces()
             finally:
-                _imd_system.stop_recording()
+                system.stop_recording()
 
-    _reset_timer(_timer)
     _timer.timeout.connect(_tick)
     _timer.start(_imd_system.config.frame_interval_ms)
     print("imd_run: started")
+
+
+def _close_local_loop(*, sync: bool = True) -> None:
+    global _local_loop
+    loop, _local_loop = _local_loop, None
+    if loop is None:
+        return
+    try:
+        state = loop.close()
+        if sync and state is not None:
+            loop.system._sync_positions_to_pymol(state)
+    except Exception as exc:
+        logger.error("imd_run: stopped due to error — %s", exc)
 
 
 def _reset_timer(timer) -> None:
@@ -873,6 +902,7 @@ def imd_stop() -> None:
         _timer.stop()
     if _timer_minimize is not None:
         _timer_minimize.stop()
+    _close_local_loop()
     _imd_system.clear_pull_forces()
     # Flush + close trajectory / CSV (idempotent; safe when not recording).
     _imd_system.stop_recording()
@@ -926,6 +956,8 @@ def imd_change(
     except (TypeError, ValueError) as exc:
         print(f"imd_change: {exc}")
         return
+    if _local_loop is not None:
+        _local_loop.wait()
     for name in updates:
         setattr(cfg, name, getattr(candidate, name))
     if temperature is not None:
@@ -956,6 +988,8 @@ def imd_drag_level(level: str = constants.DEFAULT_DRAG_LEVEL) -> None:
         return
     applied = False
     if _imd_system is not None:
+        if _local_loop is not None:
+            _local_loop.wait()
         _imd_system.config.drag_level = level
         applied = True
     if _imd_client is not None:
@@ -1011,13 +1045,13 @@ def imd_connect(
         PyMOL object whose atoms mirror the server topology. Defaults to the
         most recently loaded object.
     const_k, max_force_kj:
-        Client-side drag sensitivity (kJ/mol/nm) and per-atom |F| cap. When
+        Client-side drag sensitivity (kJ/mol/nm^2) and per-atom |F| cap. When
         omitted, ``const_k`` defaults to the per-backend recommendation (CG
         10000, AA / ML-MM 50000 — CG is auto-detected from the ``BB`` bead
         naming) so the pull feels identical to the same-process ``imd_setup_*``
         path; ``max_force_kj`` defaults to the global cap. The force is computed
-        entirely client-side, so the server's own ``const_k`` (e.g.
-        ``serve --const-k``) has NO effect — set it here instead.
+        entirely client-side; the headless engine receives those force vectors,
+        so set the sensitivity here.
     """
     global _imd_client
     from . import protocol, transport

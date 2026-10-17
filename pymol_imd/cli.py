@@ -86,7 +86,7 @@ def _build_parser(mode: str = "launch") -> argparse.ArgumentParser:
             "--nsteps-per-frame", type=int, metavar="N", help="MD steps executed per GUI frame."
         )
         common.add_argument(
-            "--const-k", type=float, metavar="K", help="Pull-force scale (kJ/mol/nm)."
+            "--const-k", type=float, metavar="K", help="Pull-force scale (kJ/mol/nm^2)."
         )
     common.add_argument(
         "--max-force-kj",
@@ -94,7 +94,7 @@ def _build_parser(mode: str = "launch") -> argparse.ArgumentParser:
         metavar="F",
         help=(
             "Per-atom safety limit on the pulling force magnitude (kJ/mol/nm); "
-            "a frame exceeding it is skipped rather than clamped. "
+            "excessive pulls retain their direction at this magnitude. "
             f"Default {constants.DEFAULT_MAX_FORCE_KJ:g}. "
             "Lower to make divergence-on-strong-drag harder."
         ),

@@ -84,12 +84,19 @@ def check_pull_recovery(root):
         folder = root / extension
         imd = make_system(folder, extension)
         imd.config.nsteps_per_frame = 4
+        imd.config.max_force_kj = 1e9
         imd.set_pull_forces(np.array([0]), np.array([[1e8, 0, 0]]))
         alive, state = imd.advance_openmm(get_positions=True, get_velocities=True, get_forces=True)
         assert alive and imd._recovery_count == 1
         assert imd.simulation.currentStep == 4
         assert not imd._active_pull_idx_prev
         assert not imd._invalid_state(state)
+        imd.set_pull_forces(np.array([0]), np.array([[1e8, 0, 0]]))
+        assert not imd._active_pull_idx_prev, "Rejected gesture was reapplied before release"
+        imd.clear_pull_forces()
+        imd.set_pull_forces(np.array([0]), np.array([[1, 0, 0]]))
+        assert imd._active_pull_idx_prev == {0}, "Release did not rearm pulling"
+        imd.clear_pull_forces()
         assert abs(state.getTime().value_in_unit(unit.picosecond) - 0.008) < 1e-12
         alive, _ = imd.advance_openmm()
         assert alive and imd._recovery_count == 1
@@ -103,6 +110,38 @@ def check_velocity_recovery(root):
     assert alive and imd._recovery_count == 1
     assert abs(state.getPositions(asNumpy=True)._value[0, 0]) < 0.2
     check_recording(imd, root / "velocity", "xtc", [1])
+
+
+def check_finite_kinetic_recovery(root):
+    imd = make_system(root / "kinetic")
+    imd._pull_recovery_latched = True
+    imd.simulation.context.setVelocities([[10, 0, 0]] * unit.nanometer / unit.picosecond)
+    alive, state = imd.advance_openmm(get_positions=True)
+    assert alive and imd._recovery_count == 1, "Finite excessive kinetic energy was accepted"
+    assert state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole) < 100
+    assert imd._pull_recovery_latched, "Recovery rearmed a gesture before release"
+    check_recording(imd, root / "kinetic", "xtc", [1])
+
+
+def check_force_boundary(root):
+    imd = make_system(root / "force_boundary")
+    for force in (float("nan"), float("inf")):
+        imd.set_pull_forces(np.array([0]), np.array([[100, 0, 0]]))
+        assert imd._active_pull_idx_prev == {0}
+        imd.set_pull_forces(np.array([0]), np.array([[force, 0, 0]]))
+        assert not imd._active_pull_idx_prev
+        assert not np.asarray(imd._pull_force.getParticleParameters(0)[1]).any()
+    for limit in (5000, 1000):
+        imd.config.max_force_kj = limit
+        requested = np.array([[6000, -8000, 0]])
+        imd.set_pull_forces(np.array([0]), requested)
+        assert imd._active_pull_idx_prev == {0}
+        np.testing.assert_allclose(
+            imd._pull_force.getParticleParameters(0)[1], [0.6 * limit, -0.8 * limit, 0]
+        )
+        np.testing.assert_allclose(imd._last_pull_forces, [[0.6 * limit, -0.8 * limit, 0]])
+        np.testing.assert_array_equal(requested, [[6000, -8000, 0]])
+    imd.stop_recording()
 
 
 def check_integration_exception(root):
@@ -149,9 +188,34 @@ def check_local_mlmm_recovery(root):
     assert len(synced) == 1 and not imd._invalid_state(synced[0])
     assert not imd._active_pull_idx_prev
     delta = imd._mlmm_force.getParticleParameters(0)[1]
-    expected = 0.01 * constants.EV_PER_A_TO_KJ_PER_MOL_NM + 10
-    np.testing.assert_allclose(delta, [expected, 0, 0], atol=1e-10)
+    expected = 100 * imd._read_openmm_positions_nm()[0]
+    expected[0] += 0.01 * constants.EV_PER_A_TO_KJ_PER_MOL_NM
+    np.testing.assert_allclose(delta, expected, atol=1e-10)
     check_recording(imd, folder, "xtc", [1])
+
+
+def check_mlmm_proposed_state(root, *, raises=False):
+    class LimitedML(ConstantML):
+        def get_forces(self, atoms):
+            if atoms.positions[0, 0] > 1.2:
+                if raises:
+                    raise RuntimeError("MLIP geometry outside supported range")
+                return np.full((len(atoms), 3), np.nan)
+            return super().get_forces(atoms)
+
+    folder = root / ("mlmm_exception" if raises else "mlmm_proposed")
+    imd = make_system(folder, mlmm=True)
+    imd._mlip_atoms.calc = LimitedML()
+    imd.config.energy_cutoff_kj = 1e9
+    imd.config.max_force_kj = 1e6
+    imd.apply_mlmm_if_present()
+    imd.set_pull_forces(np.array([0]), np.array([[1e5, 0, 0]]))
+    alive, state = imd.advance_openmm(get_positions=True)
+    assert alive and imd._recovery_count == 1, "An invalid next ML state was committed"
+    assert imd._read_openmm_positions_nm()[0, 0] < 0.12
+    imd.apply_mlmm_if_present()
+    assert imd.advance_openmm()[0]
+    check_recording(imd, folder, "xtc", [1, 2])
 
 
 def main():
@@ -160,9 +224,13 @@ def main():
         root = Path(directory)
         check_pull_recovery(root)
         check_velocity_recovery(root)
+        check_finite_kinetic_recovery(root)
+        check_force_boundary(root)
         check_integration_exception(root)
         check_unrecoverable(root)
         check_local_mlmm_recovery(root)
+        check_mlmm_proposed_state(root)
+        check_mlmm_proposed_state(root, raises=True)
     print("smoke-recovery: passed")
 
 

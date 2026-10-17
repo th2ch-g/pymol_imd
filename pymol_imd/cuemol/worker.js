@@ -14,6 +14,8 @@
   let atoms = [];
   let atomIndex = new Map();
   let drag = null;
+  let completedTarget = null;
+  let movedThisTick = false;
   let appliedFrames = 0;
   let lastStep = 0;
   let dragStarts = 0;
@@ -63,14 +65,31 @@
     }
     view = invoke(scene, "getView", options.viewId || viewIDs[0]);
     if (!view) throw new Error("The requested view does not exist");
-    const reader = invoke(internal.getService("StreamManager"), "createHandler", "pdb", 0);
-    invoke(reader, "setPath", options.path);
-    molecule = invoke(reader, "createDefaultObj");
-    invoke(reader, "attach", molecule);
-    try {
-      invoke(reader, "read");
-    } finally {
-      invoke(reader, "detach");
+    if (options.bonds) {
+      // Build beads directly: PDB loading infers atomistic bonds in known residues.
+      molecule = internal.createObj("MolCoord");
+      for (const [index, key] of options.atomKeys.entries()) {
+        const residue = Number(key[1]);
+        if (!Number.isInteger(residue)) throw new Error("CG prepared PDB must use integer residue IDs");
+        const atom = internal.createObj("MolAtom");
+        const position = internal.createObj("Vector");
+        ["x", "y", "z"].forEach((axis, j) => position.setProp(axis, options.positions[index][j]));
+        atom.setProp("name", key[3]);
+        atom.setProp("confid", key[4]);
+        atom.setProp("element", "C");
+        atom.setProp("pos", position);
+        invoke(molecule, "appendAtom1", atom, key[0], residue, key[2]);
+      }
+    } else {
+      const reader = invoke(internal.getService("StreamManager"), "createHandler", "pdb", 0);
+      invoke(reader, "setPath", options.path);
+      molecule = invoke(reader, "createDefaultObj");
+      invoke(reader, "attach", molecule);
+      try {
+        invoke(reader, "read");
+      } finally {
+        invoke(reader, "detach");
+      }
     }
     const selection = internal.createObj("SelCommand");
     if (!invoke(selection, "compile", "*", prop(scene, "uid"))) {
@@ -95,10 +114,18 @@
     atomIndex = new Map(atoms.map((atom, index) => [prop(atom, "id"), index]));
     molecule.setProp("name", options.name || "IMD molecule");
     invoke(scene, "addObject", molecule);
+    if (options.bonds) {
+      const analysis = internal.getService("MolAnlManager");
+      for (const [first, second] of options.bonds) {
+        invoke(analysis, "makeBond", molecule, prop(atoms[first], "id"), prop(atoms[second], "id"));
+      }
+    }
     setDefaultColoring();
     const renderer = invoke(molecule, "createRenderer", "ballstick");
     renderer.setProp("name", "IMD atoms");
     invoke(renderer, "applyStyles", "DefaultBallStick,DefaultCPKColoring");
+    if (options.beadRadius) renderer.setProp("sphr", options.beadRadius);
+    if (options.bondRadius) renderer.setProp("bondw", options.bondRadius);
     invoke(molecule, "fitView", view, false);
     view.setProp("perspective", false);
     invoke(view, "invalidate");
@@ -113,6 +140,7 @@
       viewId: prop(view, "uid"),
       objectId: prop(molecule, "uid"),
       atomIds: atoms.map((atom) => prop(atom, "id")),
+      bondCount: invoke(molecule, "getBondSize"),
       atomKeys: atoms.map(identity),
       positions: atoms.map((atom) => xyz(prop(atom, "pos"))),
       screen: atoms.map((atom) => xyz(invoke(view, "projToScreen", prop(atom, "pos")))),
@@ -125,6 +153,8 @@
 
   function handle(event) {
     if (event.type === "release") {
+      completedTarget = event.completed && movedThisTick && drag
+        ? { index: drag.index, position: drag.target } : null;
       if (drag) dragEnds++;
       drag = null;
       return;
@@ -133,6 +163,8 @@
     const y = event.y * prop(view, "height") / event.height;
     if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error("Invalid pointer position");
     if (event.type === "down") {
+      movedThisTick = false;
+      completedTarget = null;
       const result = invoke(view, "hitTest", Math.round(x), Math.round(y));
       const hit = result ? JSON.parse(result) : null;
       if (!hit || hit.obj_id !== prop(molecule, "uid") || !atomIndex.has(hit.atom_id)) return;
@@ -151,11 +183,14 @@
         (x - drag.x) * drag.right[axis] - (y - drag.y) * drag.up[axis]
       ));
       dragMoves++;
+      movedThisTick = true;
     }
   }
 
   function tick(payload) {
     ensurePresent();
+    completedTarget = null;
+    movedThisTick = false;
     for (const event of payload.events || []) handle(event);
     if (payload.positions) {
       const positions = payload.positions;
@@ -174,7 +209,7 @@
       lastStep = payload.step;
     }
     return {
-      target: drag ? { index: drag.index, position: drag.target } : null,
+      target: drag ? { index: drag.index, position: drag.target } : completedTarget,
       appliedFrames, lastStep, dragStarts, dragMoves, dragEnds,
     };
   }

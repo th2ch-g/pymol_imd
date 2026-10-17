@@ -48,6 +48,7 @@ const context = vm.createContext({
   clearInterval: () => { watchdog = null; },
 });
 const native = [];
+document.addEventListener("pointerdown", event => native.push(event.type), true);
 for (const type of ["pointerdown", "pointermove", "pointerup", "mousedown", "mousemove", "mouseup", "click", "dblclick", "wheel"]) {
   canvas.addEventListener(type, event => native.push(event.type));
 }
@@ -72,8 +73,9 @@ function send(type, options = {}, target = canvas) {
     stopImmediatePropagation() { this.stopped = true; },
     ...options,
   };
-  const capture = (document.listeners.get(type) || []).filter(x => x.capture);
-  const listeners = target.listeners.get(type) || [];
+  const capture = (window.listeners.get(type) || []).filter(x => x.capture);
+  if (target !== window) capture.push(...(document.listeners.get(type) || []).filter(x => x.capture));
+  const listeners = (target.listeners.get(type) || []).filter(x => !x.capture);
   for (const { handler } of [...capture, ...listeners]) {
     if (event.stopped) break;
     handler(event);
@@ -81,9 +83,9 @@ function send(type, options = {}, target = canvas) {
   return event;
 }
 
-function gesture(options = {}) {
+function gesture(options = {}, target = canvas) {
   return ["pointerdown", "mousedown", "pointermove", "mousemove", "pointerup", "mouseup", "click"]
-    .map(type => send(type, options));
+    .map(type => send(type, options, target));
 }
 
 assert.equal(mode.attributes["aria-pressed"], "false");
@@ -95,6 +97,17 @@ assert.equal(mode.attributes["aria-pressed"], "true");
 const beforePull = native.length;
 assert(gesture().every(event => event.defaultPrevented));
 assert.equal(native.length, beforePull);
+const completed = ui.poll();
+assert.equal(completed.events.map(x => x.type).join(","), "down,move,release");
+assert.equal(completed.events.at(-1).completed, true);
+gesture();
+send("blur", {}, window);
+const cancelled = ui.poll().events;
+assert.equal(cancelled.map(x => x.type).join(","), "down,move,release,release");
+assert.notEqual(cancelled.at(-1).completed, true);
+const overlay = new Element();
+overlay.closest = name => name === ".rectsel-overlay" ? overlay : null;
+assert(gesture({}, overlay).every(event => event.defaultPrevented));
 assert.equal(ui.poll().events.map(x => x.type).join(","), "down,move,release");
 
 // A keyboard-activated control must remain usable after a captured drag.
@@ -153,5 +166,94 @@ ui.detach();
 assert.equal(context.__cuemolIMDUI, undefined);
 assert.equal(watchdog, null);
 assert.equal(panel.isConnected, false);
-assert([...document.listeners.values(), ...window.listeners.values()].every(list => list.length === 0));
+assert.equal(document.listeners.get("pointerdown").length, 1);
+assert([...window.listeners.values()].every(list => list.length === 0));
+assert([...document.listeners.entries()].every(([type, list]) => type === "pointerdown" || list.length === 0));
 console.log("CueMol input smoke OK (camera, modifiers, controls, drag level, release, timeout, detach)");
+
+function nativeObject(properties = {}, methods = {}) {
+  return {
+    getProp(name) { return properties[name]; },
+    setProp(name, value) { properties[name] = value; },
+    invokeMethod(name, ...args) { return methods[name]?.(...args); },
+  };
+}
+function vector(x, y, z) { return nativeObject({ x, y, z }); }
+const atom = nativeObject({
+  id: 7, chainName: "A", residIndex: "1", residName: "ALA", name: "CA", confid: "",
+  pos: vector(0, 0, 0),
+});
+const secondAtom = nativeObject({
+  id: 12, chainName: "A", residIndex: "1", residName: "ALA", name: "CB", confid: "",
+  pos: vector(1, 0, 0),
+});
+const bonds = [];
+const renderer = nativeObject();
+const residue = nativeObject({ name: "ALA" });
+const molecule = nativeObject({ uid: 2 }, {
+  getSelArray: () => [12, 7], getAtomByID: id => id === 7 ? atom : secondAtom,
+  getAtomSize: () => 2, getBondSize: () => bonds.length,
+  createRenderer: () => renderer,
+  getResidue: () => residue,
+});
+const view = nativeObject({
+  uid: 3, width: 400, height: 300, zoom: 300,
+  right_vec: vector(1, 0, 0), up_vec: vector(0, 1, 0),
+}, {
+  projToScreen: () => vector(0, 0, 0), hitTest: () => JSON.stringify({ obj_id: 2, atom_id: 7 }),
+});
+const scene = nativeObject({ uid: 1, view_uids: "3" }, {
+  getView: () => view, getObject: () => molecule,
+});
+const manager = nativeObject({}, { getSceneUIDList: () => "1", getScene: () => scene });
+const reader = nativeObject({}, { createDefaultObj: () => molecule });
+const services = {
+  SceneManager: manager,
+  StreamManager: nativeObject({}, { createHandler: () => reader }),
+  StyleManager: nativeObject(),
+  MolAnlManager: nativeObject({}, {
+    getNostdBondsJSON: () => "[]", makeBond: (object, a, b) => bonds.push([a, b]),
+  }),
+};
+const internal = {
+  getService: name => services[name], copyToTypedArray: value => value,
+  createObj: name => {
+    if (name === "MolCoord") return molecule;
+    if (name === "MolAtom") return newAtoms.shift();
+    return nativeObject({}, { compile: () => true });
+  },
+};
+const newAtoms = [atom, secondAtom];
+const workerContext = vm.createContext({ require: () => ({ getModule: () => internal }) });
+vm.runInContext(fs.readFileSync(path.join(__dirname, "../cuemol/worker.js"), "utf8"), workerContext);
+const worker = workerContext.__cuemolIMD;
+const loaded = worker.load({
+  path: "prepared.pdb", atomKeys: [["A", "1", "ALA", "CA", ""], ["A", "1", "ALA", "CB", ""]],
+  positions: [[0, 0, 0], [1, 0, 0]],
+  bonds: [[0, 1]], beadRadius: 0.4, bondRadius: 0.25,
+});
+assert.deepEqual(bonds, [[7, 12]]);
+assert.equal(loaded.bondCount, 1);
+assert.equal(renderer.getProp("sphr"), 0.4);
+assert.equal(residue.getProp("name"), "ALA");
+const down = { type: "down", x: 50, y: 50, width: 400, height: 300 };
+const move = { ...down, type: "move", x: 60 };
+let sample = worker.tick({ events: [down, move, { type: "release", completed: true }] });
+assert.equal(sample.target.index, 0);
+assert.equal(sample.target.position[0], 10);
+assert.equal(worker.tick({ events: [] }).target, null);
+assert.equal(worker.tick({ events: [down, move, { type: "release" }] }).target, null);
+assert.equal(worker.tick({ events: [down, move, { type: "release", completed: true }, { type: "release" }] }).target, null);
+assert.equal(worker.tick({ events: [down, { type: "release", completed: true }] }).target, null);
+assert.equal(worker.tick({ events: [down, move] }).target.position[0], 10);
+assert.equal(worker.tick({ events: [] }).target.position[0], 10);
+for (let step = 0; step < 100; step++) {
+  const state = worker.tick({ positions: [[step / 10, 0, 0], [step / 10 + 1, 0, 0]], step, events: [] });
+  assert.equal(state.target.position[0], 10, "MD motion moved the mouse target");
+}
+assert.equal(worker.tick({ events: [{ type: "release", completed: true }] }).target, null);
+for (let step = 100; step < 200; step++) {
+  const state = worker.tick({ positions: [[step / 10, 0, 0], [step / 10 + 1, 0, 0]], step, events: [] });
+  assert.equal(state.target, null, "MD motion restarted a released gesture");
+}
+console.log("CueMol worker smoke OK (fast gesture consumed once, cancel, click, hold, release)");

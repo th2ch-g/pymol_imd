@@ -60,7 +60,7 @@ def run_drag(
     can change direction or targets over time; it receives read-only full-system
     coordinates and returns offsets in the selected-index order. An offset is
     converted to a force by the existing ``const_k`` scale. No coordinates are
-    overwritten, and a too-large request skips the whole force frame.
+    overwritten, and each force is capped at the configured per-atom limit.
 
     The system must be stopped, with ``nsteps_per_frame=1`` and no open recorder.
     This function owns the stepping loop and uses the system's configured
@@ -114,7 +114,9 @@ def run_drag(
                 else:
                     offsets = offsets_angstrom
                 system.apply_drag(indices, offsets)
-                skipped += int(system._force_exceeded_prev)
+                skipped += int(
+                    system._force_exceeded_prev and not system._last_pull_active_idx.size
+                )
             else:
                 system.clear_pull_forces()
             system.apply_mlmm_if_present()

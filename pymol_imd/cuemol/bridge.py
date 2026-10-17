@@ -21,6 +21,25 @@ from .cdp import CDP, CDPError
 logger = logging.getLogger(__name__)
 
 
+def read_prepared_bonds(path: Path) -> list[list[int]]:
+    """Map explicit PDB bonds to prepared atom order, including hybrid-36 IDs."""
+    lines = path.read_text().splitlines()
+    serials = [line[6:11] for line in lines if line.startswith(("ATOM  ", "HETATM"))]
+    indices = {serial: index for index, serial in enumerate(serials)}
+    if len(indices) != len(serials):
+        raise ValueError("Prepared PDB has duplicate atom serials")
+    bonds = set()
+    for line in lines:
+        if not line.startswith("CONECT"):
+            continue
+        source = indices.get(line[6:11])
+        for offset in range(11, min(len(line), 31), 5):
+            target = indices.get(line[offset : offset + 5])
+            if source is not None and target is not None and source != target:
+                bonds.add(tuple(sorted((source, target))))
+    return [list(pair) for pair in sorted(bonds)]
+
+
 def read_prepared_pdb(path: Path) -> tuple[list[list[str]], np.ndarray]:
     """Preserve prepared-PDB order and reject ambiguous atom identities."""
     keys = []
@@ -98,6 +117,7 @@ class CueMolBridge:
         name: str = "IMD molecule",
     ):
         self.atom_keys, self.prepared_positions = read_prepared_pdb(prepared)
+        is_cg = any(key[3] == "BB" for key in self.atom_keys)
         self.cdp = CDP(endpoint, timeout=constants.CUEMOL_CDP_TIMEOUT_S)
         self.page = None
         self.worker = None
@@ -158,9 +178,13 @@ class CueMolBridge:
                 {
                     "path": str(prepared.resolve()),
                     "atomKeys": self.atom_keys,
+                    "positions": self.prepared_positions.tolist() if is_cg else None,
                     "sceneId": scene_id,
                     "viewId": view_id,
                     "name": name,
+                    "bonds": read_prepared_bonds(prepared) if is_cg else None,
+                    "beadRadius": constants.CG_SPHERE_SCALE if is_cg else None,
+                    "bondRadius": constants.CG_STICK_RADIUS if is_cg else None,
                 },
             )
             if not np.allclose(
@@ -245,7 +269,7 @@ class CueMolIMD:
             "nonzero_force_packets": 0,
             "release_packets": 0,
             "peak_force_kj_per_nm": 0.0,
-            "force_cap_skips": 0,
+            "force_cap_clamps": 0,
             "pointer_counts": {},
             "paused": False,
             "drag_level": drag_level,
@@ -352,10 +376,10 @@ class CueMolIMD:
                     if exceeded:
                         if not self.stats.get("over_limit", False):
                             logger.warning(
-                                "Pull exceeds %.1f kJ/mol/nm; skipping this frame",
+                                "Pull capped at %.1f kJ/mol/nm",
                                 self.max_force_kj,
                             )
-                        self.stats["force_cap_skips"] += 1
+                        self.stats["force_cap_clamps"] += 1
                     self.stats["over_limit"] = bool(exceeded)
                     if len(active):
                         self.client.send_forces(

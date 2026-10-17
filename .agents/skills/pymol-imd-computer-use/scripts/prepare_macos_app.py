@@ -76,6 +76,7 @@ def main() -> int:
                 parser.error(f"Startup script does not exist: {args.startup}")
             python_args += ["-r", str(startup.resolve())]
         environment = {
+            "PATH": str(Path(sys.prefix) / "bin") + os.pathsep + os.environ.get("PATH", ""),
             "PYTHONHOME": sys.prefix,
             "PYTHONUTF8": "1",
             "QT_MAC_WANTS_LAYER": "1",

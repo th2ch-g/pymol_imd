@@ -17,7 +17,7 @@ A callback receives time in ps and full-system positions in angstrom. It must
 return virtual cursor offsets for the selected atoms in their selected order.
 For a desired force array in kJ/mol/nm, convert it with
 `offsets = forces / system.config.const_k * constants.NM_TO_ANGSTROM`.
-The normal drag noise threshold and whole-frame force cap still apply.
+The normal drag noise threshold and per-atom magnitude cap still apply.
 To bound a target force smoothly, use
 `forces = raw / sqrt(1 + (norm(raw, axis=1) / soft_cap)**2)[:, None]`.
 Record `soft_cap` separately from the unchanged system force cap.

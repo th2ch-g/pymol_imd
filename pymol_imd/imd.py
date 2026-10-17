@@ -3,7 +3,7 @@
 This module is backend-agnostic: it takes a :class:`SystemBundle` (built by an
 AA / CG / ML-MM backend) and turns it into a runnable simulation that:
 
-  * runs OpenMM steps on the PyMOL Qt event loop via :class:`QTimer`,
+  * runs OpenMM steps independently of the viewer's event loop,
   * reads PyMOL atomic coordinates each frame and pushes a pulling force into
     a single :class:`CustomExternalForce` so the user can drag atoms in the
     PyMOL window during MD,
@@ -104,6 +104,19 @@ class _DeferredReporter:
         self.pending.append((self.reporter, simulation.currentStep, state))
 
 
+def cap_pull_forces(forces: np.ndarray, max_force_kj: float) -> tuple[np.ndarray, int]:
+    """Limit finite force vectors per atom, preserving their directions."""
+    bounded = np.array(forces, dtype=float, copy=True)
+    largest = np.max(np.abs(bounded), axis=1)
+    nonzero = np.flatnonzero(largest)
+    scaled = bounded[nonzero] / largest[nonzero, None]
+    lengths = np.linalg.norm(scaled, axis=1)
+    limited = largest[nonzero] > max_force_kj / lengths
+    indices = nonzero[limited]
+    bounded[indices] = scaled[limited] * (max_force_kj / lengths[limited, None])
+    return bounded, int(indices.size)
+
+
 def compute_pull_forces(
     delta_nm: np.ndarray,
     const_k: float,
@@ -117,44 +130,39 @@ def compute_pull_forces(
     (:mod:`pymol_imd.client`) so dragging feels numerically identical in both.
     Pure / side-effect free.
 
-    The per-atom force magnitude is checked against ``max_force_kj``. If ANY
-    dragged atom would exceed the cap, the WHOLE frame's pull is skipped
-    (no force applied) instead of being clamped, so a too-hard drag simply does
-    nothing that frame rather than injecting a runaway force. The caller is
-    expected to warn and keep the MD running when ``n_exceeded > 0``.
+    Each force is capped at ``max_force_kj`` without changing its direction.
+    Non-finite input releases the entire pull frame.
 
     Parameters
     ----------
     delta_nm:
         ``(n_atoms, 3)`` array of ``target - current`` positions in nm.
     const_k, max_force_kj, noise_nm:
-        Pull-force scale (kJ/mol/nm), per-atom |F| limit (kJ/mol/nm), and the
+        Pull-force scale (kJ/mol/nm^2), per-atom |F| limit (kJ/mol/nm), and the
         drag noise floor (nm) below which an atom counts as not dragged.
 
     Returns
     -------
     (active_idx, forces, n_exceeded):
         ``active_idx`` are the dragged atom indices (|delta| >= ``noise_nm``),
-        EMPTY when the frame is skipped; ``forces`` is the full ``(n_atoms, 3)``
-        array (kJ/mol/nm) — inactive atoms zeroed and active ones scaled by
-        ``const_k`` (no clamp), or ALL-ZERO when the frame is skipped;
-        ``n_exceeded`` is the number of dragged atoms whose |F| exceeded
-        ``max_force_kj`` — nonzero means the whole frame's pull was skipped.
+        empty when input is invalid; ``forces`` is the full ``(n_atoms, 3)``
+        array (kJ/mol/nm), with inactive atoms zeroed and active ones capped.
+        ``n_exceeded`` counts capped atoms, or non-finite atoms when rejected.
     """
-    delta = np.array(delta_nm, dtype=float, copy=True)
+    delta = np.asarray(delta_nm, dtype=float)
+    invalid = int(np.count_nonzero(~np.isfinite(delta).all(axis=1)))
+    if invalid:
+        return np.empty(0, dtype=int), np.zeros_like(delta), invalid
     atom_max = np.max(np.abs(delta), axis=1)
-    active_mask = atom_max >= noise_nm
-    delta[~active_mask] = 0.0
-    forces = delta * const_k
-    fmag = np.linalg.norm(forces, axis=1)
-    # Whole-frame skip: if ANY dragged atom's |F| exceeds the limit, drop the
-    # entire frame's pull (empty active set, zero forces) so the MD keeps
-    # running without a runaway force. Replaces the old per-atom magnitude clamp.
-    n_exceeded = int(np.count_nonzero(fmag[active_mask] > max_force_kj))
-    if n_exceeded:
-        return np.empty(0, dtype=int), np.zeros_like(forces), n_exceeded
-    active_idx = np.where(active_mask)[0]
-    return active_idx, forces, 0
+    active_idx = np.flatnonzero(atom_max >= noise_nm)
+    forces = np.zeros_like(delta)
+    if not active_idx.size:
+        return active_idx, forces, 0
+    requested = delta[active_idx] * const_k
+    if not np.isfinite(requested).all():
+        return np.empty(0, dtype=int), forces, int(active_idx.size)
+    forces[active_idx], n_exceeded = cap_pull_forces(requested, max_force_kj)
+    return active_idx, forces, n_exceeded
 
 
 @dataclass
@@ -166,20 +174,16 @@ class IMDConfig:
     friction: float = constants.DEFAULT_FRICTION_PER_PS  # 1/ps
     timestep_ps: float = constants.DEFAULT_TIMESTEP_PS  # ps
     nsteps_per_frame: int = constants.DEFAULT_NSTEPS_PER_FRAME
-    const_k: float = constants.DEFAULT_CONST_K  # kJ/mol/nm scale for the pulling force
+    const_k: float = constants.DEFAULT_CONST_K  # Pull-force scale in kJ/mol/nm^2
     mouse_force: bool = constants.DEFAULT_MOUSE_FORCE
     # Integrator selection: "langevin" (legacy BBK-like) or "langevin_middle"
     # (Leimkuhler-Matthews BAOAB). The middle scheme has 2nd-order accurate
     # configurational sampling and a wider stability window under external
     # forcing, so AA backends default to it; CG/MLMM keep "langevin" for now.
     integrator: str = constants.DEFAULT_INTEGRATOR
-    # Per-atom |F| limit (kJ/mol/nm) on the pulling force. If ANY dragged atom
-    # would exceed it, that whole frame's pull is skipped (no force applied) and
-    # a throttled warning is logged — the MD keeps running. This prevents runaway
-    # accelerations from a too-hard drag without stopping the simulation. (The
-    # separate energy guard retries an unstable frame without pulling.)
+    # Per-atom magnitude cap; excessive pulls retain their direction at this limit.
     max_force_kj: float = constants.DEFAULT_MAX_FORCE_KJ
-    # If |potential energy| exceeds this (kJ/mol), the simulation is treated
+    # If |potential energy| or kinetic energy exceeds this (kJ/mol), the simulation is treated
     # as diverged and retried. Stop only when bounded recovery fails.
     energy_cutoff_kj: float = constants.DEFAULT_ENERGY_CUTOFF_KJ
     # QTimer tick interval (ms) for both the production and minimize loops.
@@ -319,7 +323,7 @@ class IMDSystem:
         # so we can zero them on release without scanning all n_atoms.
         self._active_pull_idx_prev: set[int] = set()
         # Edge-triggered guard for the pull-force limit warning: True while the
-        # current drag exceeds max_force_kj (its frame pull is skipped). Warn
+        # current drag exceeds max_force_kj (its force is capped). Warn
         # once on the rising edge, reset on the falling edge, so a sustained
         # over-limit drag doesn't flood the console (the QTimer ticks every few ms).
         self._force_exceeded_prev: bool = False
@@ -353,11 +357,15 @@ class IMDSystem:
         # CSV writer reads it without recomputing.
         self._last_pull_active_idx: np.ndarray = np.empty(0, dtype=int)
         self._last_pull_forces: np.ndarray = np.empty((0, 3), dtype=float)
+        self._pull_recovery_latched = False
+        self._pull_rejected_prev = False
 
         # Tier-1 lossless ML/MM caches: per-frame-invariant index arrays / maps
         # plus a reusable ASE Atoms object so the hot path stops rebuilding them
         # every frame. All no-ops for non-MLMM backends.
         self._mlip_atoms = None
+        self._mlmm_cached_positions = None
+        self._mlmm_cached_box = None
         self._ml_indices_list: list[int] = []
         self._n_ml = 0
         self._mlip_symbols: list[str] = []
@@ -567,11 +575,12 @@ class IMDSystem:
         simulation = self.simulation
         context = simulation.context
         checkpoint = context.createCheckpoint()
+        block_pull = self._pull_recovery_latched or bool(self._active_pull_idx_prev)
         reporters = simulation.reporters
         pending: list = []
         simulation.reporters = [_DeferredReporter(reporter, pending) for reporter in reporters]
         state_kwargs = dict(
-            getPositions=get_positions,
+            getPositions=get_positions or self._mlmm_force is not None,
             getEnergy=True,
             getVelocities=get_velocities,
             getForces=get_forces,
@@ -586,13 +595,28 @@ class IMDSystem:
                     state = self._final_frame_state(pending, state_kwargs)
                     invalid_report = any(self._invalid_state(report) for _, _, report in pending)
                     if not self._invalid_state(state) and not invalid_report:
+                        if self._mlmm_force is not None:
+                            positions = state.getPositions(asNumpy=True).value_in_unit(
+                                unit.nanometer
+                            )
+                            box = (
+                                state.getPeriodicBoxVectors(asNumpy=True)
+                                if self.bundle.pbc
+                                else None
+                            )
+                            try:
+                                self._apply_mlmm_correction_force(np.asarray(positions), box)
+                            except (RuntimeError, ValueError) as exc:
+                                raise FloatingPointError(f"ML/MM evaluation failed: {exc}") from exc
                         accepted = True
                         break
                     reason = "non-finite state or energy outside energy_cutoff_kj"
-                except openmm.OpenMMException as exc:
+                except (openmm.OpenMMException, FloatingPointError) as exc:
                     reason = str(exc)
                 context.loadCheckpoint(checkpoint)
+                self._mlmm_cached_positions = None
                 self.clear_pull_forces()
+                self._pull_recovery_latched = block_pull
                 self._pull_force.updateParametersInContext(context)
                 self.apply_mlmm_if_present()
                 if attempt == constants.ENERGY_RECOVERY_RETRIES:
@@ -663,7 +687,7 @@ class IMDSystem:
             if self._diverged(state):
                 return True
             kinetic = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
-            if not np.isfinite(kinetic):
+            if not np.isfinite(kinetic) or kinetic > self.config.energy_cutoff_kj:
                 return True
         for flag, getter in (
             (openmm.State.Positions, state.getPositions),
@@ -738,6 +762,7 @@ class IMDSystem:
         """Remove the frozen per-frame correction before MM minimization."""
         if self._mlmm_force is None:
             return
+        self._mlmm_cached_positions = None
         for index in range(self._mlmm_force.getNumParticles()):
             atom_index, _parameters = self._mlmm_force.getParticleParameters(index)
             self._mlmm_force.setParticleParameters(index, atom_index, (0.0, 0.0, 0.0))
@@ -784,6 +809,15 @@ class IMDSystem:
             )
             if self.bundle.pbc:
                 box_vectors = state.getPeriodicBoxVectors(asNumpy=True)
+        box_nm = (
+            None if box_vectors is None else np.asarray(box_vectors.value_in_unit(unit.nanometer))
+        )
+        if (
+            self._mlmm_cached_positions is not None
+            and np.array_equal(full_positions, self._mlmm_cached_positions)
+            and np.array_equal(box_nm, self._mlmm_cached_box)
+        ):
+            return
         ml_positions_nm = full_positions[self._ml_indices_list]
         ml_positions_ang = ml_positions_nm * 10.0
 
@@ -797,6 +831,11 @@ class IMDSystem:
         atoms = self._mlip_atoms
         atoms.set_positions(mlip_positions_ang)
         F_all_eV_per_A = np.asarray(atoms.get_forces(), dtype=np.float64)
+        if (
+            F_all_eV_per_A.shape != mlip_positions_ang.shape
+            or not np.isfinite(F_all_eV_per_A).all()
+        ):
+            raise FloatingPointError("MLIP returned invalid forces for the proposed coordinates")
 
         # 2) Partition MLIP forces. ML region atoms keep their forces; link
         #    atom forces are redistributed via the placement Jacobian to the
@@ -840,6 +879,8 @@ class IMDSystem:
         F_ml_kj_per_nm = F_ml_eV_per_A * _EV_PER_A_TO_KJ_PER_MOL_NM
         delta_ml = F_ml_kj_per_nm - np.asarray(F_mm_kj_per_nm)
         delta_bdy = F_mm_boundary_eV_per_A * _EV_PER_A_TO_KJ_PER_MOL_NM
+        if not np.isfinite(delta_ml).all() or not np.isfinite(delta_bdy).all():
+            raise FloatingPointError("ML/MM correction is non-finite for the proposed coordinates")
 
         for local_idx, atom_idx in enumerate(ml_indices):
             gx, gy, gz = delta_ml[local_idx]
@@ -852,6 +893,8 @@ class IMDSystem:
                 n_ml + k, int(atom_idx), (float(gx), float(gy), float(gz))
             )
         self._mlmm_force.updateParametersInContext(self.simulation.context)
+        self._mlmm_cached_positions = np.array(full_positions, copy=True)
+        self._mlmm_cached_box = None if box_nm is None else box_nm.copy()
 
     @staticmethod
     def _link_atom_positions_ang(
@@ -1188,7 +1231,7 @@ class IMDSystem:
         force vector (kJ/mol/nm) and its magnitude. With drag_level
         residue / chain this is the whole expanded group, every atom carrying the
         group's mean force (not just the grabbed atom). Frames with no applied
-        force emit no rows (including over-limit frames whose pull was skipped).
+        force emit no rows. Capped pulls record their applied force.
         atom_index is 0-based (OpenMM / trajectory convention); add 1 for a
         PyMOL selection.
         """
@@ -1310,7 +1353,7 @@ class IMDSystem:
         ``offsets_angstrom`` is a three-vector or one vector per selected atom.
         It is a cursor offset from the current position, not a coordinate edit
         or a requested final molecular displacement. The same scale, noise
-        floor, whole-frame force cap and group expansion as mouse dragging apply.
+        floor, per-atom force cap and group expansion as mouse dragging apply.
         Reapply before each MD frame to hold a drag; ``clear_pull_forces`` releases
         it. Returns the number of atoms receiving a force in this frame.
         """
@@ -1334,16 +1377,15 @@ class IMDSystem:
         active_idx, forces, n_exceeded = compute_pull_forces(
             delta, self.config.const_k, self.config.max_force_kj, self._DELTA_NOISE_NM
         )
-        # Over-limit drag: the whole frame's pull was skipped. Warn once on the
-        # rising edge (not every tick) and keep the MD running.
         if n_exceeded and not self._force_exceeded_prev:
-            logger.warning(
-                "Pull force on %d atom(s) exceeded max_force_kj=%.1f kJ/mol/nm; "
-                "this frame's pull was skipped (no force applied), MD continues. "
-                "Drag a shorter distance or raise max_force_kj to pull harder.",
-                n_exceeded,
-                self.config.max_force_kj,
-            )
+            if active_idx.size:
+                logger.warning(
+                    "Pull force on %d atom(s) capped at max_force_kj=%.1f kJ/mol/nm",
+                    n_exceeded,
+                    self.config.max_force_kj,
+                )
+            else:
+                logger.warning("Non-finite pull input; released the entire pull frame")
         self._force_exceeded_prev = bool(n_exceeded)
         # Drag a whole residue / chain when requested: PyMOL only moves a
         # covalent fragment under the mouse, so we propagate that pull to the rest
@@ -1371,7 +1413,29 @@ class IMDSystem:
         instead of all n_atoms. Calls ``updateParametersInContext`` once.
         Shared by the PyMOL drag path and the socket MDComm path.
         """
-        to_zero = self._active_pull_idx_prev - set(active_idx.tolist())
+        active_idx = np.asarray(active_idx, dtype=int)
+        forces = np.asarray(forces, dtype=float)
+        if forces.shape != (self.n_atoms, 3):
+            raise ValueError("Pull forces must have shape (n_atoms, 3)")
+        if active_idx.ndim != 1 or np.any((active_idx < 0) | (active_idx >= self.n_atoms)):
+            raise ValueError("Pull atom indices must be a one-dimensional array in range")
+        if not active_idx.size:
+            self._pull_recovery_latched = False
+        requested = forces[active_idx]
+        rejected = not np.isfinite(requested).all()
+        if rejected and not self._pull_rejected_prev:
+            logger.warning("Non-finite pull force; released the entire pull frame")
+        self._pull_rejected_prev = rejected
+        if rejected or self._pull_recovery_latched:
+            active_idx = np.empty(0, dtype=int)
+            forces = np.zeros((self.n_atoms, 3), dtype=float)
+        elif active_idx.size:
+            bounded, limited = cap_pull_forces(requested, self.config.max_force_kj)
+            if limited:
+                forces = forces.copy()
+                forces[active_idx] = bounded
+        active_set = set(active_idx.tolist())
+        to_zero = self._active_pull_idx_prev - active_set
         if active_idx.size or to_zero:
             for idx in active_idx:
                 fx, fy, fz = forces[idx]
@@ -1381,7 +1445,7 @@ class IMDSystem:
             for idx in to_zero:
                 self._pull_force.setParticleParameters(int(idx), int(idx), (0.0, 0.0, 0.0))
             self._pull_force.updateParametersInContext(self.simulation.context)
-        self._active_pull_idx_prev = set(active_idx.tolist())
+        self._active_pull_idx_prev = active_set
         # Cache for the force CSV writer (consumed by _record_force_csv).
         self._last_pull_active_idx = active_idx
         self._last_pull_forces = forces
@@ -1416,9 +1480,8 @@ class IMDSystem:
         chain (its ``mouse_selection_mode`` does not affect editing drag), so
         ``drag_level`` is realized here: every atom of a touched residue / chain
         receives the mean pull force of that group's dragged atoms, dragging the
-        whole group along. Any over-limit frame is already skipped upstream in
-        :func:`compute_pull_forces` (empty ``active_idx``), so this only runs on
-        within-limit pulls; the group mean of within-limit vectors stays bounded.
+        whole group along. Input vectors are already capped by
+        :func:`compute_pull_forces`; their group mean stays bounded.
         """
         group_of = (
             self._atom_residue_idx if self.config.drag_level == "residue" else self._atom_chain_idx

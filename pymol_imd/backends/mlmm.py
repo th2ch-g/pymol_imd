@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import math
 import tempfile
+from importlib.metadata import version
 from pathlib import Path
 
 from openmm import unit
@@ -165,8 +166,8 @@ def _configure_torch_threads(device_str: str, n_ml: int) -> None:
     could slow some cases. The effective count is logged either way so users
     can tune it.
 
-    Numerically lossless: at fixed coordinates the MLIP forces are
-    bitwise-identical regardless of thread count (verified for AIMNet2).
+    Floating-point reduction order can change with thread count. Keep the
+    thread count fixed when comparing strict numerical regression references.
     """
     if device_str != "cpu":
         return
@@ -396,6 +397,13 @@ def _build_uma_calculator(model: str, device_str: str, task_name: str, *, ml_com
     controls compilation without replacing internal model wrappers.
     """
     try:
+        e3nn_version = version("e3nn")
+        if tuple(map(int, e3nn_version.split(".")[:2])) < (0, 5):
+            raise RuntimeError(
+                f"UMA requires e3nn>=0.5, but e3nn {e3nn_version} is installed. "
+                "Run `pixi run install-uma`, then use `pixi run --no-install` for UMA; "
+                "a normal pixi run restores MACE's locked e3nn version."
+            )
         from fairchem.core import FAIRChemCalculator
         from fairchem.core.calculate.pretrained_mlip import get_predict_unit
         from fairchem.core.units.mlip_unit import InferenceSettings

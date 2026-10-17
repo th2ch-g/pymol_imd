@@ -57,8 +57,10 @@
     if (pointer !== null) {
       const released = pointer;
       pointer = null;
-      queue({ type: "release", trusted: event?.isTrusted === true });
+      queue({ type: "release", completed: event?.type === "pointerup", trusted: event?.isTrusted === true });
       if (canvas.hasPointerCapture(released)) canvas.releasePointerCapture(released);
+    } else if (events.some(item => item.type === "release" && item.completed)) {
+      queue({ type: "release", trusted: false });
     }
   }
   function setPulling(value) {
@@ -115,10 +117,13 @@
     return { type, x: event.clientX - rect.left, y: event.clientY - rect.top,
       width: rect.width, height: rect.height, trusted: event.isTrusted };
   }
-  on(document, "pointerdown", (event) => {
+  function overViewport(event) {
+    return event.target === canvas || event.target?.closest?.(".rectsel-overlay") != null;
+  }
+  on(window, "pointerdown", (event) => {
     if (pointer !== null) return;
     capturedMouse = false;
-    if (!connected || !pulling || paused || event.button !== 0 || event.target !== canvas
+    if (!connected || !pulling || paused || event.button !== 0 || !overViewport(event)
       || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
     stop(event);
     capturedMouse = true;
@@ -126,25 +131,25 @@
     canvas.setPointerCapture(pointer);
     queue(point(event, "down"));
   });
-  on(document, "pointermove", (event) => {
+  on(window, "pointermove", (event) => {
     if (pointer === null || event.pointerId !== pointer) return;
     stop(event);
     queue(point(event, "move"));
   });
-  on(document, "pointerup", (event) => {
+  on(window, "pointerup", (event) => {
     if (event.pointerId !== pointer) return;
     stop(event);
     release(event);
   });
   for (const type of ["pointercancel", "lostpointercapture"]) {
-    on(document, type, (event) => { if (event.pointerId === pointer) release(event); });
+    on(window, type, (event) => { if (event.pointerId === pointer) release(event); });
   }
   for (const type of ["mousedown", "mouseup", "click", "dblclick"]) {
-    on(document, type, (event) => {
-      if (capturedMouse && event.button === 0 && event.target === canvas) stop(event);
+    on(window, type, (event) => {
+      if (capturedMouse && event.button === 0 && overViewport(event)) stop(event);
     });
   }
-  on(document, "mousemove", (event) => { if (pointer !== null) stop(event); });
+  on(window, "mousemove", (event) => { if (pointer !== null) stop(event); });
   on(window, "blur", release);
   on(window, "resize", placePanel);
   on(document, "visibilitychange", () => { if (document.hidden) release(); });
@@ -174,7 +179,7 @@
     update(value) {
       heartbeat = Date.now();
       if (connected) {
-        const force = value.overLimit ? "Pull limit: move closer" : `${value.force.toFixed(1)} kJ/mol/nm`;
+        const force = `${value.force.toFixed(1)} kJ/mol/nm${value.overLimit ? " (capped)" : ""}`;
         status.textContent = `IMD · ${paused ? "Paused" : "Running"} · step ${value.step} · ${force}`;
       }
     },

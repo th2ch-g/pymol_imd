@@ -8,8 +8,8 @@ that expansion WITHOUT a PyMOL window, on a tiny synthetic topology
 
   * the drag-level constants are consistent and ``IMDConfig`` defaults to atom,
   * ``commands._validate_drag_level`` rejects unknown levels,
-  * ``compute_pull_forces`` applies sub-limit pulls and skips the WHOLE frame
-    (no force) when any dragged atom exceeds ``max_force_kj``,
+  * ``compute_pull_forces`` caps each atom's force without changing direction
+    or discarding other atoms' sub-limit pulls,
   * ``IMDSystem._build_group_indices`` maps atoms to residue / chain correctly,
   * ``IMDSystem._expand_drag_groups`` expands a dragged atom to its whole
     residue / chain and copies the group's mean pull force to every member,
@@ -92,8 +92,8 @@ def _check_validate() -> None:
 
 
 def _check_force_limit() -> None:
-    """compute_pull_forces: sub-limit applies; any over-limit skips the frame."""
-    from pymol_imd.imd import compute_pull_forces
+    """Check per-atom magnitude caps, directions, boundaries and invalid input."""
+    from pymol_imd.imd import cap_pull_forces, compute_pull_forces
 
     const_k = 10000.0
     max_force_kj = 5000.0
@@ -107,15 +107,21 @@ def _check_force_limit() -> None:
     assert idx.tolist() == [1], idx
     assert np.allclose(forces[1], [1000.0, 0.0, 0.0]), forces[1]
 
-    # (b) one over-limit atom zeroes the WHOLE frame (whole-frame, not per-atom):
-    # 1.0 nm * 10000 = 10000 > 5000; the co-dragged sub-limit atom is dropped too.
+    # (b) Cap only the over-limit atom; preserve its direction and other pulls.
     delta2 = np.zeros((3, 3))
     delta2[0] = [0.05, 0.0, 0.0]  # sub-limit (500), would normally be active
-    delta2[2] = [1.0, 0.0, 0.0]  # over-limit (10000)
+    delta2[2] = [0.6, -0.8, 0.0]
     idx2, forces2, n_exceeded2 = compute_pull_forces(delta2, const_k, max_force_kj, noise)
     assert n_exceeded2 == 1, n_exceeded2
-    assert idx2.size == 0, idx2
-    assert np.allclose(forces2, 0.0), forces2
+    assert idx2.tolist() == [0, 2], idx2
+    np.testing.assert_allclose(forces2, [[500, 0, 0], [0, 0, 0], [3000, -4000, 0]])
+    _, smaller, count = compute_pull_forces(delta2, const_k, 1000, noise)
+    assert count == 1
+    np.testing.assert_allclose(smaller[[0, 2]], [[500, 0, 0], [600, -800, 0]])
+    huge = np.array([[1e300, -1e300, 0]])
+    bounded, count = cap_pull_forces(huge, max_force_kj)
+    assert count == 1 and np.isfinite(bounded).all()
+    np.testing.assert_allclose(bounded, np.array([[1, -1, 0]]) * (max_force_kj / np.sqrt(2)))
 
     # (c) exactly at the limit is NOT over (strict >): 0.5 nm * 10000 = 5000.
     delta3 = np.zeros((2, 3))
@@ -125,7 +131,12 @@ def _check_force_limit() -> None:
     assert idx3.tolist() == [1], idx3
     assert np.allclose(forces3[1], [5000.0, 0.0, 0.0]), forces3[1]
 
-    log.info("force-limit OK: sub-limit applies; over-limit skips whole frame; boundary ok")
+    for invalid in (float("nan"), float("inf")):
+        delta3[0, 0] = invalid
+        indices, forces, rejected = compute_pull_forces(delta3, const_k, max_force_kj, noise)
+        assert rejected == 1 and indices.size == 0 and not forces.any()
+
+    log.info("force-limit OK: per-atom cap preserves directions, sub-limit pulls and boundaries")
 
 
 def _check_group_indices() -> None:

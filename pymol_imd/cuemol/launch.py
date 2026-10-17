@@ -16,8 +16,6 @@ from .cdp import CDP, CDPError
 
 def close_launched_app(process: subprocess.Popen, endpoint: str | None) -> None:
     """Close only the debug instance created by this launcher."""
-    if process.poll() is not None:
-        return
     if endpoint:
         connection = None
         try:
@@ -33,6 +31,8 @@ def close_launched_app(process: subprocess.Popen, endpoint: str | None) -> None:
             return
         except subprocess.TimeoutExpired:
             pass
+    if process.poll() is not None:
+        return
     process.terminate()
     try:
         process.wait(timeout=constants.CUEMOL_CDP_TIMEOUT_S)

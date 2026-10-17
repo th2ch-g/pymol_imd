@@ -18,7 +18,13 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from pymol_imd.cuemol.__main__ import main
-from pymol_imd.cuemol.bridge import CueMolBridge, CueMolIMD, read_prepared_pdb, target_forces
+from pymol_imd.cuemol.bridge import (
+    CueMolBridge,
+    CueMolIMD,
+    read_prepared_bonds,
+    read_prepared_pdb,
+    target_forces,
+)
 from pymol_imd.cuemol.cdp import CDPError, WebSocket, _local_url, _NoRedirects
 from pymol_imd.cuemol.launch import close_launched_app, launch
 from pymol_imd.protocol import IMDHeaderType
@@ -52,6 +58,8 @@ def _test_mapping_and_forces(root):
         ["A", "1A", "ALA", "CA", "B"],
     ]
     np.testing.assert_allclose(positions, [[1, 2, 3]] * 4)
+    prepared.write_text(text + "CONECT    8    2    9\nCONECT    2    8\nEND\n")
+    assert read_prepared_bonds(prepared) == [[0, 1], [0, 2]]
     for level, expected in (("atom", [0]), ("residue", [0, 1]), ("chain", [0, 1, 3])):
         indices, forces, exceeded = target_forces(
             positions,
@@ -72,7 +80,12 @@ def _test_mapping_and_forces(root):
             const_k=50000,
             max_force_kj=5000,
         )
-        assert not len(indices) and not np.any(forces) and bool(exceeded) == over_cap
+        assert bool(exceeded) == over_cap
+        if over_cap:
+            assert indices.tolist() == [0]
+            np.testing.assert_allclose(forces, [[5000, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]])
+        else:
+            assert not len(indices) and not np.any(forces)
     _raises(
         ValueError,
         lambda: target_forces(
@@ -279,11 +292,12 @@ def _test_loop_cleanup(root):
     runner = CueMolIMD(bridge, client, frame_interval_ms=1)
     with contextlib.redirect_stdout(io.StringIO()):
         stats = runner.run(evidence=root / "loop.json")
-    assert stats["nonzero_force_packets"] == 2 and stats["force_cap_skips"] == 1
+    assert stats["nonzero_force_packets"] == 3 and stats["force_cap_clamps"] == 1
     assert stats["coordinate_max_error_ang"] == 0
     assert bridge.limit_warnings == [False, True, False, False, False]
     assert client.controls == [IMDHeaderType.PAUSE, IMDHeaderType.RESUME]
     np.testing.assert_allclose(client.forces[0][1], [[50, 0, 0]])
+    np.testing.assert_allclose(client.forces[1][1], [[500, 0, 0]])
     assert not client.forces[-1][0].size and client.closed and bridge.closed
     assert json.loads((root / "loop.json").read_text())["frames_displayed"] == 5
 
@@ -403,6 +417,10 @@ def _test_launcher(root):
     connection.return_value.request.assert_called_once_with("Browser.close")
     connection.return_value.close.assert_called_once()
     process.terminate.assert_not_called()
+    process.poll.return_value = -2
+    with patch("pymol_imd.cuemol.launch.CDP") as connection:
+        close_launched_app(process, endpoint)
+    connection.return_value.request.assert_called_once_with("Browser.close")
 
 
 def _test_cold_attach(root):

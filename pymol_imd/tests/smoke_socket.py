@@ -18,6 +18,7 @@ Usage::
 
 from __future__ import annotations
 
+import csv
 import logging
 import socket
 import struct
@@ -26,6 +27,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -177,6 +179,84 @@ def _wait_for_frame(client, timeout: float = 5.0):
     raise AssertionError("no frame received within timeout")
 
 
+def _test_force_freshness(root):
+    from pymol_imd import constants, protocol
+    from pymol_imd.protocol import IMDHeaderType as T
+    from pymol_imd.server import IMDServer
+    from pymol_imd.tests.smoke_recovery import make_system
+
+    imd = make_system(root)
+    server = IMDServer(imd)
+    packet = protocol.pack_mdcomm(np.array([0]), np.array([[10.0, 0, 0]]), protocol.NATIVE)
+    with patch("pymol_imd.server.time.monotonic", return_value=1.0):
+        server._handle_incoming(T.MDCOMM, 1, packet[8:])
+        server._apply_pending_forces()
+        assert imd._active_pull_idx_prev == {0}
+    with patch(
+        "pymol_imd.server.time.monotonic", return_value=1.0 + constants.IMD_FORCE_LEASE_S + 0.01
+    ):
+        server._apply_pending_forces()
+        assert not imd._active_pull_idx_prev, "Stalled client retained a constant pull"
+        server._handle_incoming(T.MDCOMM, 1, packet[8:])
+        server._apply_pending_forces()
+        server._handle_incoming(T.PAUSE, 0, b"")
+        server._apply_pending_forces()
+        assert not imd._active_pull_idx_prev
+        server._handle_incoming(T.MDCOMM, 1, packet[8:])
+        server._handle_incoming(T.RESUME, 0, b"")
+        server._apply_pending_forces()
+        assert not imd._active_pull_idx_prev, "Resume replayed input received during pause"
+    with patch("pymol_imd.server.time.monotonic", return_value=2.0):
+        server._handle_incoming(T.MDCOMM, 1, packet[8:])
+        server._handle_incoming(T.MDCOMM, 0, b"")
+        server._apply_pending_forces()
+        assert imd._active_pull_idx_prev == {0}, "A short gesture vanished between MD frames"
+        assert imd.advance_openmm()[0]
+        server._apply_pending_forces()
+        assert not imd._active_pull_idx_prev, "A completed short gesture was held for another frame"
+        assert imd.advance_openmm()[0]
+        server._handle_incoming(T.MDCOMM, 1, packet[8:])
+        server._handle_incoming(T.MDCOMM, 0, b"")
+        server._handle_incoming(T.PAUSE, 0, b"")
+        server._handle_incoming(T.RESUME, 0, b"")
+        server._apply_pending_forces()
+        assert not imd._active_pull_idx_prev, "Pause retained a completed gesture"
+        excessive = protocol.pack_mdcomm(
+            np.array([0]), np.array([[imd.config.max_force_kj, 0, 0]]), protocol.NATIVE
+        )
+        server._handle_incoming(T.MDCOMM, 1, packet[8:])
+        server._handle_incoming(T.MDCOMM, 0, b"")
+        server._handle_incoming(T.MDCOMM, 1, excessive[8:])
+        server._apply_pending_forces()
+        assert imd._active_pull_idx_prev == {0}, "Over-cap input was discarded"
+        np.testing.assert_allclose(
+            imd._pull_force.getParticleParameters(0)[1], [imd.config.max_force_kj, 0, 0]
+        )
+        for release_consumed in (False, True):
+            server._handle_incoming(T.MDCOMM, 1, packet[8:])
+            server._handle_incoming(T.MDCOMM, 0, b"")
+            if release_consumed:
+                server._apply_pending_forces()
+            imd.clear_pull_forces()
+            imd._pull_recovery_latched = True
+            server._handle_incoming(T.MDCOMM, 1, packet[8:])
+            server._apply_pending_forces()
+            assert imd._active_pull_idx_prev == {0}, "A new gesture did not rearm after release"
+            server._handle_incoming(T.MDCOMM, 0, b"")
+            server._apply_pending_forces()
+        server._handle_incoming(T.MDCOMM, 1, packet[8:])
+        server._handle_incoming(T.MDCOMM, 0, b"")
+    with patch(
+        "pymol_imd.server.time.monotonic", return_value=2.0 + constants.IMD_FORCE_LEASE_S + 0.01
+    ):
+        server._apply_pending_forces()
+        assert not imd._active_pull_idx_prev, "A stale completed gesture was replayed"
+    imd.stop_recording()
+    with (root / "forces.csv").open() as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1 and int(rows[0]["step"]) == 1
+
+
 def main(pdb_id: str = "1aki") -> int:
     _test_protocol_roundtrip()
     _test_fragmented_client_decoder()
@@ -189,6 +269,7 @@ def main(pdb_id: str = "1aki") -> int:
     from pymol_imd.server import IMDServer
 
     with tempfile.TemporaryDirectory() as tmp:
+        _test_force_freshness(Path(tmp) / "freshness")
         pdb = fetch_pdb(pdb_id, out_dir=Path(tmp))
         bundle = AABackend().build_system(pdb)
         imd = IMDSystem(bundle, IMDConfig(nsteps_per_frame=1, mouse_force=False))
@@ -253,15 +334,16 @@ def main(pdb_id: str = "1aki") -> int:
         log.info("force round-trip OK: 100 kJ/mol/A on the wire -> %.1f kJ/mol/nm pulled", fx0)
 
         # Server-side safety applies even to a non-PyMOL client that bypasses
-        # the client force cap. An over-limit packet releases the active pull.
+        # the client force cap. An over-limit packet applies the server's cap.
         client.send_forces(np.array([0]), np.array([[1000.0, 0.0, 0.0]]))
         for _ in range(200):
             client.poll_frame()
             fx0 = float(imd._pull_force.getParticleParameters(0)[1][0])
-            if abs(fx0) < 1e-12:
+            if abs(fx0 - imd.config.max_force_kj) < 1e-6:
                 break
             time.sleep(0.005)
-        assert abs(fx0) < 1e-12, f"over-limit MDComm force remained active: {fx0}"
+        assert abs(fx0 - imd.config.max_force_kj) < 1e-6, f"MDComm force not capped: {fx0}"
+        client.send_forces(np.empty(0, dtype=int), np.empty((0, 3)))
 
         client.send_control(IMDHeaderType.TRATE, 3)
         for _ in range(100):

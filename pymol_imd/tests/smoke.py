@@ -25,19 +25,12 @@ log = logging.getLogger("smoke")
 
 
 def _verify_force_limit(imd, *, label: str) -> None:
-    """Confirm an over-limit drag skips the whole frame; a sub-limit one applies.
-
-    With const_k=10000 and max_force_kj=5000 (defaults), a 1 nm shove gives a
-    nominal |F| = 10000 kJ/mol/nm > the 5000 limit, so the whole frame's pull is
-    skipped and atom 0's force must be exactly 0 (the skip-and-warn behavior that
-    replaced the old clamp). A sub-limit shove is then applied to confirm a
-    within-limit pull still goes through, unclamped.
-    """
+    """Confirm an over-limit drag is capped and a sub-limit pull is unchanged."""
     cap = imd.config.max_force_kj
     over_fmag = 1.0 * imd.config.const_k  # delta=1 nm * const_k
     if over_fmag <= cap:
         log.info(
-            "[%s] const_k=%.0f keeps a 1 nm drag within limit=%.0f; skip check vacuous",
+            "[%s] const_k=%.0f keeps a 1 nm drag within limit=%.0f; cap check vacuous",
             label,
             imd.config.const_k,
             cap,
@@ -58,16 +51,16 @@ def _verify_force_limit(imd, *, label: str) -> None:
 
     original = imd._read_pymol_positions_nm
     try:
-        # (1) Over-limit 1 nm shove -> whole frame skipped -> atom 0 force == 0.
+        # (1) An over-limit shove applies the configured maximum force.
         imd._read_pymol_positions_nm = _shoved_positions(0, 1.0)
         imd._apply_pull_force_from_pymol()
         fmag = _atom0_fmag()
-        if fmag > 1e-6:
+        if abs(fmag - cap) > 1e-6:
             raise AssertionError(
-                f"[{label}] over-limit drag not skipped: |F|={fmag:.2f} kJ/mol/nm, expected 0"
+                f"[{label}] over-limit drag not capped: |F|={fmag:.2f}, expected {cap:.2f}"
             )
 
-        # (2) Sub-limit shove -> applied unclamped (no magnitude cap anymore).
+        # (2) A sub-limit shove retains its requested force.
         sub_dist = 0.25 * cap / imd.config.const_k
         expected = sub_dist * imd.config.const_k
         imd._read_pymol_positions_nm = _shoved_positions(0, sub_dist)
@@ -80,7 +73,7 @@ def _verify_force_limit(imd, *, label: str) -> None:
     finally:
         imd._read_pymol_positions_nm = original
     log.info(
-        "[%s] force-limit OK: over-limit (1 nm) skipped -> 0; sub-limit applied -> %.1f kJ/mol/nm",
+        "[%s] force-limit OK: over-limit capped; sub-limit applied -> %.1f kJ/mol/nm",
         label,
         fmag,
     )

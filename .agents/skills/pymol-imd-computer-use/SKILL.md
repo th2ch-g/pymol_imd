@@ -75,7 +75,7 @@ request, use only the checks needed to establish its outcome.
 | Setup, minimize, run, stop | Correct object/atom count; MD steps advance; stop clears forces and the Qt timer |
 | Atom / residue / chain drag | Actual CUA gesture; matching nonzero force rows; correct expanded atom set |
 | Multi-chain model | Chain drag affects only the selected chain, including when residue numbers repeat |
-| Force cap | Lower the cap for a small test drag; the frame is skipped and MD keeps running |
+| Force cap | Lower the cap for a small test drag; the applied force reaches the cap, keeps its direction, and MD continues |
 | Recording off / restart | Files stop growing while MD continues; restart uses new paths; outputs close and read back |
 | Object/atom deletion | A clear error, stopped timer, released pull forces, closed recording/connection |
 | Socket reconnect / server loss | Fresh session files; clean reconnect; disconnected viewer releases its timer |
