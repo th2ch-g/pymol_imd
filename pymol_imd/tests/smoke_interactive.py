@@ -292,13 +292,13 @@ def check_feedback(folder):
         system.stop_recording()
     assert len(viewer.frames) == 250
     assert np.max(np.abs(np.asarray(viewer.frames) - initial)) > 0.01
-    assert not system._active_pull_idx_prev and system._recovery_count == 0
+    assert not system._active_pull_idx_prev
     with (folder / "forces.csv").open() as stream:
         rows = list(csv.DictReader(stream))
     assert len(rows) == 1, "MD motion after release fed back into the pull force"
     assert int(rows[0]["step"]) == 51
-    assert float(rows[0]["fmag"]) == system.config.max_force_kj
-    print("OK: one capped edit produces one force sample across 250 moving MD frames")
+    assert float(rows[0]["fmag"]) == 50000
+    print("OK: one uncapped edit produces one force sample across 250 moving MD frames")
 
 
 def main():

@@ -78,7 +78,7 @@ def target_forces(
     atom_keys: list[list[str]],
     *,
     const_k: float,
-    max_force_kj: float,
+    max_force_kj: float | None,
     drag_level: str = "atom",
     particle_masses: np.ndarray | None = None,
     group_ids: dict[str, np.ndarray] | None = None,
@@ -271,7 +271,7 @@ class CueMolIMD:
         client: IMDClient,
         *,
         const_k: float = constants.AA_RECOMMENDED_CONST_K,
-        max_force_kj: float = constants.DEFAULT_MAX_FORCE_KJ,
+        max_force_kj: float | None = None,
         drag_level: str = constants.DEFAULT_DRAG_LEVEL,
         frame_interval_ms: int = constants.CUEMOL_FRAME_INTERVAL_MS,
     ):

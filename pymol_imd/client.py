@@ -252,7 +252,7 @@ class PyMOLIMDClient:
         pymol_object: str,
         *,
         const_k: float,
-        max_force_kj: float,
+        max_force_kj: float | None = None,
         delta_noise_nm: float = constants.DELTA_NOISE_NM,
         frame_interval_ms: int = constants.IMD_CLIENT_FRAME_INTERVAL_MS,
         drag_level: str = constants.DEFAULT_DRAG_LEVEL,

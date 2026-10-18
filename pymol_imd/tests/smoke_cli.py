@@ -59,6 +59,10 @@ def main_test() -> int:
         {"nsteps_per_frame": 0},
         {"frame_interval_ms": 0},
         {"mouse_force": "false"},
+        {"max_force_kj": 0},
+        {"max_force_kj": -1},
+        {"max_force_kj": float("nan")},
+        {"max_force_kj": True},
     ):
         try:
             IMDConfig(**invalid_config)

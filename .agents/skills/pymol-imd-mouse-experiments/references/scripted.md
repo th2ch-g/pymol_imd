@@ -17,7 +17,7 @@ A callback receives time in ps and full-system positions in angstrom. It must
 return virtual cursor offsets for the selected atoms in their selected order.
 For a desired force array in kJ/mol/nm, convert it with
 `offsets = forces / system.config.const_k * constants.NM_TO_ANGSTROM`.
-The normal drag noise threshold and per-atom magnitude cap still apply.
+The normal drag noise threshold and any explicitly configured force cap apply.
 To bound a target force smoothly, use
 `forces = raw / sqrt(1 + (norm(raw, axis=1) / soft_cap)**2)[:, None]`.
 Record `soft_cap` separately from the unchanged system force cap.
@@ -58,8 +58,8 @@ closed after release even if the driven geometry matched the open reference.
 Use the fixture and ML/MM selection in `chorismate.md`: AIMNet2, region charge
 0, multiplicity 1, 160 selected atoms and 12 link hydrogens. Keep the default
 GBn2 environment and the fixture's single bridging water. Use a 0.0005 ps
-timestep, 300 K, the normal force scale 50000 kJ/mol/nm^2 and force cap
-5000 kJ/mol/nm. Record the actual devices and seed.
+timestep, 300 K, the normal force scale 50000 kJ/mol/nm^2 and an explicitly configured force cap of
+5000 kJ/mol/nm for this scripted protocol. Record the actual devices and seed.
 
 Resolve the four ligand atoms by name in the prepared topology. Select them
 in pair order: C3, C16, C1, O11. Measure the initial pair distances after
@@ -78,7 +78,7 @@ Check all six bond changes listed in `chorismate.md`, then independently infer
 ligand connectivity and stereochemistry from recorded coordinates with RDKit.
 Check every release frame, not just the most favorable frame. Save a product
 SDF with inferred bonds if assignment succeeds; the full-system PDB and XTC
-retain the initial topology. Report any cap rejection or energy recovery.
+retain the initial topology. Report any force clipping or integration failure.
 A coordinate-inferred prephenate structure supports externally driven
 conversion in this model; it does not establish a concerted transition state,
 activation barrier or spontaneous enzymatic catalysis. Label an unmatched or

@@ -27,7 +27,7 @@ class DragResult:
     release_steps: int
     applied_frames: int
     skipped_frames: int
-    recovery_frames: int
+    recovery_frames: int  # Retained for compatibility; automatic recovery is disabled.
     wall_seconds: float
 
 
@@ -60,12 +60,12 @@ def run_drag(
     can change direction or targets over time; it receives read-only full-system
     coordinates and returns offsets in the selected-index order. An offset is
     converted to a force by the existing ``const_k`` scale. No coordinates are
-    overwritten, and each force is capped at the configured per-atom limit.
+    overwritten. Forces are uncapped unless a limit is explicitly configured.
 
     The system must be stopped, with ``nsteps_per_frame=1`` and no open recorder.
     This function owns the stepping loop and uses the system's configured
     trajectory/CSV outputs. ML/MM corrections are refreshed at every step.
-    Forces and recorders are released on completion, recovery failure, callback
+    Forces and recorders are released on completion, integration failure, callback
     error or interruption. This is a synchronous Python API, not a Qt callback
     and not a physical mouse event.
     """
@@ -93,7 +93,6 @@ def run_drag(
     simulation = system.simulation
     start_step = simulation.currentStep
     start_time = simulation.context.getState().getTime().value_in_unit(unit.picosecond)
-    recoveries = system._recovery_count
     applied = skipped = 0
     started = time.monotonic()
     try:
@@ -122,7 +121,7 @@ def run_drag(
             system.apply_mlmm_if_present()
             alive, _ = system.advance_openmm()
             if not alive:
-                raise RuntimeError(f"MD recovery failed at step {simulation.currentStep}")
+                raise RuntimeError(f"MD stopped at step {simulation.currentStep}")
             if frame < drag_steps and np.any(system._last_pull_forces):
                 applied += 1
     finally:
@@ -140,6 +139,6 @@ def run_drag(
         release_steps=release_steps,
         applied_frames=applied,
         skipped_frames=skipped,
-        recovery_frames=system._recovery_count - recoveries,
+        recovery_frames=0,
         wall_seconds=time.monotonic() - started,
     )

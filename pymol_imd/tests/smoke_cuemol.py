@@ -26,7 +26,7 @@ from pymol_imd.cuemol.bridge import (
     target_forces,
 )
 from pymol_imd.cuemol.cdp import CDPError, WebSocket, _local_url, _NoRedirects
-from pymol_imd.cuemol.launch import close_launched_app, launch
+from pymol_imd.cuemol.launch import close_launched_app, default_app, launch
 from pymol_imd.protocol import IMDHeaderType
 
 
@@ -303,7 +303,7 @@ def _test_loop_cleanup(root):
     ]
     client = _Client()
     bridge = _Bridge(client, script)
-    runner = CueMolIMD(bridge, client, frame_interval_ms=1)
+    runner = CueMolIMD(bridge, client, max_force_kj=5000, frame_interval_ms=1)
     with contextlib.redirect_stdout(io.StringIO()):
         stats = runner.run(evidence=root / "loop.json")
     assert stats["nonzero_force_packets"] == 3 and stats["force_cap_clamps"] == 1
@@ -334,6 +334,25 @@ def _test_loop_cleanup(root):
     with contextlib.redirect_stdout(io.StringIO()):
         _raises(OSError, lambda: CueMolIMD(bridge, client).run(evidence=output))
     assert client.closed and bridge.closed
+
+
+def _test_live_force_caps():
+    target = {"index": 0, "position": [100, 0, 0]}
+    for override in (None, 7500):
+        script = [
+            {
+                "controls": [f"drag-level:{level}"],
+                "events": [{"type": "down", "target": target}],
+            }
+            for level in ("atom", "residue", "chain")
+        ]
+        client = _Client()
+        bridge = _Bridge(client, script + [{"controls": ["disconnect"]}])
+        runner = CueMolIMD(bridge, client, max_force_kj=override, frame_interval_ms=1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            runner.run()
+        applied = [forces[0, 0] * 10 for indices, forces in client.forces if len(indices)]
+        np.testing.assert_allclose(applied, [500000] * 3 if override is None else [override] * 3)
 
 
 def _test_live_drag_level(root):
@@ -403,6 +422,87 @@ def _test_live_drag_level(root):
     assert not client.forces[-1][0].size and client.closed and bridge.closed
 
 
+def _test_platform_defaults(root):
+    with (
+        patch("pymol_imd.cuemol.launch.sys.platform", "darwin"),
+        patch("pymol_imd.cuemol.launch.shutil.which") as which,
+    ):
+        assert default_app() == Path("/Applications/CueMol3.app")
+        which.assert_not_called()
+    for platform, names in (
+        ("linux", ("cuemol3", "CueMol3")),
+        ("win32", ("CueMol3.exe", "cuemol3.exe")),
+    ):
+        for name in names:
+            executable = root / name
+            with (
+                patch("pymol_imd.cuemol.launch.sys.platform", platform),
+                patch(
+                    "pymol_imd.cuemol.launch.shutil.which",
+                    side_effect={name: str(executable)}.get,
+                ),
+            ):
+                assert default_app() == executable
+        with (
+            patch("pymol_imd.cuemol.launch.sys.platform", platform),
+            patch("pymol_imd.cuemol.launch.shutil.which", return_value=None),
+            patch.dict("pymol_imd.cuemol.launch.os.environ", {}, clear=True),
+        ):
+            _raises(FileNotFoundError, default_app)
+    for variable, suffix in (
+        ("ProgramFiles", Path("CueMol3")),
+        ("ProgramFiles(x86)", Path("CueMol3")),
+        ("LOCALAPPDATA", Path("Programs") / "CueMol3"),
+    ):
+        directory = root / variable
+        executable = directory / suffix / "CueMol3.exe"
+        executable.parent.mkdir(parents=True)
+        executable.touch()
+        with (
+            patch("pymol_imd.cuemol.launch.sys.platform", "win32"),
+            patch("pymol_imd.cuemol.launch.shutil.which", return_value=None),
+            patch.dict(
+                "pymol_imd.cuemol.launch.os.environ", {variable: str(directory)}, clear=True
+            ),
+        ):
+            assert default_app() == executable
+
+
+def _test_cli_app_selection(root):
+    prepared = root / "prepared.pdb"
+    endpoint = "http://127.0.0.1:9000"
+    app = root / "custom-app"
+    process = Mock()
+    process.pid = 123
+    process.wait.return_value = 0
+    for argv, expected_app, launches in (
+        (["launch"], None, True),
+        (["launch", "--app", str(app)], app, True),
+        (["connect", str(prepared)], None, True),
+        (["connect", str(prepared), "--app", str(app)], app, True),
+        (["connect", str(prepared), "--endpoint", endpoint], None, False),
+    ):
+        with (
+            patch("pymol_imd.cuemol.__main__.launch", return_value=(process, endpoint)) as start,
+            patch("pymol_imd.cuemol.__main__.close_launched_app") as close,
+            patch("pymol_imd.cuemol.__main__.CueMolBridge") as bridge,
+            patch("pymol_imd.cuemol.__main__.IMDClient"),
+            patch("pymol_imd.cuemol.__main__.CueMolIMD") as runner,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            runner.return_value.run.return_value = {"frames": 1}
+            assert main([*argv, "--output-dir", str(root / "cli-runs")]) == 0
+            if launches:
+                assert start.call_count == 1 and start.call_args.args[0] == expected_app
+                close.assert_called_once_with(process, endpoint)
+            else:
+                start.assert_not_called()
+                close.assert_not_called()
+            if argv[0] == "connect":
+                assert bridge.call_args.args[:2] == (endpoint, prepared)
+                bridge.return_value.close.assert_called_once()
+
+
 def _test_launcher(root):
     app = root / "CueMol3.app"
     contents = app / "Contents"
@@ -419,9 +519,11 @@ def _test_launcher(root):
 
     with (
         patch("pymol_imd.cuemol.launch.sys.platform", "darwin"),
+        patch("pymol_imd.cuemol.launch.default_app", return_value=app) as resolve_default,
         patch("pymol_imd.cuemol.launch.subprocess.Popen", side_effect=started) as popen,
     ):
-        child, endpoint = launch(app, profile, root / "app.log")
+        child, endpoint = launch(None, profile, root / "app.log")
+    resolve_default.assert_called_once_with()
     assert child is process and endpoint == "http://127.0.0.1:9000"
     argv = popen.call_args.args[0]
     assert argv[:5] == ["open", "-n", "-W", "-a", str(app.resolve())]
@@ -486,7 +588,10 @@ def main_test():
         _test_mapping_and_forces(root)
         _test_websocket()
         _test_loop_cleanup(root)
+        _test_live_force_caps()
         _test_live_drag_level(root)
+        _test_platform_defaults(root)
+        _test_cli_app_selection(root)
         _test_launcher(root)
         _test_cold_attach(root)
     print(

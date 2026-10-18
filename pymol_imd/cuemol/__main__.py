@@ -23,7 +23,9 @@ def _parser() -> argparse.ArgumentParser:
         "launch", help="Launch an installed CueMol3 with a separate profile"
     )
     launch_parser.add_argument(
-        "--app", type=Path, required=True, help="Installed app bundle or executable"
+        "--app",
+        type=Path,
+        help="Installed app bundle or executable (default: platform installation)",
     )
     connect_parser = commands.add_parser(
         "connect", help="Display the server's prepared PDB and stream IMDv3"
@@ -31,14 +33,20 @@ def _parser() -> argparse.ArgumentParser:
     connect_parser.add_argument(
         "prepared", type=Path, help="The exact prepared= PDB printed by IMD_READY"
     )
-    source = connect_parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--app", type=Path, help="Launch this installed app bundle or executable")
+    source = connect_parser.add_mutually_exclusive_group()
+    source.add_argument(
+        "--app",
+        type=Path,
+        help="Installed app bundle or executable (default: platform installation)",
+    )
     source.add_argument("--endpoint", help="Existing CueMol loopback HTTP debug endpoint")
     connect_parser.add_argument("--host", default=constants.IMD_DEFAULT_HOST)
     connect_parser.add_argument("--port", type=int, default=constants.IMD_DEFAULT_PORT)
     connect_parser.add_argument("--const-k", type=float, default=constants.AA_RECOMMENDED_CONST_K)
     connect_parser.add_argument(
-        "--max-force-kj", type=float, default=constants.DEFAULT_MAX_FORCE_KJ
+        "--max-force-kj",
+        type=float,
+        help="Optional per-atom pull cap (kJ/mol/nm). Default: no cap.",
     )
     connect_parser.add_argument(
         "--drag-level",
@@ -78,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     bridge = None
     try:
         endpoint = getattr(args, "endpoint", None)
-        if args.app:
+        if endpoint is None:
             process, endpoint = launch(args.app, run_dir / "profile", run_dir / "app.log")
             metadata = {"endpoint": endpoint, "launcher_pid": process.pid}
             (run_dir / "launch.json").write_text(json.dumps(metadata, indent=2) + "\n")

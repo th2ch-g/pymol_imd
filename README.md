@@ -9,8 +9,23 @@ adapter. Drag atoms in the viewer while OpenMM advances the simulation.
 | `cg` | Martini 3 | Coarse-grained proteins; 20 fs timestep |
 | `mlmm` | Amber MM + an ONIOM MLIP correction | A selected region treated with AIMNet2, MACE, ORB or UMA |
 
-[Install](#install) · [PyMOL](#pymol) · [CueMol3](#cuemol3-experimental) ·
+[Videos](#videos) · [Install](#install) · [PyMOL](#pymol) · [CueMol3](#cuemol3-experimental) ·
 [Pull settings](#pull-settings)
+
+## Videos
+
+Click a preview to open its MP4. Each clip is 14 seconds, 960 × 540 at 20 fps;
+the six videos total about 6.5 MB.
+
+| Recorded motion | PyMOL | CueMol3 |
+|---|---|---|
+| **AA:** partial QBP opening | [![Play AA in PyMOL](examples/pymol_aa.jpg)](examples/pymol_aa.mp4) | [![Play AA in CueMol3](examples/cuemol_aa.jpg)](examples/cuemol_aa.mp4) |
+| **CG:** transient QBP opening and return | [![Play CG in PyMOL](examples/pymol_cg.jpg)](examples/pymol_cg.mp4) | [![Play CG in CueMol3](examples/cuemol_cg.jpg)](examples/cuemol_cg.mp4) |
+| **ML/MM:** driven chorismate rearrangement | [![Play ML/MM in PyMOL](examples/pymol_mlmm.jpg)](examples/pymol_mlmm.mp4) | [![Play ML/MM in CueMol3](examples/cuemol_mlmm.jpg)](examples/cuemol_mlmm.mp4) |
+
+Both columns replay the same verified physical-mouse trajectories recorded in
+PyMOL, rendered independently by each viewer. They are trajectory movies, with
+MD time shown on screen. See [conditions and interpretation](examples/README.md#videos).
 
 ## Install
 
@@ -73,12 +88,18 @@ pixi run pymol_imd serve input.pdb --level aa --minimize --port 8888
 
 **2. Connect the viewer in another terminal:** use the **exact prepared PDB**
 printed as `prepared=...` in the server's `IMD_READY` line. Replace the example
-paths with that file and the installed app bundle (macOS) or executable (Linux).
+path with that file.
 
 ```bash
-pixi run cuemol connect path/to/prepared.pdb \
-    --app path/to/CueMol3.app --port 8888
+pixi run cuemol connect path/to/prepared.pdb --port 8888
 ```
+
+The app defaults to `/Applications/CueMol3.app` on macOS. On Linux, the adapter
+looks for `cuemol3` or `CueMol3` on `PATH`; on Windows, it looks for `CueMol3.exe`
+or `cuemol3.exe` on `PATH`, then checks Program Files and the per-user Programs
+directory. Use `--app` to select another installation, or `--endpoint` to
+attach to an existing CueMol3 debug instance. `pixi run cuemol launch` uses the
+same defaults. The simulation environment on Windows still requires WSL2.
 
 | Action | Upper-right IMD panel |
 |---|---|
@@ -87,7 +108,7 @@ pixi run cuemol connect path/to/prepared.pdb \
 | Pull a residue or chain | Choose **Drag level**; changing it releases the current pull |
 | Move the camera | Turn pulling off for left-drag rotation; right/middle buttons, modifiers and wheel remain available |
 | Pause / resume | **Pause / Resume**, which also releases active pulls |
-| End the session | **Disconnect**; a viewer started with `connect --app` closes with its client |
+| End the session | **Disconnect**; a viewer started by `connect` closes with its client |
 
 Stop the engine with **Ctrl+C** in its terminal.
 
@@ -104,30 +125,23 @@ peptide (33 atoms). Other versions and larger systems remain unverified.
 
 ## Pull settings
 
-Excessive finite forces keep their direction and are **capped per atom**.
-The default cap is **5,000 kJ/mol/nm**. Change it at startup with
-`--max-force-kj`, or during a local PyMOL run with `imd_change`:
-
-```bash
-pixi run pymol_imd local input.pdb --level aa --minimize --max-force-kj 2500
-```
-
-For socket connections, set `--max-force-kj` on both the engine and client;
-the smaller cap takes effect. CueMol's panel shows **(capped)** when the client
-limits a pull. `--const-k` controls the force response to mouse displacement.
+Drag forces are **uncapped by default** for atom, residue and chain modes in
+both viewers. `--const-k` controls the force response to mouse displacement.
+An optional per-atom cap can be set with `--max-force-kj` or local PyMOL's
+`imd_change`; explicit caps preserve force direction. Socket engines and
+clients apply a cap only when explicitly configured.
 
 Residue and chain pulls distribute the group's total force in proportion to
 particle mass, giving light and heavy atoms the same pull acceleration.
-When a group reaches the cap, all its forces scale together. Atom mode is
-unchanged.
+When an explicit group cap is reached, all its forces scale together.
 Use the current server's prepared PDB with the `connect` CLI so socket viewers
 receive the actual particle masses, including Martini beads.
 
-Invalid MD frames are rolled back and retried without pulling, then with zero
-velocities; successful recovery keeps MD running. Rejected frames are excluded
-from recordings, including states with unconverged OpenMM distance constraints.
-Recovery changes trajectory sampling. Sustained pulling may still distort the
-structure before an energy limit is reached.
+MD advances without automatic rollback, velocity resets or retries. There is
+no default finite-energy cutoff. Numerical failures, including non-finite
+states, unconverged OpenMM distance constraints and invalid ML/MM forces, stop
+the run with an error and close the recordings. Failed frames are not written.
+`--energy-cutoff-kj` enables an optional energy limit that stops MD when exceeded.
 
 ## Simulation defaults and output
 

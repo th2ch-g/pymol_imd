@@ -980,6 +980,7 @@ def imd_drag_level(level: str = constants.DEFAULT_DRAG_LEVEL) -> None:
     each pull to the whole residue / chain of the dragged atoms. PyMOL's editing
     drag only moves a covalent fragment and ignores ``mouse_selection_mode``, so
     the expansion is done plugin-side rather than via a PyMOL setting.
+    Force caps are optional and stay fixed when the level changes.
     """
     try:
         level = _validate_drag_level(level)
@@ -1049,7 +1050,8 @@ def imd_connect(
         omitted, ``const_k`` defaults to the per-backend recommendation (CG
         10000, AA / ML-MM 50000 — CG is auto-detected from the ``BB`` bead
         naming) so the pull feels identical to the same-process ``imd_setup_*``
-        path; ``max_force_kj`` defaults to the global cap. The force is computed
+        path; an unspecified ``max_force_kj`` leaves forces uncapped.
+        An explicit cap stays fixed. The force is computed
         entirely client-side; the headless engine receives those force vectors,
         so set the sensitivity here.
     """
@@ -1125,13 +1127,13 @@ def imd_connect(
     )
     try:
         ck = _as_float(const_k) if const_k is not None else default_const_k
-        mf = _as_float(max_force_kj) if max_force_kj is not None else constants.DEFAULT_MAX_FORCE_KJ
+        mf = _as_float(max_force_kj) if max_force_kj is not None else None
         fi = (
             _as_int(frame_interval_ms)
             if frame_interval_ms is not None
             else constants.IMD_CLIENT_FRAME_INTERVAL_MS
         )
-        if ck < 0.0 or mf <= 0.0 or fi <= 0:
+        if ck < 0.0 or (mf is not None and mf <= 0.0) or fi <= 0:
             raise ValueError("const_k must be >= 0; max_force_kj and frame_interval_ms must be > 0")
     except ValueError as exc:
         print(f"imd_connect: {exc}")

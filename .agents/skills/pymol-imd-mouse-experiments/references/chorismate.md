@@ -58,7 +58,8 @@ A useful paired input selects `C16+C1` and pulls toward C3, then selects
 screen directions and coordinates from the current camera and screenshot.
 Record both gestures for the shared MD step and verify all four force rows.
 A native rotation of `C16+O11` can also move the two reaction coordinates.
-Keep the force cap unchanged and reduce a gesture if the whole frame is rejected.
+Keep any explicitly configured force cap unchanged. Reduce a gesture if it
+causes a numerical failure, and record the failed attempt separately.
 
 This diagnostic procedure uses the current internal timer and driver. Do not
 call `run_drag`, supply synthetic offsets, or assign molecular coordinates in

@@ -8,12 +8,46 @@ an ignored directory such as `.pixi/cua/`, outside `tests/`.
 For code-driven experiments, follow the
 [scripted molecular protocols](../.agents/skills/pymol-imd-mouse-experiments/references/scripted.md).
 
+## Videos
+
+The six MP4s replay verified trajectories from physical mouse experiments in
+PyMOL. Each trajectory is rendered independently with PyMOL and CueMol3; the
+CueMol3 clips do not represent a separate CueMol mouse experiment. They are
+14-second, silent H.264 videos at 960 × 540 and 20 fps. The displayed MD clock
+gives the simulation time; playback is resampled without coordinate interpolation.
+
+| Level | PyMOL | CueMol3 | Observed result |
+|---|---|---|---|
+| AA | [MP4](pymol_aa.mp4) | [MP4](cuemol_aa.mp4) | QBP partial opening: heavy-atom domain distance 25.04 → 30.10 Å; open-reference RMSD 5.27 → 3.77 Å |
+| CG | [MP4](pymol_cg.mp4) | [MP4](cuemol_cg.mp4) | QBP transient opening and return: BB-centroid distance approximately 24.4 → 29.3 → 24.5 Å |
+| ML/MM | [MP4](pymol_mlmm.mp4) | [MP4](cuemol_mlmm.mp4) | Driven chorismate-to-prephenate-like conversion; product connectivity persists through all 2,000 unforced release frames |
+
+AA uses Amber/GBn2 at 2 fs and shows 0–21.694 ps. CG uses Martini 3 at 20 fs
+with its elastic network retained and shows 136–146 ps of the recorded run.
+The domains are fitted on domain A for display; the protein folds remain
+substantially preserved. The CG distance is a BB proxy and its opening is
+transient, rather than a persistent open-state transition.
+
+The enzyme run uses AIMNet2/Amber ONIOM with GBn2, 160 ML atoms and 12 link H,
+ML charge 0 and multiplicity 1, and a 0.5 fs step. Its 126 physical gestures
+were consumed by 85 manually advanced MD steps, followed by 2,000 unforced
+steps (1 ps). All six formal Claisen bond changes and the product's connectivity
+and stereochemistry were checked using coordinate-based RDKit inference.
+The movie updates displayed ligand bonds from that inference; it is not an
+electronic bond-order or spontaneous-catalysis calculation. The initial and
+final C1–O11/C3–C16 distances distinguish bond breaking from bond formation.
+
+All three recordings used a 300 K target and an explicit 5,000 kJ/mol/nm pull
+cap, with no automatic recovery in the shown runs. The current plugin's default
+is uncapped. Raw trajectories, analysis and intermediate frames stay in ignored
+work directories; the MP4s and their JPEG previews are the published artifacts.
+
 ## QBP
 
 `qbp.pdb` is the 226-residue mature sequence specified by the
 [RGI input](https://github.com/cddlab/rgi_toolkit/blob/main/examples/distance/alphafold3/qbp_25.00.json).
 It comes from AlphaFold DB P0AEQ3 model v6 with the 22-residue signal peptide
-removed and residues renumbered from 1. `qbp.fasta` records that exact sequence.
+removed and residues renumbered from 1.
 This is a closed-like prediction with no ligand or water.
 
 `qbp_open_reference.pdb` (1GGG) and `qbp_closed_reference.pdb` (1WDN) contain
@@ -65,5 +99,3 @@ rearrangement. PyMOL's initial bond table does not update automatically.
 An externally driven product-like geometry does not establish an enzymatic
 mechanism, transition state, barrier, or spontaneous catalysis. Do not count
 automated distance restraints as a successful physical mouse experiment.
-
-Source URLs, processing details and file checksums are in `sources.json`.

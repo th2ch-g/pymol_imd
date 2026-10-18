@@ -105,9 +105,11 @@ class _DeferredReporter:
         self.pending.append((self.reporter, simulation.currentStep, state))
 
 
-def cap_pull_forces(forces: np.ndarray, max_force_kj: float) -> tuple[np.ndarray, int]:
-    """Limit finite force vectors per atom, preserving their directions."""
+def cap_pull_forces(forces: np.ndarray, max_force_kj: float | None) -> tuple[np.ndarray, int]:
+    """Apply an optional per-atom cap, preserving force directions."""
     bounded = np.array(forces, dtype=float, copy=True)
+    if max_force_kj is None:
+        return bounded, 0
     largest = np.max(np.abs(bounded), axis=1)
     nonzero = np.flatnonzero(largest)
     scaled = bounded[nonzero] / largest[nonzero, None]
@@ -121,7 +123,7 @@ def cap_pull_forces(forces: np.ndarray, max_force_kj: float) -> tuple[np.ndarray
 def compute_pull_forces(
     delta_nm: np.ndarray,
     const_k: float,
-    max_force_kj: float,
+    max_force_kj: float | None,
     noise_nm: float,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Turn a per-atom position delta (nm) into pull forces (kJ/mol/nm).
@@ -131,7 +133,7 @@ def compute_pull_forces(
     (:mod:`pymol_imd.client`) so dragging feels numerically identical in both.
     Pure / side-effect free.
 
-    Each force is capped at ``max_force_kj`` without changing its direction.
+    ``max_force_kj=None`` leaves finite forces uncapped.
     Non-finite input releases the entire pull frame.
 
     Parameters
@@ -171,7 +173,7 @@ def expand_group_forces(
     forces: np.ndarray,
     group_of: np.ndarray,
     masses: np.ndarray,
-    max_force_kj: float,
+    max_force_kj: float | None,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Distribute each group's old total force in proportion to particle mass.
 
@@ -214,11 +216,9 @@ class IMDConfig:
     # configurational sampling and a wider stability window under external
     # forcing, so AA backends default to it; CG/MLMM keep "langevin" for now.
     integrator: str = constants.DEFAULT_INTEGRATOR
-    # Per-atom magnitude cap; excessive pulls retain their direction at this limit.
-    max_force_kj: float = constants.DEFAULT_MAX_FORCE_KJ
-    # If |potential energy| or kinetic energy exceeds this (kJ/mol), the simulation is treated
-    # as diverged and retried. Stop only when bounded recovery fails.
-    energy_cutoff_kj: float = constants.DEFAULT_ENERGY_CUTOFF_KJ
+    # Optional limits in kJ/mol/nm and kJ/mol. None disables each limit.
+    max_force_kj: float | None = constants.DEFAULT_MAX_FORCE_KJ
+    energy_cutoff_kj: float | None = constants.DEFAULT_ENERGY_CUTOFF_KJ
     # QTimer tick interval (ms) for both the production and minimize loops.
     # Read at timer start(); changing it mid-run needs a stop/run cycle.
     frame_interval_ms: int = constants.DEFAULT_FRAME_INTERVAL_MS
@@ -256,9 +256,10 @@ class IMDConfig:
             "temperature",
             "pressure",
             "timestep_ps",
-            "max_force_kj",
-            "energy_cutoff_kj",
         )
+        for name in ("max_force_kj", "energy_cutoff_kj"):
+            if getattr(self, name) is not None:
+                positive_float_fields += (name,)
         nonnegative_float_fields = ("friction", "const_k")
         for name in (*positive_float_fields, *nonnegative_float_fields):
             value = getattr(self, name)
@@ -371,7 +372,6 @@ class IMDSystem:
         # once on the rising edge, reset on the falling edge, so a sustained
         # over-limit drag doesn't flood the console (the QTimer ticks every few ms).
         self._force_exceeded_prev: bool = False
-        self._recovery_count: int = 0
 
         # --- recording state (production run only; never during minimize) ---
         # set_recording() (imd_record) stores the pending config here;
@@ -401,7 +401,6 @@ class IMDSystem:
         # CSV writer reads it without recomputing.
         self._last_pull_active_idx: np.ndarray = np.empty(0, dtype=int)
         self._last_pull_forces: np.ndarray = np.empty((0, 3), dtype=float)
-        self._pull_recovery_latched = False
         self._pull_rejected_prev = False
 
         # Tier-1 lossless ML/MM caches: per-frame-invariant index arrays / maps
@@ -608,18 +607,8 @@ class IMDSystem:
     def _step_and_get_state(
         self, *, get_positions=False, get_velocities=False, get_forces=False
     ) -> tuple[bool, openmm.State]:
-        """Commit a stable frame, or restore and retry without the user's pull.
-
-        Checkpoints preserve the clock, box, velocities and RNG state. Reports
-        remain buffered across each attempt so discarded steps cannot enter a
-        trajectory or CSV. The second retry starts with zero velocities; the
-        Langevin thermostat restores thermal motion without changing the step
-        size or the frame's physical duration.
-        """
+        """Advance once without rollback, velocity resets, or automatic retries."""
         simulation = self.simulation
-        context = simulation.context
-        checkpoint = context.createCheckpoint()
-        block_pull = self._pull_recovery_latched or bool(self._active_pull_idx_prev)
         reporters = simulation.reporters
         pending: list = []
         simulation.reporters = [_DeferredReporter(reporter, pending) for reporter in reporters]
@@ -631,75 +620,27 @@ class IMDSystem:
             getVelocities=get_velocities,
             getForces=get_forces,
         )
-        accepted = False
-        reason = ""
         try:
-            for attempt in range(constants.ENERGY_RECOVERY_RETRIES + 1):
-                pending.clear()
-                try:
-                    simulation.step(self.config.nsteps_per_frame)
-                    state = self._final_frame_state(pending, state_kwargs)
-                    invalid_report = any(self._invalid_state(report) for _, _, report in pending)
-                    if not self._invalid_state(state) and not invalid_report:
-                        if self._mlmm_force is not None:
-                            positions = state.getPositions(asNumpy=True).value_in_unit(
-                                unit.nanometer
-                            )
-                            box = (
-                                state.getPeriodicBoxVectors(asNumpy=True)
-                                if self.bundle.pbc
-                                else None
-                            )
-                            try:
-                                self._apply_mlmm_correction_force(np.asarray(positions), box)
-                            except (RuntimeError, ValueError) as exc:
-                                raise FloatingPointError(f"ML/MM evaluation failed: {exc}") from exc
-                        accepted = True
-                        break
-                    reason = (
-                        "non-finite state, excessive energy, or unsatisfied distance constraints"
+            simulation.step(self.config.nsteps_per_frame)
+            state = self._final_frame_state(pending, state_kwargs)
+            for sample in (state, *(report for _, _, report in pending if report is not state)):
+                error = self._state_error(sample)
+                if error is not None:
+                    raise FloatingPointError(
+                        f"MD stopped at step {simulation.currentStep}: {error}"
                     )
-                except (openmm.OpenMMException, FloatingPointError) as exc:
-                    reason = str(exc)
-                context.loadCheckpoint(checkpoint)
-                self._mlmm_cached_positions = None
-                self.clear_pull_forces()
-                self._pull_recovery_latched = block_pull
-                self._pull_force.updateParametersInContext(context)
-                self.apply_mlmm_if_present()
-                if attempt == constants.ENERGY_RECOVERY_RETRIES:
-                    break
-                if attempt:
-                    context.setVelocities(
-                        np.zeros((self.n_atoms, 3)) * unit.nanometer / unit.picosecond
-                    )
-                logger.warning(
-                    "Unstable MD frame (%s); restored step %d, released pull forces, "
-                    "retry %d/%d%s.",
-                    reason,
-                    simulation.currentStep,
-                    attempt + 1,
-                    constants.ENERGY_RECOVERY_RETRIES,
-                    " with zero velocities" if attempt else "",
-                )
-        finally:
+            if self._mlmm_force is not None:
+                positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+                box = state.getPeriodicBoxVectors(asNumpy=True) if self.bundle.pbc else None
+                self._apply_mlmm_correction_force(np.asarray(positions), box)
+        except BaseException:
             simulation.reporters = reporters
-        if not accepted:
             self.running = False
-            logger.error(
-                "MD recovery failed after %d retries (%s). Restored step %d and stopped; "
-                "lower const_k / max_force_kj or shorten timestep_ps.",
-                constants.ENERGY_RECOVERY_RETRIES,
-                reason,
-                simulation.currentStep,
-            )
-            return False, context.getState(**state_kwargs)
-        if attempt:
-            self._recovery_count += 1
-            logger.warning(
-                "MD recovered at step %d; continuing without the rejected pull.",
-                simulation.currentStep,
-            )
+            with contextlib.suppress(Exception):
+                self.clear_pull_forces()
+            self.stop_recording()
+            raise
+        simulation.reporters = reporters
         final_step = simulation.currentStep
         try:
             for reporter, step, report in pending:
@@ -728,22 +669,24 @@ class IMDSystem:
                 return state
         return self.simulation.context.getState(**state_kwargs)
 
-    def _invalid_state(self, state) -> bool:
-        """Check available state fields without mutating the driver or logs."""
+    def _state_error(self, state) -> str | None:
+        """Describe numerical errors and explicitly configured energy limits."""
         fields = state.getDataTypes()
         if fields & openmm.State.Energy:
-            if self._diverged(state):
-                return True
+            potential = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
             kinetic = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
-            if not np.isfinite(kinetic) or kinetic > self.config.energy_cutoff_kj:
-                return True
-        for flag, getter in (
-            (openmm.State.Positions, state.getPositions),
-            (openmm.State.Velocities, state.getVelocities),
-            (openmm.State.Forces, state.getForces),
+            if not np.isfinite(potential) or not np.isfinite(kinetic):
+                return "OpenMM returned non-finite energy"
+            limit = self.config.energy_cutoff_kj
+            if limit is not None and (abs(potential) > limit or kinetic > limit):
+                return f"energy exceeded the configured energy_cutoff_kj={limit:g}"
+        for flag, name, getter in (
+            (openmm.State.Positions, "positions", state.getPositions),
+            (openmm.State.Velocities, "velocities", state.getVelocities),
+            (openmm.State.Forces, "forces", state.getForces),
         ):
             if fields & flag and not np.isfinite(getter(asNumpy=True)._value).all():
-                return True
+                return f"OpenMM returned non-finite {name}"
         if fields & openmm.State.Positions and len(self._constraint_pairs):
             positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
             pairs = positions[self._constraint_pairs]
@@ -759,9 +702,20 @@ class IMDSystem:
                 * self._constraint_lengths_nm
                 + roundoff
             )
-            if np.any(np.abs(distances - self._constraint_lengths_nm) > tolerance):
-                return True
-        return False
+            errors = np.abs(distances - self._constraint_lengths_nm)
+            invalid = np.flatnonzero(errors > tolerance)
+            if invalid.size:
+                worst = invalid[np.argmax(errors[invalid] / tolerance[invalid])]
+                first, second = self._constraint_pairs[worst]
+                return (
+                    f"OpenMM distance constraint did not converge for atoms {first}, {second}: "
+                    f"distance {distances[worst]:.6g} nm, "
+                    f"required {self._constraint_lengths_nm[worst]:.6g} nm"
+                )
+        return None
+
+    def _invalid_state(self, state) -> bool:
+        return self._state_error(state) is not None
 
     def _init_mlmm_cache(self) -> None:
         """Precompute per-frame-invariant ML/MM data once (Tier-1 lossless).
@@ -1026,12 +980,14 @@ class IMDSystem:
         return f_q, f_m
 
     def _diverged(self, state=None) -> bool:
-        """Detect invalid potential energy without stopping before recovery."""
+        """Check potential energy against finiteness and the optional cutoff."""
         if state is None:
             state = self.simulation.context.getState(getEnergy=True)
         energy = state.getPotentialEnergy()
         u_kj = energy.value_in_unit(unit.kilojoule_per_mole)
-        return not (np.isfinite(u_kj) and abs(u_kj) <= self.config.energy_cutoff_kj)
+        return not np.isfinite(u_kj) or (
+            self.config.energy_cutoff_kj is not None and abs(u_kj) > self.config.energy_cutoff_kj
+        )
 
     def minimize_step(
         self,
@@ -1460,7 +1416,7 @@ class IMDSystem:
             # |F| the user requested — for the debug log only.
             requested = np.linalg.norm(delta[active_idx] * self.config.const_k, axis=1)
             logger.debug(
-                "pull: %d atoms dragged, |F|max requested=%.1f / limit=%.1f kJ/mol/nm",
+                "pull: %d atoms dragged, |F|max requested=%.1f kJ/mol/nm, limit=%s",
                 int(active_idx.size),
                 float(np.max(requested)),
                 self.config.max_force_kj,
@@ -1481,14 +1437,12 @@ class IMDSystem:
             raise ValueError("Pull forces must have shape (n_atoms, 3)")
         if active_idx.ndim != 1 or np.any((active_idx < 0) | (active_idx >= self.n_atoms)):
             raise ValueError("Pull atom indices must be a one-dimensional array in range")
-        if not active_idx.size:
-            self._pull_recovery_latched = False
         requested = forces[active_idx]
         rejected = not np.isfinite(requested).all()
         if rejected and not self._pull_rejected_prev:
             logger.warning("Non-finite pull force; released the entire pull frame")
         self._pull_rejected_prev = rejected
-        if rejected or self._pull_recovery_latched:
+        if rejected:
             active_idx = np.empty(0, dtype=int)
             forces = np.zeros((self.n_atoms, 3), dtype=float)
         elif active_idx.size:

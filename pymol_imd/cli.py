@@ -92,12 +92,7 @@ def _build_parser(mode: str = "launch") -> argparse.ArgumentParser:
         "--max-force-kj",
         type=float,
         metavar="F",
-        help=(
-            "Per-atom safety limit on the pulling force magnitude (kJ/mol/nm); "
-            "excessive pulls retain their direction at this magnitude. "
-            f"Default {constants.DEFAULT_MAX_FORCE_KJ:g}. "
-            "Lower to make divergence-on-strong-drag harder."
-        ),
+        help="Optional per-atom pull cap (kJ/mol/nm), preserving direction. Default: no cap.",
     )
     common.add_argument(
         "--integrator",
@@ -141,11 +136,8 @@ def _build_parser(mode: str = "launch") -> argparse.ArgumentParser:
         "--energy-cutoff-kj",
         type=float,
         metavar="E",
-        help=(
-            "|potential energy| above this (kJ/mol) triggers rollback and recovery; "
-            "the loop stops only if recovery fails. "
-            f"Default {constants.DEFAULT_ENERGY_CUTOFF_KJ:g}."
-        ),
+        help="Optional |potential energy| / kinetic energy cutoff (kJ/mol). "
+        "Exceeding it stops MD without recovery. Default: no cutoff.",
     )
     if mode != "serve":
         common.add_argument(
@@ -645,7 +637,13 @@ def _build_connect_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=constants.IMD_DEFAULT_PORT, metavar="PORT")
     p.add_argument("--object", default=None, metavar="NAME", help="PyMOL object name.")
     p.add_argument("--const-k", type=float, default=None, metavar="K", help="Drag sensitivity.")
-    p.add_argument("--max-force-kj", type=float, default=None, metavar="F", help="Pull |F| cap.")
+    p.add_argument(
+        "--max-force-kj",
+        type=float,
+        default=None,
+        metavar="F",
+        help="Optional per-atom pull cap (kJ/mol/nm). Default: no cap.",
+    )
     p.add_argument(
         "--frame-interval-ms",
         type=int,

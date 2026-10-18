@@ -26,7 +26,9 @@ log = logging.getLogger("smoke")
 
 def _verify_force_limit(imd, *, label: str) -> None:
     """Confirm an over-limit drag is capped and a sub-limit pull is unchanged."""
-    cap = imd.config.max_force_kj
+    original_cap = imd.config.max_force_kj
+    cap = 5000
+    imd.config.max_force_kj = cap
     over_fmag = 1.0 * imd.config.const_k  # delta=1 nm * const_k
     if over_fmag <= cap:
         log.info(
@@ -72,6 +74,8 @@ def _verify_force_limit(imd, *, label: str) -> None:
             )
     finally:
         imd._read_pymol_positions_nm = original
+        imd.config.max_force_kj = original_cap
+        imd.clear_pull_forces()
     log.info(
         "[%s] force-limit OK: over-limit capped; sub-limit applied -> %.1f kJ/mol/nm",
         label,

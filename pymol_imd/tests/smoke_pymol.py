@@ -369,6 +369,17 @@ def _check_socket_input_consumption() -> None:
     assert len(connection.sent) == 2
     assert connection.sent[0][0].tolist() == [0]
     assert connection.sent[1][0].size == 0, "An old edit was resent while waiting for a frame"
+    viewer._particle_masses = np.array([12.0])
+    viewer._group_ids = {"residue": np.array([0]), "chain": np.array([0])}
+    for override in (None, 7500):
+        viewer.max_force_kj = override
+        for level in ("atom", "residue", "chain"):
+            viewer.drag_level = level
+            viewer._last_server_ang = np.zeros((1, 3))
+            cmd.load_coordset(np.array([[100.0, 0, 0]]), obj, state=1)
+            viewer._send_drag_forces()
+            limit = 100000 if override is None else override
+            np.testing.assert_allclose(connection.sent[-1][1], [[limit / 10, 0, 0]])
     cmd.delete(obj)
 
 

@@ -8,7 +8,7 @@ documented in `examples/README.md`. Test AA and CG sequentially in one viewer.
 
 ```python
 imd_setup_aa('examples/qbp.pdb', work_dir='.pixi/cua/qbp/aa/build',
-             drag_level='atom', nsteps_per_frame=1, frame_interval_ms=16)
+             drag_level='atom', nsteps_per_frame=1)
 # In a separate trial, replace imd_setup_aa with imd_setup_cg.
 imd_minimize()
 ```
@@ -46,7 +46,7 @@ opening direction. Orient the camera so the desired motion lies in the screen
 plane. Verify the first recorded force direction: PyMOL's view matrix convention
 can reverse or transpose an assumed projection. Do not infer opening from screen
 translation alone. Begin with short drags; use existing `imd_change` settings
-to reduce force or steps per frame if the model deforms or repeatedly rolls back.
+to reduce force if the model deforms or integration fails.
 An illustrative gentle AA trial uses `const_k=1000` and one step per frame;
 record any stronger trial separately. A single CUA drag may produce only one
 accepted force frame, so report the actual force duty cycle rather than assuming

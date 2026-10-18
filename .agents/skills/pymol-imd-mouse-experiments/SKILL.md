@@ -7,8 +7,8 @@ description: Run physical mouse-drag experiments for chorismate mutase reactions
 
 Use the versioned inputs in `examples/`. These are manual computer-use
 experiments separate from `pymol_imd/tests/`, with generated evidence under an
-ignored task directory such as `.pixi/cua/`. Read `examples/README.md` and
-`examples/sources.json` before interpreting the models.
+ignored task directory such as `.pixi/cua/`. Read `examples/README.md` before
+interpreting the models.
 
 Read the existing [viewer skill](../pymol-imd-computer-use/SKILL.md) for launch,
 single-window ownership, CUA input, recording and cleanup. Use its macOS helper
@@ -18,8 +18,8 @@ coordinates during a mouse trial.
 
 When the user explicitly requests a code-driven variant, use
 `pymol_imd.scripted.run_drag` as described in the repository README. It holds
-virtual mouse offsets over simulated time through the same force-cap,
-recovery and recording path. Label those outputs as scripted; they do not
+virtual mouse offsets over simulated time through the same force, integration
+and recording path. Label those outputs as scripted; they do not
 satisfy the physical-gesture criterion below. Read the
 [scripted protocols](references/scripted.md) for the molecular selections,
 target schedules and release checks.
@@ -45,10 +45,9 @@ Record gesture coordinates and timing separately from the force CSV. Stop and
 flush recording before concluding that an empty CSV means no force was applied.
 
 Keep a release segment after the final drag. Save XTC plus its matching prepared
-PDB, force/state CSVs, console recovery warnings and the final structure. A
-rollback can discard a genuine mouse attempt from the accepted force CSV;
-report that rejection explicitly. Do not raise the divergence threshold or
-change a model merely to obtain a pass.
+PDB, force/state CSVs, console errors and the final structure. Numerical failures
+stop without automatic recovery, and failed frames are excluded from recordings.
+Report a failed attempt explicitly. Do not change a model merely to obtain a pass.
 
 Assess control drift, reference agreement, local deformation, energy failures
 and persistence after release. Report `observed`, `not observed`, or `invalid

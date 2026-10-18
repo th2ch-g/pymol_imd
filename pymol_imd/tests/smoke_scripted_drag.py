@@ -157,12 +157,17 @@ def check_error_cleanup(root):
     assert len(rows(root / "error/state.csv")) == 2
 
 
-def check_recovery_and_mlmm(root):
-    recovering = make_system(root / "recovery")
-    recovering.config.energy_cutoff_kj = 0.001
-    result = run_drag(recovering, [1], [0.1, 0, 0], duration_ps=0.002)
-    assert result.recovery_frames == 1 and result.applied_frames == 0
-    assert result.end_step == 2 and not rows(root / "recovery/forces.csv")
+def check_failure_and_mlmm(root):
+    failing = make_system(root / "failure")
+    failing.config.energy_cutoff_kj = 0.001
+    try:
+        run_drag(failing, [1], [0.1, 0, 0], duration_ps=0.002)
+    except FloatingPointError as exc:
+        assert "energy_cutoff_kj" in str(exc)
+    else:
+        raise AssertionError("An explicit cutoff must stop without recovery")
+    assert failing.simulation.currentStep == 1 and not rows(root / "failure/forces.csv")
+    assert not failing.running and not failing._recording and not failing._active_pull_idx_prev
 
     driver = make_system(root / "mlmm", mlmm=True)
     calculator = driver.bundle.extra["ml_calculator"]
@@ -171,6 +176,7 @@ def check_recovery_and_mlmm(root):
     result = run_drag(driver, [1], [0.1, 0, 0], duration_ps=0.003, release_ps=0.002)
     assert calculator.calls - calls_before == 6  # Initial state and five accepted proposals.
     assert result.applied_frames == 3
+    assert result.recovery_frames == 0
     force_rows = rows(root / "mlmm/forces.csv")
     assert len(force_rows) == 9
     assert sorted(set(int(r["atom_index"]) for r in force_rows)) == [0, 1, 2]
@@ -220,7 +226,7 @@ def main():
         check_mouse_equivalence(root)
         check_callback_cap_and_release(root)
         check_error_cleanup(root)
-        check_recovery_and_mlmm(root)
+        check_failure_and_mlmm(root)
         check_validation(root)
     print("smoke-scripted-drag: passed")
 

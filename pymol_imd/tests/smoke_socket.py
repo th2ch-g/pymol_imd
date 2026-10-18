@@ -179,6 +179,32 @@ def _wait_for_frame(client, timeout: float = 5.0):
     raise AssertionError("no frame received within timeout")
 
 
+def _test_server_force_caps(root):
+    from pymol_imd import protocol
+    from pymol_imd.protocol import IMDHeaderType
+    from pymol_imd.server import IMDServer
+    from pymol_imd.tests.smoke_recovery import make_system
+
+    for override in (None, 8000):
+        imd = make_system(root / str(override))
+        imd.config.max_force_kj = override
+        server = IMDServer(imd)
+        assert imd.config.max_force_kj == override
+        for requested in (5000, 10000, 20000, 400000):
+            packet = protocol.pack_mdcomm(
+                np.array([0]), np.array([[requested * 0.06, requested * 0.08, 0]]), protocol.NATIVE
+            )
+            server._handle_incoming(IMDHeaderType.MDCOMM, 1, packet[8:])
+            server._apply_pending_forces()
+            limit = requested if override is None else min(requested, override)
+            np.testing.assert_allclose(
+                imd._pull_force.getParticleParameters(0)[1], [0.6 * limit, 0.8 * limit, 0]
+            )
+        imd.clear_pull_forces()
+        imd.stop_recording()
+    log.info("server forces OK: no default cap; explicit server ceilings are retained")
+
+
 def _test_force_freshness(root):
     from pymol_imd import constants, protocol
     from pymol_imd.protocol import IMDHeaderType as T
@@ -186,6 +212,7 @@ def _test_force_freshness(root):
     from pymol_imd.tests.smoke_recovery import make_system
 
     imd = make_system(root)
+    imd.config.max_force_kj = 5000
     server = IMDServer(imd)
     packet = protocol.pack_mdcomm(np.array([0]), np.array([[10.0, 0, 0]]), protocol.NATIVE)
     with patch("pymol_imd.server.time.monotonic", return_value=1.0):
@@ -238,7 +265,6 @@ def _test_force_freshness(root):
             if release_consumed:
                 server._apply_pending_forces()
             imd.clear_pull_forces()
-            imd._pull_recovery_latched = True
             server._handle_incoming(T.MDCOMM, 1, packet[8:])
             server._apply_pending_forces()
             assert imd._active_pull_idx_prev == {0}, "A new gesture did not rearm after release"
@@ -269,10 +295,11 @@ def main(pdb_id: str = "1aki") -> int:
     from pymol_imd.server import IMDServer
 
     with tempfile.TemporaryDirectory() as tmp:
+        _test_server_force_caps(Path(tmp) / "caps")
         _test_force_freshness(Path(tmp) / "freshness")
         pdb = fetch_pdb(pdb_id, out_dir=Path(tmp))
         bundle = AABackend().build_system(pdb)
-        imd = IMDSystem(bundle, IMDConfig(nsteps_per_frame=1, mouse_force=False))
+        imd = IMDSystem(bundle, IMDConfig(nsteps_per_frame=1, mouse_force=False, max_force_kj=5000))
         imd.simulation.minimizeEnergy(maxIterations=200)
         n_atoms = bundle.topology.getNumAtoms()
         log.info("AA system: %d atoms", n_atoms)
@@ -335,7 +362,10 @@ def main(pdb_id: str = "1aki") -> int:
 
         # Server-side safety applies even to a non-PyMOL client that bypasses
         # the client force cap. An over-limit packet applies the server's cap.
-        client.send_forces(np.array([0]), np.array([[1000.0, 0.0, 0.0]]))
+        from pymol_imd import constants
+
+        excessive = 2 * imd.config.max_force_kj * constants.KJ_PER_NM_TO_KJ_PER_ANGSTROM
+        client.send_forces(np.array([0]), np.array([[excessive, 0.0, 0.0]]))
         for _ in range(200):
             client.poll_frame()
             fx0 = float(imd._pull_force.getParticleParameters(0)[1][0])

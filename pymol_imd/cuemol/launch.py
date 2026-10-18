@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shutil
 import subprocess
 import sys
 import time
@@ -12,6 +13,32 @@ from pathlib import Path
 from pymol_imd import constants
 
 from .cdp import CDP, CDPError
+
+
+def default_app() -> Path:
+    """Locate the platform's default CueMol3 installation."""
+    if sys.platform == "darwin":
+        return Path("/Applications/CueMol3.app")
+    names = ("CueMol3.exe", "cuemol3.exe") if sys.platform == "win32" else ("cuemol3", "CueMol3")
+    for name in names:
+        executable = shutil.which(name)
+        if executable is not None:
+            return Path(executable)
+    if sys.platform == "win32":
+        for variable, suffix in (
+            ("ProgramFiles", Path("CueMol3")),
+            ("ProgramFiles(x86)", Path("CueMol3")),
+            ("LOCALAPPDATA", Path("Programs") / "CueMol3"),
+        ):
+            prefix = os.environ.get(variable)
+            if prefix:
+                executable = Path(prefix) / suffix / "CueMol3.exe"
+                if executable.is_file():
+                    return executable
+    raise FileNotFoundError(
+        f"CueMol3 was not found on PATH ({', '.join(names)}) or in a default installation; "
+        "install it or pass --app with its executable path"
+    )
 
 
 def close_launched_app(process: subprocess.Popen, endpoint: str | None) -> None:
@@ -42,20 +69,26 @@ def close_launched_app(process: subprocess.Popen, endpoint: str | None) -> None:
 
 
 def launch(
-    app: Path,
+    app: Path | None,
     profile: Path,
     log_path: Path,
     timeout: float = constants.CUEMOL_LAUNCH_TIMEOUT_S,
 ) -> tuple[subprocess.Popen, str]:
-    app = app.expanduser().resolve()
+    app = (default_app() if app is None else app).expanduser().resolve()
     bundle = None
     if app.suffix == ".app":
+        if not (app / "Contents" / "Info.plist").is_file():
+            raise FileNotFoundError(
+                f"CueMol app bundle not found: {app}; pass --app with its installed path"
+            )
         bundle = app
         with (app / "Contents" / "Info.plist").open("rb") as stream:
             executable = plistlib.load(stream)["CFBundleExecutable"]
         app = app / "Contents" / "MacOS" / executable
     if not app.is_file():
-        raise FileNotFoundError(f"CueMol executable not found: {app}")
+        raise FileNotFoundError(
+            f"CueMol executable not found: {app}; pass --app with its installed path"
+        )
     profile = profile.resolve()
     profile.mkdir(parents=True, exist_ok=True)
     active_port = profile / "DevToolsActivePort"

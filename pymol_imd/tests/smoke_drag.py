@@ -139,6 +139,41 @@ def _check_force_limit() -> None:
     log.info("force-limit OK: per-atom cap preserves directions, sub-limit pulls and boundaries")
 
 
+def _check_level_caps() -> None:
+    from pymol_imd import commands
+
+    imd = _toy_imd_system("atom")
+    previous = commands._imd_system, commands._imd_client, commands._local_loop
+    commands._imd_system, commands._imd_client, commands._local_loop = imd, None, None
+    try:
+        for override in (None, 7500):
+            imd.config.max_force_kj = override
+            for level, count in (
+                ("atom", 1),
+                ("residue", 2),
+                ("chain", 4),
+            ):
+                commands.imd_drag_level(level)
+                commands.imd_change(const_k=10000)
+                assert imd.config.max_force_kj == override
+                assert imd.apply_drag([0], [60, 80, 0]) == count
+                limit = 100000 if override is None else override
+                active = imd._last_pull_active_idx
+                np.testing.assert_allclose(
+                    imd._last_pull_forces[active],
+                    np.tile([0.6 * limit, 0.8 * limit, 0], (count, 1)),
+                )
+                imd.clear_pull_forces()
+        commands.imd_change(max_force_kj=8000, drag_level="residue")
+        commands.imd_drag_level("chain")
+        assert imd.config.max_force_kj == 8000
+    finally:
+        commands._imd_system, commands._imd_client, commands._local_loop = previous
+    log.info(
+        "live forces OK: all levels default to no cap; explicit overrides survive config changes"
+    )
+
+
 def _check_group_indices() -> None:
     imd = _toy_imd_system("atom")
     assert imd._atom_residue_idx.tolist() == [0, 0, 1, 1, 2, 2, 3, 3], imd._atom_residue_idx
@@ -202,6 +237,7 @@ def _check_mass_distribution() -> None:
     from pymol_imd.imd import expand_group_forces
 
     imd = _toy_imd_system("residue")
+    imd.config.max_force_kj = 5000
     imd._particle_masses = np.array([12, 1, 16, 0, 72, 54, 36, 72], dtype=float)
     client = PyMOLIMDClient(None, "unused", const_k=10000, max_force_kj=5000)
     client._particle_masses = imd._particle_masses
@@ -258,6 +294,7 @@ def main() -> int:
     _check_constants()
     _check_validate()
     _check_force_limit()
+    _check_level_caps()
     _check_group_indices()
     _check_expand_single()
     _check_expand_multi()

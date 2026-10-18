@@ -103,7 +103,7 @@ FIXED_LINK_DISTANCE_ANG: dict[str, float] = {
 }
 
 # ---------------------------------------------------------------------------
-# IMD runtime defaults (mirror IMDConfig field defaults; values unchanged)
+# IMD runtime defaults
 # ---------------------------------------------------------------------------
 DEFAULT_TEMPERATURE_K = 300.0  # Langevin thermostat temperature (K)
 DEFAULT_PRESSURE_BAR = 1.0  # MonteCarloBarostat pressure (bar; NPT only)
@@ -113,12 +113,12 @@ DEFAULT_NSTEPS_PER_FRAME = 1  # MD steps advanced per GUI frame
 DEFAULT_CONST_K = 10000.0  # pulling-force scale (kJ/mol/nm^2); backends override
 DEFAULT_MOUSE_FORCE = True  # whether the user pull-force mechanism is active
 DEFAULT_INTEGRATOR = "langevin"  # "langevin" | "langevin_middle"; AA overrides
-DEFAULT_MAX_FORCE_KJ = 5000.0  # per-atom hard cap on pull-force magnitude (kJ/mol/nm)
-DEFAULT_ENERGY_CUTOFF_KJ = 1e9  # |U| or kinetic energy above this rejects the frame (kJ/mol)
-ENERGY_RECOVERY_RETRIES = 2  # Retry without pulling, then with zero velocities.
+DEFAULT_MAX_FORCE_KJ = None  # No pull-force cap unless explicitly configured.
+DEFAULT_ENERGY_CUTOFF_KJ = None  # No finite-energy cutoff unless explicitly configured.
 DEFAULT_FRAME_INTERVAL_MS = 1  # QTimer tick interval for the IMD / minimize loops (ms)
 DEFAULT_DRAG_LEVEL = "atom"  # mouse-drag granularity: atom | residue | chain
 DEFAULT_PLATFORM = "auto"  # OpenMM platform: auto (fastest) | cuda | opencl | cpu | reference
+
 
 # ---------------------------------------------------------------------------
 # Per-backend defaults

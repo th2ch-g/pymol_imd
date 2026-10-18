@@ -57,7 +57,7 @@ def _make_dragging_imd(bundle, *, n_drag_atoms: int = 2):
     return imd
 
 
-def _check_csv(csv_path: Path, *, max_force_kj: float) -> None:
+def _check_csv(csv_path: Path, *, max_force_kj: float | None) -> None:
     with open(csv_path, newline="") as fh:
         rows = list(csv.reader(fh))
     expected = ["frame", "step", "time_ps", "atom_index", "fx", "fy", "fz", "fmag"]
@@ -71,7 +71,7 @@ def _check_csv(csv_path: Path, *, max_force_kj: float) -> None:
         fmag = float(r[7])
         if atom_index < 0:
             raise AssertionError(f"negative atom_index {atom_index}")
-        if fmag > max_force_kj + 1.0:
+        if max_force_kj is not None and fmag > max_force_kj + 1.0:
             raise AssertionError(f"|F|={fmag} exceeds limit {max_force_kj}")
     log.info("CSV OK: %d data rows, header matches, |F| within limit", len(data))
 
