@@ -33,6 +33,7 @@ from openmm.app import DCDFile, DCDReporter, PDBReporter, Simulation, XTCFile, X
 
 from . import constants
 from .backends.base import SystemBundle
+from .particle_masses import system_masses, validate_masses
 from .pymol_io import load_coordinates
 
 logger = logging.getLogger(__name__)
@@ -163,6 +164,38 @@ def compute_pull_forces(
         return np.empty(0, dtype=int), forces, int(active_idx.size)
     forces[active_idx], n_exceeded = cap_pull_forces(requested, max_force_kj)
     return active_idx, forces, n_exceeded
+
+
+def expand_group_forces(
+    active_idx: np.ndarray,
+    forces: np.ndarray,
+    group_of: np.ndarray,
+    masses: np.ndarray,
+    max_force_kj: float,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Distribute each group's old total force in proportion to particle mass.
+
+    A common scale enforces the per-particle cap without changing mass ratios,
+    so the pull contributes equal acceleration to every mobile group member.
+    Massless particles receive no pull.
+    """
+    masses = validate_masses(masses, len(forces))
+    touched = np.unique(group_of[active_idx])
+    expanded = np.flatnonzero(np.isin(group_of, touched) & (masses > 0))
+    result = np.zeros_like(forces)
+    exceeded = 0
+    for group in touched:
+        all_members = np.flatnonzero(group_of == group)
+        members = all_members[masses[all_members] > 0]
+        if not members.size:
+            continue
+        dragged = active_idx[group_of[active_idx] == group]
+        mean = forces[dragged].mean(axis=0)
+        weights = masses[members] / masses[members].sum() * len(all_members)
+        peak, limited = cap_pull_forces((mean * weights.max())[None, :], max_force_kj)
+        result[members] = peak * (weights / weights.max())[:, None]
+        exceeded += int(limited > 0)
+    return expanded, result, exceeded
 
 
 @dataclass
@@ -317,6 +350,17 @@ class IMDSystem:
         self._ml_subset_context: openmm.Context | None = None
         self._init_ml_subset_context()
         self.n_atoms = bundle.topology.getNumAtoms()
+        self._particle_masses = system_masses(bundle.system)
+        constraints = [
+            bundle.system.getConstraintParameters(i)
+            for i in range(bundle.system.getNumConstraints())
+        ]
+        self._constraint_pairs = np.array([(i, j) for i, j, _ in constraints], dtype=int).reshape(
+            -1, 2
+        )
+        self._constraint_lengths_nm = np.array(
+            [distance.value_in_unit(unit.nanometer) for _, _, distance in constraints]
+        )
         self.running = False
         self._last_min_energy: float | None = None
         # Tracks atoms whose pull force was non-zero on the previous frame
@@ -580,7 +624,9 @@ class IMDSystem:
         pending: list = []
         simulation.reporters = [_DeferredReporter(reporter, pending) for reporter in reporters]
         state_kwargs = dict(
-            getPositions=get_positions or self._mlmm_force is not None,
+            getPositions=get_positions
+            or self._mlmm_force is not None
+            or bool(len(self._constraint_pairs)),
             getEnergy=True,
             getVelocities=get_velocities,
             getForces=get_forces,
@@ -610,7 +656,9 @@ class IMDSystem:
                                 raise FloatingPointError(f"ML/MM evaluation failed: {exc}") from exc
                         accepted = True
                         break
-                    reason = "non-finite state or energy outside energy_cutoff_kj"
+                    reason = (
+                        "non-finite state, excessive energy, or unsatisfied distance constraints"
+                    )
                 except (openmm.OpenMMException, FloatingPointError) as exc:
                     reason = str(exc)
                 context.loadCheckpoint(checkpoint)
@@ -695,6 +743,23 @@ class IMDSystem:
             (openmm.State.Forces, state.getForces),
         ):
             if fields & flag and not np.isfinite(getter(asNumpy=True)._value).all():
+                return True
+        if fields & openmm.State.Positions and len(self._constraint_pairs):
+            positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+            pairs = positions[self._constraint_pairs]
+            distances = np.linalg.norm(pairs[:, 0] - pairs[:, 1], axis=1)
+            roundoff = (
+                constants.CONSTRAINT_POSITION_ROUNDOFF_ULPS
+                * np.finfo(np.float32).eps
+                * np.max(np.abs(pairs), axis=(1, 2))
+            )
+            tolerance = (
+                constants.CONSTRAINT_VALIDATION_TOLERANCE_FACTOR
+                * self.simulation.integrator.getConstraintTolerance()
+                * self._constraint_lengths_nm
+                + roundoff
+            )
+            if np.any(np.abs(distances - self._constraint_lengths_nm) > tolerance):
                 return True
         return False
 
@@ -1377,21 +1442,18 @@ class IMDSystem:
         active_idx, forces, n_exceeded = compute_pull_forces(
             delta, self.config.const_k, self.config.max_force_kj, self._DELTA_NOISE_NM
         )
+        if self.config.drag_level != "atom" and active_idx.size:
+            active_idx, forces, group_exceeded = self._expand_drag_groups(active_idx, forces)
+            n_exceeded += group_exceeded
         if n_exceeded and not self._force_exceeded_prev:
             if active_idx.size:
                 logger.warning(
-                    "Pull force on %d atom(s) capped at max_force_kj=%.1f kJ/mol/nm",
-                    n_exceeded,
+                    "Pull force capped at max_force_kj=%.1f kJ/mol/nm",
                     self.config.max_force_kj,
                 )
             else:
                 logger.warning("Non-finite pull input; released the entire pull frame")
         self._force_exceeded_prev = bool(n_exceeded)
-        # Drag a whole residue / chain when requested: PyMOL only moves a
-        # covalent fragment under the mouse, so we propagate that pull to the rest
-        # of the group here (no-op for the default atom level / a skipped frame).
-        if self.config.drag_level != "atom" and active_idx.size:
-            active_idx, forces = self._expand_drag_groups(active_idx, forces)
         self.set_pull_forces(active_idx, forces)
 
         if active_idx.size:
@@ -1473,27 +1535,14 @@ class IMDSystem:
 
     def _expand_drag_groups(
         self, active_idx: np.ndarray, forces: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Expand a per-atom pull to whole residues / chains.
-
-        PyMOL's 3-Button Editing drags a covalent fragment, not a residue or
-        chain (its ``mouse_selection_mode`` does not affect editing drag), so
-        ``drag_level`` is realized here: every atom of a touched residue / chain
-        receives the mean pull force of that group's dragged atoms, dragging the
-        whole group along. Input vectors are already capped by
-        :func:`compute_pull_forces`; their group mean stays bounded.
-        """
+    ) -> tuple[np.ndarray, np.ndarray, int]:
+        """Expand residue/chain pulls using the actual OpenMM particle masses."""
         group_of = (
             self._atom_residue_idx if self.config.drag_level == "residue" else self._atom_chain_idx
         )
-        touched = np.unique(group_of[active_idx])
-        expanded = np.where(np.isin(group_of, touched))[0]
-        new_forces = forces.copy()
-        for g in touched:
-            members = expanded[group_of[expanded] == g]
-            dragged = active_idx[group_of[active_idx] == g]
-            new_forces[members] = forces[dragged].mean(axis=0)
-        return expanded, new_forces
+        return expand_group_forces(
+            active_idx, forces, group_of, self._particle_masses, self.config.max_force_kj
+        )
 
     # ------------------------------------------------------------ coord sync IO
     def _read_openmm_positions_nm(self) -> np.ndarray:

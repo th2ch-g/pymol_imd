@@ -216,6 +216,7 @@ def write_prepared_pdb(
     out_path: Path | str,
     *,
     bond_filter=None,
+    system=None,
 ) -> Path:
     """Write a PDB so PyMOL can be re-loaded against the OpenMM atom order.
 
@@ -244,6 +245,10 @@ def write_prepared_pdb(
                 continue
             fh.write(f"CONECT{atom_serial[atom_a]:>5d}{atom_serial[atom_b]:>5d}\n")
         PDBFile.writeFooter(topology, fh)
+    if system is not None:
+        from .particle_masses import system_masses, write_particle_masses
+
+        write_particle_masses(out_path, system_masses(system))
     return out_path
 
 

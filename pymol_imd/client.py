@@ -17,13 +17,15 @@ import contextlib
 import logging
 import time
 from dataclasses import dataclass
+from io import StringIO
 
 import numpy as np
 
 from . import constants, protocol, transport
-from .imd import compute_pull_forces
+from .imd import compute_pull_forces, expand_group_forces
+from .particle_masses import element_masses, validate_masses
 from .protocol import IMDHeaderType, SessionInfo
-from .pymol_io import load_coordinates
+from .pymol_io import load_coordinates, take_prepared_masses
 
 logger = logging.getLogger(__name__)
 
@@ -276,6 +278,9 @@ class PyMOLIMDClient:
         # / chain. Mirrors IMDSystem's in-process expansion so socket dragging
         # feels the same. The client has no OpenMM topology, hence the readout.
         self._group_ids: dict[str, np.ndarray] = {}
+        from pymol import cmd
+
+        self._particle_masses: np.ndarray | None = take_prepared_masses(cmd, pymol_object)
 
     def start(self) -> None:
         from pymol.Qt import QtCore
@@ -357,20 +362,20 @@ class PyMOLIMDClient:
         active_idx, forces_nm, n_exceeded = compute_pull_forces(
             delta_nm, self.const_k, self.max_force_kj, self.delta_noise_nm
         )
+        if self.drag_level != "atom" and active_idx.size:
+            active_idx, forces_nm, group_exceeded = self._expand_drag_groups(
+                active_idx, forces_nm, len(coords)
+            )
+            n_exceeded += group_exceeded
         if n_exceeded and not self._force_exceeded_prev:
             if active_idx.size:
                 logger.warning(
-                    "Pull force on %d atom(s) capped at max_force_kj=%.1f kJ/mol/nm",
-                    n_exceeded,
+                    "Pull force capped at max_force_kj=%.1f kJ/mol/nm",
                     self.max_force_kj,
                 )
             else:
                 logger.warning("Non-finite pull input; released the entire pull frame")
         self._force_exceeded_prev = bool(n_exceeded)
-        # Expand to the whole residue / chain (same behavior as the in-process
-        # IMDSystem); no-op for the default atom level / a skipped frame.
-        if self.drag_level != "atom" and active_idx.size:
-            active_idx, forces_nm = self._expand_drag_groups(active_idx, forces_nm, len(coords))
         active_set = set(active_idx.tolist())
         if active_idx.size or self._active_prev:
             # n=0 MDComm (no active atoms) tells the server to release: it
@@ -396,49 +401,41 @@ class PyMOLIMDClient:
             )
 
     def _group_of(self, level: str, n_atoms: int) -> np.ndarray | None:
-        """Per-atom integer group id for residue / chain, read from PyMOL once.
-
-        Residues are keyed by ``(chain, resi)`` so identically-numbered residues
-        in different chains don't merge; chains by chain id. Cached per level.
-        Returns ``None`` if the readout count doesn't match (object mismatch),
-        in which case the caller falls back to the unexpanded per-atom pull.
-        """
+        """Retain TER boundaries even when distinct chains have the same label."""
         cached = self._group_ids.get(level)
         if cached is not None:
             return cached
+        from openmm.app import PDBFile
         from pymol import cmd
 
-        rows: list[tuple[str, str]] = []
-        cmd.iterate(self.selector, "rows.append((chain, resi))", space={"rows": rows})
-        if len(rows) != n_atoms:
+        topology = PDBFile(StringIO(cmd.get_pdbstr(self.selector, state=1))).topology
+        atoms = list(topology.atoms())
+        if len(atoms) != n_atoms:
             return None
-        keys = [c for c, _r in rows] if level == "chain" else [f"{c}/{r}" for c, r in rows]
-        lookup: dict[str, int] = {}
-        ids = np.empty(n_atoms, dtype=np.int64)
-        for i, key in enumerate(keys):
-            ids[i] = lookup.setdefault(key, len(lookup))
-        self._group_ids[level] = ids
-        return ids
+        self._group_ids = {
+            "residue": np.array([atom.residue.index for atom in atoms]),
+            "chain": np.array([atom.residue.chain.index for atom in atoms]),
+        }
+        return self._group_ids[level]
 
     def _expand_drag_groups(
         self, active_idx: np.ndarray, forces_nm: np.ndarray, n_atoms: int
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Expand a per-atom pull to whole residues / chains (client side).
-
-        Mirrors :meth:`pymol_imd.imd.IMDSystem._expand_drag_groups` but reads
-        group membership from the PyMOL object (the client has no OpenMM
-        topology). Every atom of a touched residue / chain gets the mean pull
-        force of that group's dragged atoms. Falls back to the unexpanded pull
-        when the group readout is unavailable.
-        """
+    ) -> tuple[np.ndarray, np.ndarray, int]:
+        """Share the local force distribution using prepared particle masses."""
         group_of = self._group_of(self.drag_level, n_atoms)
         if group_of is None:
-            return active_idx, forces_nm
-        touched = np.unique(group_of[active_idx])
-        expanded = np.where(np.isin(group_of, touched))[0]
-        new_forces = forces_nm.copy()
-        for g in touched:
-            members = expanded[group_of[expanded] == g]
-            dragged = active_idx[group_of[active_idx] == g]
-            new_forces[members] = forces_nm[dragged].mean(axis=0)
-        return expanded, new_forces
+            raise RuntimeError("PyMOL atom groups changed; reload the prepared PDB and reconnect")
+        if self._particle_masses is None:
+            from pymol import cmd
+
+            atoms = cmd.get_model(self.selector).atom
+            if any(atom.name == "BB" for atom in atoms):
+                raise RuntimeError(
+                    "CG group pulling needs prepared particle masses; reconnect with "
+                    "pymol_imd connect <prepared.pdb>"
+                )
+            masses = element_masses(atom.symbol for atom in atoms)
+            self._particle_masses = validate_masses(masses, n_atoms)
+        return expand_group_forces(
+            active_idx, forces_nm, group_of, self._particle_masses, self.max_force_kj
+        )

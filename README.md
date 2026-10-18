@@ -116,11 +116,18 @@ For socket connections, set `--max-force-kj` on both the engine and client;
 the smaller cap takes effect. CueMol's panel shows **(capped)** when the client
 limits a pull. `--const-k` controls the force response to mouse displacement.
 
+Residue and chain pulls distribute the group's total force in proportion to
+particle mass, giving light and heavy atoms the same pull acceleration.
+When a group reaches the cap, all its forces scale together. Atom mode is
+unchanged.
+Use the current server's prepared PDB with the `connect` CLI so socket viewers
+receive the actual particle masses, including Martini beads.
+
 Invalid MD frames are rolled back and retried without pulling, then with zero
 velocities; successful recovery keeps MD running. Rejected frames are excluded
-from recordings. Recovery changes
-trajectory sampling. Sustained pulling may still distort the structure before
-an energy limit is reached.
+from recordings, including states with unconverged OpenMM distance constraints.
+Recovery changes trajectory sampling. Sustained pulling may still distort the
+structure before an energy limit is reached.
 
 ## Simulation defaults and output
 

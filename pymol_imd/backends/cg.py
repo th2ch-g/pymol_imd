@@ -26,6 +26,7 @@ from openmm import unit
 from openmm.app import PDBFile
 
 from .. import constants
+from ..particle_masses import system_masses, write_particle_masses
 from ..prep import _download_atomic
 from .base import SystemBundle
 
@@ -256,6 +257,7 @@ class CGBackend:
         # come from the same cg.top.
         prepared_pdb = work_dir / "cg_prepared.pdb"
         shutil.copy(cg_pdb, prepared_pdb)
+        write_particle_masses(prepared_pdb, system_masses(system))
 
         return SystemBundle(
             system=system,

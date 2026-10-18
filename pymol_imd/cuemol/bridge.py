@@ -10,10 +10,12 @@ from importlib.resources import files
 from pathlib import Path
 
 import numpy as np
+from openmm.app import PDBFile
 
 from pymol_imd import constants
 from pymol_imd.client import IMDClient
-from pymol_imd.imd import compute_pull_forces
+from pymol_imd.imd import compute_pull_forces, expand_group_forces
+from pymol_imd.particle_masses import read_particle_masses
 from pymol_imd.protocol import IMDHeaderType
 
 from .cdp import CDP, CDPError
@@ -78,6 +80,8 @@ def target_forces(
     const_k: float,
     max_force_kj: float,
     drag_level: str = "atom",
+    particle_masses: np.ndarray | None = None,
+    group_ids: dict[str, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Use the shared force cap and units, including residue/chain expansion."""
     delta = np.zeros_like(positions, dtype=float)
@@ -95,12 +99,20 @@ def target_forces(
     if drag_level not in constants.SUPPORTED_DRAG_LEVELS:
         raise ValueError(f"Invalid drag level: {drag_level}")
     if len(active) and drag_level != "atom":
-        selected = int(active[0])
-        width = 1 if drag_level == "chain" else 2
-        key = atom_keys[selected][:width]
-        members = np.array([i for i, other in enumerate(atom_keys) if other[:width] == key])
-        forces[members] = forces[selected]
-        active = members
+        if particle_masses is None:
+            raise ValueError("Group pulling needs particle masses; use a newly prepared server PDB")
+        if group_ids is None:
+            width = 1 if drag_level == "chain" else 2
+            lookup = {}
+            groups = np.array(
+                [lookup.setdefault(tuple(key[:width]), len(lookup)) for key in atom_keys]
+            )
+        else:
+            groups = group_ids[drag_level]
+        active, forces, group_exceeded = expand_group_forces(
+            active, forces, groups, particle_masses, max_force_kj
+        )
+        exceeded += group_exceeded
     return active, forces, exceeded
 
 
@@ -117,6 +129,14 @@ class CueMolBridge:
         name: str = "IMD molecule",
     ):
         self.atom_keys, self.prepared_positions = read_prepared_pdb(prepared)
+        self.particle_masses = read_particle_masses(prepared)
+        atoms = list(PDBFile(str(prepared)).topology.atoms())
+        if len(atoms) != len(self.atom_keys):
+            raise ValueError("Prepared PDB topology does not match the coordinate atom order")
+        self.group_ids = {
+            "residue": np.array([atom.residue.index for atom in atoms]),
+            "chain": np.array([atom.residue.chain.index for atom in atoms]),
+        }
         is_cg = any(key[3] == "BB" for key in self.atom_keys)
         self.cdp = CDP(endpoint, timeout=constants.CUEMOL_CDP_TIMEOUT_S)
         self.page = None
@@ -368,6 +388,8 @@ class CueMolIMD:
                         const_k=self.const_k,
                         max_force_kj=self.max_force_kj,
                         drag_level=self.drag_level,
+                        particle_masses=self.bridge.particle_masses,
+                        group_ids=self.bridge.group_ids,
                     )
                     force_max = float(np.linalg.norm(forces, axis=1).max())
                     self.stats["peak_force_kj_per_nm"] = max(

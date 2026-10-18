@@ -218,6 +218,53 @@ def check_mlmm_proposed_state(root, *, raises=False):
     check_recording(imd, folder, "xtc", [1, 2])
 
 
+def check_constraint_recovery(root):
+    topology = Topology()
+    residue = topology.addResidue("MOL", topology.addChain())
+    carbon = topology.addAtom("C", Element.getBySymbol("C"), residue)
+    hydrogen = topology.addAtom("H", Element.getBySymbol("H"), residue)
+    topology.addBond(carbon, hydrogen)
+    system = openmm.System()
+    system.addParticle(12)
+    system.addParticle(1)
+    system.addConstraint(0, 1, 0.109)
+    bundle = SystemBundle(
+        system=system,
+        topology=topology,
+        positions=np.array([[0, 0, 0], [0.109, 0, 0]]) * unit.nanometer,
+        backend_name="aa",
+        prepared_pdb_path=root / "unused.pdb",
+    )
+    imd = IMDSystem(bundle, IMDConfig(platform="reference"))
+    imd.running = True
+    imd.set_recording(traj=str(root / "constraints.xtc"))
+    imd.start_recording()
+    original = imd._final_frame_state
+    calls = 0
+
+    def unconverged_state(pending, state_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # A solver can return finite coordinates/energy without converging.
+            imd.simulation.context.setPositions(np.array([[0, 0, 0], [0.2, 0, 0]]))
+        return original(pending, state_kwargs)
+
+    imd._final_frame_state = unconverged_state
+    alive, state = imd.advance_openmm()
+    assert alive and calls == 2 and imd._recovery_count == 1
+    assert state.getDataTypes() & openmm.State.Positions
+    assert not imd._invalid_state(state)
+    assert imd.simulation.currentStep == 1
+    imd.stop_recording()
+    trajectory = mdtraj.load_xtc(
+        str(root / "constraints.xtc"), top=mdtraj.Topology.from_openmm(topology)
+    )
+    assert trajectory.n_frames == 1
+    distance = np.linalg.norm(trajectory.xyz[0, 1] - trajectory.xyz[0, 0])
+    assert abs(distance - 0.109) < 1e-5, "An unconverged constrained state was recorded"
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     with tempfile.TemporaryDirectory(prefix="imd-recovery-") as directory:
@@ -231,6 +278,7 @@ def main():
         check_local_mlmm_recovery(root)
         check_mlmm_proposed_state(root)
         check_mlmm_proposed_state(root, raises=True)
+        check_constraint_recovery(root)
     print("smoke-recovery: passed")
 
 

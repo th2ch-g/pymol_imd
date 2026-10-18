@@ -93,6 +93,7 @@ class AABackend:
             modeller.topology,
             modeller.positions,
             work_dir / f"{pdb_path.stem}_prepared.pdb",
+            system=system,
         )
 
         return SystemBundle(

@@ -879,7 +879,8 @@ def _connect_statement(prepared: str, host: str, port: int, obj: str, extra: dic
     kw_str = ", ".join(f"{k}={v!r}" for k, v in kw.items())
     return (
         "from pymol_imd import *; cmd.set('retain_order', 1); "
-        f"cmd.load({prepared!r}, {obj!r}); imd_connect({kw_str})"
+        "from pymol_imd.pymol_io import load_prepared; "
+        f"load_prepared(cmd, {prepared!r}, {obj!r}); imd_connect({kw_str})"
     )
 
 

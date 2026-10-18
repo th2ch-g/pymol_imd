@@ -36,7 +36,11 @@ def main_test() -> int:
     assert "; imd_run()" not in statement
 
     connect = _connect_statement("/tmp/prepared.pdb", "127.0.0.1", 8888, "obj", {})
-    assert connect.index("retain_order") < connect.index("cmd.load") < connect.index("imd_connect")
+    assert (
+        connect.index("retain_order")
+        < connect.index("load_prepared(cmd,")
+        < connect.index("imd_connect")
+    )
 
     _expect_system_exit(lambda: _build_parser("serve").parse_args(["x.pdb", "--const-k", "1"]))
     try:

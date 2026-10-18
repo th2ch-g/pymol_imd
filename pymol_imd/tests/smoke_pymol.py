@@ -75,7 +75,10 @@ def _check_prepared_identifiers(pdb: Path) -> None:
     from openmm.app import PDBFile, element
 
     from pymol_imd.backends.mlmm import _resolve_ml_indices
+    from pymol_imd.client import PyMOLIMDClient
+    from pymol_imd.particle_masses import read_particle_masses, write_particle_masses
     from pymol_imd.prep import write_prepared_pdb
+    from pymol_imd.pymol_io import load_prepared
 
     source = PDBFile(str(pdb))
     protein = next(source.topology.chains())
@@ -110,17 +113,51 @@ def _check_prepared_identifiers(pdb: Path) -> None:
         source.topology, "chain W or (chain Z and resi 42A)", prepared_pdb_path=prepared
     )
     assert actual == expected, (actual, expected)
+    masses = np.linspace(1.25, 72, source.topology.getNumAtoms())
+    write_particle_masses(prepared, masses)
+    write_particle_masses(prepared, masses)
+    np.testing.assert_array_equal(read_particle_masses(prepared), masses)
+    obj = "mass_metadata_test"
+    load_prepared(cmd, str(prepared), obj)
+    viewer = PyMOLIMDClient(None, obj, const_k=50000, max_force_kj=5000, drag_level="chain")
+    forces = np.zeros((len(masses), 3))
+    forces[0, 0] = 10
+    active, distributed, _ = viewer._expand_drag_groups(np.array([0]), forces, len(masses))
+    np.testing.assert_array_equal(viewer._particle_masses, masses)
+    assert len(active) == len(masses) - 3, "Chain pulling included the separate water chain"
+    acceleration = distributed[active] / masses[active, None]
+    np.testing.assert_allclose(acceleration, np.tile(acceleration[0], (len(active), 1)))
+    cmd.delete(obj)
+    water.chain.id = protein.id
+    write_prepared_pdb(source.topology, positions * unit.nanometer, prepared)
+    write_particle_masses(prepared, masses)
+    load_prepared(cmd, str(prepared), obj)
+    viewer = PyMOLIMDClient(None, obj, const_k=50000, max_force_kj=5000, drag_level="chain")
+    active, _, _ = viewer._expand_drag_groups(np.array([0]), forces, len(masses))
+    assert len(active) == len(masses) - 3, "TER-separated chains with equal labels were merged"
+    cmd.delete(obj)
     log.info("prepared PDB preserves chain/residue/insertion identifiers and ML selection")
 
 
 def _exercise_backend(app, pdb: Path, level: str, output: Path | None) -> list:
+    from pymol_imd.client import PyMOLIMDClient
+    from pymol_imd.particle_masses import read_particle_masses
+
     setup = getattr(commands, f"imd_setup_{level}")
     kwargs = {"platform": "cpu", "nsteps_per_frame": 1, "frame_interval_ms": 5}
     if level == "mlmm":
         kwargs.update(ml_selection="resi 1-2", ml_charge=0, ml_mult=1, ml_device="cpu")
     setup(str(pdb), work_dir=str(pdb.parent / level), **kwargs)
     system = commands._imd_system
+    np.testing.assert_array_equal(
+        read_particle_masses(system.bundle.prepared_pdb_path), system._particle_masses
+    )
     obj = system.pymol_object
+    viewer = PyMOLIMDClient(None, obj, const_k=50000, max_force_kj=5000)
+    np.testing.assert_array_equal(
+        viewer._group_of("residue", system.n_atoms), system._atom_residue_idx
+    )
+    np.testing.assert_array_equal(viewer._group_of("chain", system.n_atoms), system._atom_chain_idx)
     assert cmd.count_atoms(obj) == system.n_atoms
     assert cmd.get_setting_int("retain_order") == 1
     if level != "cg":

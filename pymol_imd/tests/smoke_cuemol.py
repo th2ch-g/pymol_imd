@@ -58,6 +58,17 @@ def _test_mapping_and_forces(root):
         ["A", "1A", "ALA", "CA", "B"],
     ]
     np.testing.assert_allclose(positions, [[1, 2, 3]] * 4)
+    indices, _, _ = target_forces(
+        positions,
+        {"index": 0, "position": [1.1, 2, 3]},
+        keys,
+        const_k=50000,
+        max_force_kj=5000,
+        drag_level="chain",
+        particle_masses=np.full(4, 12.0),
+        group_ids={"chain": np.array([0, 0, 1, 2])},
+    )
+    assert indices.tolist() == [0, 1], "Distinct chains with the same label were merged"
     prepared.write_text(text + "CONECT    8    2    9\nCONECT    2    8\nEND\n")
     assert read_prepared_bonds(prepared) == [[0, 1], [0, 2]]
     for level, expected in (("atom", [0]), ("residue", [0, 1]), ("chain", [0, 1, 3])):
@@ -68,6 +79,7 @@ def _test_mapping_and_forces(root):
             const_k=50000,
             max_force_kj=5000,
             drag_level=level,
+            particle_masses=np.full(len(keys), 12.0),
         )
         assert indices.tolist() == expected and not exceeded
         np.testing.assert_allclose(forces[indices], [[500, 0, 0]] * len(expected))
@@ -234,6 +246,8 @@ class _Client:
 
 class _Bridge:
     atom_keys = [["A", "1", "ALA", "CA", ""]]
+    particle_masses = np.array([12.0])
+    group_ids = None
     initial = {"sceneId": 1, "objectId": 2}
 
     def __init__(self, client, script):
@@ -346,6 +360,7 @@ def _test_live_drag_level(root):
         ["A", "2", "ALA", "CA", ""],
         ["B", "1", "ALA", "CA", ""],
     ]
+    bridge.particle_masses = np.full(4, 12.0)
     runner = CueMolIMD(bridge, client, drag_level="chain", frame_interval_ms=1)
     with contextlib.redirect_stdout(io.StringIO()):
         stats = runner.run(evidence=root / "drag-level.json")

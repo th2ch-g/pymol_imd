@@ -70,6 +70,9 @@ GAS_CONSTANT_KJ_PER_MOL_K = 0.00831446261815324
 # state-CSV density column (total system mass / periodic box volume).
 AMU_PER_NM3_TO_G_PER_CM3 = 1.6605390666e-3
 MINIMUM_BOX_MARGIN_NM = 0.01  # keep cutoff strictly below half the box length
+# Allow solver convergence and single-precision coordinate roundoff in state validation.
+CONSTRAINT_VALIDATION_TOLERANCE_FACTOR = 10.0
+CONSTRAINT_POSITION_ROUNDOFF_ULPS = 8.0
 
 # Covalent radii in Angstrom for the Morokuma/Dapprich link-atom g-factor.
 # Source: standard chemistry references (Cordero 2008, condensed). Only the

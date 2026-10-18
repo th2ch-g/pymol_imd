@@ -760,6 +760,7 @@ class MLMMBackend:
             modeller.topology,
             modeller.positions,
             work_dir / f"{pdb_path.stem}_prepared.pdb",
+            system=system,
         )
 
         ml_indices = _resolve_ml_indices(
