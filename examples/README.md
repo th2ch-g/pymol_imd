@@ -5,9 +5,8 @@ the experiments with the
 [mouse experiment skill](../.agents/skills/pymol-imd-mouse-experiments/SKILL.md).
 Generated preparation files, recordings, screenshots and reports belong under
 an ignored directory such as `.pixi/cua/`, outside `tests/`.
-For code-driven experiments, use the
-[scripted drag API](../docs/reference.md#scripted-dragging-without-a-viewer) and
-[molecular protocols](../.agents/skills/pymol-imd-mouse-experiments/references/scripted.md).
+For code-driven experiments, follow the
+[scripted molecular protocols](../.agents/skills/pymol-imd-mouse-experiments/references/scripted.md).
 
 ## QBP
 

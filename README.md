@@ -10,7 +10,7 @@ adapter. Drag atoms in the viewer while OpenMM advances the simulation.
 | `mlmm` | Amber MM + an ONIOM MLIP correction | A selected region treated with AIMNet2, MACE, ORB or UMA |
 
 [Install](#install) · [PyMOL](#pymol) · [CueMol3](#cuemol3-experimental) ·
-[Pull settings](#pull-settings) · [Reference](docs/reference.md)
+[Pull settings](#pull-settings)
 
 ## Install
 
@@ -23,10 +23,9 @@ pixi install
 ```
 
 This installs all three simulation levels, with **AIMNet2** as the default
-MLIP and **MACE** as an alternative. ORB and UMA require optional installation
-tasks; UMA also requires model access. See
-[MLIP installation and CUDA setup](docs/reference.md#installation-and-mlip-backends).
-UMA runs use `pixi run --no-install` after `install-uma` to retain its dependencies.
+MLIP and **MACE** as an alternative. Install ORB or UMA with
+`pixi run install-orb` or `pixi run install-uma`. UMA also requires model access;
+use `pixi run --no-install` after `install-uma` to retain its dependencies.
 
 ## PyMOL
 
@@ -60,7 +59,7 @@ restore the usual controls, or follow **MovA** in the lower-right mouse grid.
 
 `local` starts production after setup and optional minimization. Use `launch`
 to configure the viewer without starting production, or add `--print-only`
-to inspect its generated command. See [PyMOL commands](docs/reference.md#use-from-inside-pymol).
+to inspect its generated command.
 
 ## CueMol3 (experimental)
 
@@ -102,8 +101,6 @@ Keep perspective disabled while pulling. The adapter currently supports one
 visible viewport and one native worker. CueMol3 **2.3.21.544** was physically
 tested with AA QBP (3,536 atoms), Martini QBP (528 beads), and an AIMNet2 ML/MM
 peptide (33 atoms). Other versions and larger systems remain unverified.
-See [CueMol3 details](docs/reference.md#cuemol3-details) for separate viewer
-launch, connection options and validation scope.
 
 ## Pull settings
 
@@ -120,11 +117,10 @@ the smaller cap takes effect. CueMol's panel shows **(capped)** when the client
 limits a pull. `--const-k` controls the force response to mouse displacement.
 
 Invalid MD frames are rolled back and retried without pulling, then with zero
-velocities; successful recovery keeps
-MD running. Rejected frames are excluded from recordings. Recovery changes
+velocities; successful recovery keeps MD running. Rejected frames are excluded
+from recordings. Recovery changes
 trajectory sampling. Sustained pulling may still distort the structure before
-an energy limit is reached; see
-[force handling and recovery](docs/reference.md#how-it-works).
+an energy limit is reached.
 
 ## Simulation defaults and output
 
@@ -140,14 +136,10 @@ an energy limit is reached; see
 
 ## Documentation and checks
 
-- [CLI flags](docs/reference.md#cli-flags), [remote PyMOL](docs/reference.md#imdv3-socket-mode-client--server)
-  and [recording options](docs/reference.md#recording-trajectories-forces-and-state)
-- [ML/MM selection and link atoms](docs/reference.md#mlmm-region-selection)
-- [Scripted dragging](docs/reference.md#scripted-dragging-without-a-viewer)
-- [Troubleshooting](docs/reference.md#troubleshooting),
-  [architecture](docs/reference.md#project-layout) and [validation](docs/reference.md#validation)
-- [Example structures](examples/README.md) and
-  [physical mouse experiments](.agents/skills/pymol-imd-mouse-experiments/SKILL.md)
+Use `pixi run pymol_imd local --help`, `pixi run pymol_imd serve --help`,
+or `pixi run cuemol connect --help` to list command options.
+See [example structures](examples/README.md) and
+[physical mouse experiments](.agents/skills/pymol-imd-mouse-experiments/SKILL.md).
 
 Core checks include `pixi run smoke`, `pixi run smoke-mlmm`,
 `pixi run smoke-interactive`, `pixi run smoke-pymol`, `pixi run smoke-socket`,
