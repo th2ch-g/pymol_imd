@@ -14,14 +14,15 @@ adapter. Drag atoms in the viewer while OpenMM advances the simulation.
 
 ## Videos
 
-Click a preview to open its MP4. Each clip is 14 seconds, 960 × 540 at 20 fps;
-the six videos total about 6.5 MB.
+Animated previews play directly below (2.3 MB total).
+Click one to download the original MP4.
+Each MP4 is 14 seconds, 960 × 540 at 20 fps; the six total about 6.5 MB.
 
 | Recorded motion | PyMOL | CueMol3 |
 |---|---|---|
-| **AA:** partial QBP opening | [![Play AA in PyMOL](examples/pymol_aa.jpg)](examples/pymol_aa.mp4) | [![Play AA in CueMol3](examples/cuemol_aa.jpg)](examples/cuemol_aa.mp4) |
-| **CG:** transient QBP opening and return | [![Play CG in PyMOL](examples/pymol_cg.jpg)](examples/pymol_cg.mp4) | [![Play CG in CueMol3](examples/cuemol_cg.jpg)](examples/cuemol_cg.mp4) |
-| **ML/MM:** driven chorismate rearrangement | [![Play ML/MM in PyMOL](examples/pymol_mlmm.jpg)](examples/pymol_mlmm.mp4) | [![Play ML/MM in CueMol3](examples/cuemol_mlmm.jpg)](examples/cuemol_mlmm.mp4) |
+| **AA:** partial QBP opening | [![AA in PyMOL](examples/pymol_aa.webp)](examples/pymol_aa.mp4?raw=true) | [![AA in CueMol3](examples/cuemol_aa.webp)](examples/cuemol_aa.mp4?raw=true) |
+| **CG:** transient QBP opening and return | [![CG in PyMOL](examples/pymol_cg.webp)](examples/pymol_cg.mp4?raw=true) | [![CG in CueMol3](examples/cuemol_cg.webp)](examples/cuemol_cg.mp4?raw=true) |
+| **ML/MM:** driven chorismate rearrangement | [![ML/MM in PyMOL](examples/pymol_mlmm.webp)](examples/pymol_mlmm.mp4?raw=true) | [![ML/MM in CueMol3](examples/cuemol_mlmm.webp)](examples/cuemol_mlmm.mp4?raw=true) |
 
 Both columns replay the same verified physical-mouse trajectories recorded in
 PyMOL, rendered independently by each viewer. They are trajectory movies, with
