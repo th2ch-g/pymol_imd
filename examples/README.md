@@ -17,13 +17,13 @@ CueMol3 clips do not represent a separate CueMol mouse experiment. They are
 gives the simulation time; playback is resampled without coordinate interpolation.
 
 The [README previews](../README.md#videos) are looping WebP animations at
-384 × 216 and 8 fps. Download the full-resolution MP4s below.
+384 × 216 and 8 fps. Open the full-resolution MP4 files below.
 
 | Level | PyMOL | CueMol3 | Observed result |
 |---|---|---|---|
-| AA | [MP4](pymol_aa.mp4?raw=true) | [MP4](cuemol_aa.mp4?raw=true) | QBP partial opening: heavy-atom domain distance 25.04 → 30.10 Å; open-reference RMSD 5.27 → 3.77 Å |
-| CG | [MP4](pymol_cg.mp4?raw=true) | [MP4](cuemol_cg.mp4?raw=true) | QBP transient opening and return: BB-centroid distance approximately 24.4 → 29.3 → 24.5 Å |
-| ML/MM | [MP4](pymol_mlmm.mp4?raw=true) | [MP4](cuemol_mlmm.mp4?raw=true) | Driven chorismate-to-prephenate-like conversion; product connectivity persists through all 2,000 unforced release frames |
+| AA | [MP4](pymol_aa.mp4) | [MP4](cuemol_aa.mp4) | QBP partial opening: heavy-atom domain distance 25.04 → 30.10 Å; open-reference RMSD 5.27 → 3.77 Å |
+| CG | [MP4](pymol_cg.mp4) | [MP4](cuemol_cg.mp4) | QBP transient opening and return: BB-centroid distance approximately 24.4 → 29.3 → 24.5 Å |
+| ML/MM | [MP4](pymol_mlmm.mp4) | [MP4](cuemol_mlmm.mp4) | Driven chorismate-to-prephenate-like conversion; product connectivity persists through all 2,000 unforced release frames |
 
 AA uses Amber/GBn2 at 2 fs and shows 0–21.694 ps. CG uses Martini 3 at 20 fs
 with its elastic network retained and shows 136–146 ps of the recorded run.
